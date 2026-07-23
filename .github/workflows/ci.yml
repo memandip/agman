@@ -21,4 +21,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Lint shell scripts
-        run: shellcheck -S warning bin/loadout install.sh tests/run.sh
+        run: shellcheck -S warning bin/agman install.sh tests/run.sh

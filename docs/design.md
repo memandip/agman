@@ -1,4 +1,4 @@
-# loadout — design (v0.1, 2026-07-23)
+# agman — design (v0.1, 2026-07-23)
 
 ## Problem
 
@@ -22,20 +22,20 @@ Claude Code has one user-level config dir (`~/.claude`): global `CLAUDE.md`, set
 
 Two layers, the pyenv/direnv pattern:
 
-1. **Core CLI** (`bin/loadout`, pure bash): owns profile storage and state. Everything except mutating the current shell's environment.
-2. **Shell integration** (emitted by `loadout init zsh|bash`, added via `eval` in the rc file): a `loadout()` function that makes `use`/`off` also export/unset `CLAUDE_CONFIG_DIR` in the current shell, and a `claude()` wrapper that injects the persistent default at invocation time. A child process cannot set its parent's env — this split is what makes `use` feel global while remaining per-process under the hood.
+1. **Core CLI** (`bin/agman`, pure bash): owns profile storage and state. Everything except mutating the current shell's environment.
+2. **Shell integration** (emitted by `agman init zsh|bash`, added via `eval` in the rc file): a `agman()` function that makes `use`/`off` also export/unset `CLAUDE_CONFIG_DIR` in the current shell, and a `claude()` wrapper that injects the persistent default at invocation time. A child process cannot set its parent's env — this split is what makes `use` feel global while remaining per-process under the hood.
 
 ### Storage
 
 ```
-~/.loadouts/            # LOADOUT_HOME
+~/.agman/            # AGMAN_HOME
 ├── .default                   # name of the persistent default profile
 ├── work/                      # a complete CLAUDE_CONFIG_DIR
 │   ├── CLAUDE.md  settings.json  skills/  agents/  rules/  plugins/  .claude.json
 └── personal/
 ```
 
-Profile names: `^[A-Za-z0-9][A-Za-z0-9._-]*$`, max 64 chars; `default|off|none|current|help` reserved. Validation is what makes `remove`'s `rm -rf "$LOADOUT_HOME/$name"` safe.
+Profile names: `^[A-Za-z0-9][A-Za-z0-9._-]*$`, max 64 chars; `default|off|none|current|help` reserved. Validation is what makes `remove`'s `rm -rf "$AGMAN_HOME/$name"` safe.
 
 ### Selection precedence (the contract)
 
@@ -55,7 +55,7 @@ Profile names: `^[A-Za-z0-9][A-Za-z0-9._-]*$`, max 64 chars; `default|off|none|c
 
 ## Command surface (v0.1)
 
-`create list use off current dir env run exec rename remove doctor init help version` — see README table. `env` exists so users can get per-shell profiles without any integration (`eval "$(loadout env work)"`), mirroring `aws-vault`/`ssh-agent` conventions.
+`create list use off current dir env run exec rename remove doctor init help version` — see README table. `env` exists so users can get per-shell profiles without any integration (`eval "$(agman env work)"`), mirroring `aws-vault`/`ssh-agent` conventions.
 
 ## Platform notes
 
@@ -74,14 +74,16 @@ Profile names: `^[A-Za-z0-9][A-Za-z0-9._-]*$`, max 64 chars; `default|off|none|c
 
 ## Testing
 
-`tests/run.sh`: dependency-free, fully sandboxed (fake `$HOME`, temp `LOADOUT_HOME`, stub `claude` on PATH that echoes `CLAUDE_CONFIG_DIR`). Covers seeding/excludes, name validation, precedence, run/exec, rename/remove state transitions, and end-to-end shell-hook behavior via `bash -c 'eval "$(loadout init bash)"; …'`. CI: Ubuntu + macOS matrix plus shellcheck.
+`tests/run.sh`: dependency-free, fully sandboxed (fake `$HOME`, temp `AGMAN_HOME`, stub `claude` on PATH that echoes `CLAUDE_CONFIG_DIR`). Covers seeding/excludes, name validation, precedence, run/exec, rename/remove state transitions, and end-to-end shell-hook behavior via `bash -c 'eval "$(agman init bash)"; …'`. CI: Ubuntu + macOS matrix plus shellcheck.
 
 ## Naming
 
-Renamed from `ccprofile` (2026-07-23) for the multi-agent positioning. Requirements: vendor-neutral, memorable, clean namespace. Availability swept: existing GitHub "loadout" repos are gaming tools only; Homebrew formula name free; npm/PyPI/crates squats are irrelevant for a curl-installed bash tool. Rejected word families: "switch" (owned by the cc-switch ecosystem in this exact niche), "ctx/context" (now signals memory tools: ctx.rs, aictx, lean-ctx), "env" (drifting toward RL environments). `equip` added as an alias of `use` to match the metaphor.
+Final name: **agman** (**ag**ent **man**ager), decided 2026-07-23 after two earlier candidates: `ccprofile` (too Claude-specific once the multi-agent direction was set) and `loadout` (strong metaphor, dropped in favor of an nvm-style expandable name). Sweep results for `agman`: npm name free, Homebrew formula free, no GitHub project of substance, no software company on it — nearest collisions are an investment firm and unrelated "AGM Tools" businesses, all non-software. Naming pattern follows podman (pod manager → pod-man; agent manager → ag-man).
+
+Rejected acronyms, verified taken or colonized: `acm`, `apm`, `amp` (Sourcegraph's coding agent), `aim` (aimhubio ML tracker), `acp` (Zed's Agent Client Protocol), `alm`, `aipm` ("AI project manager" tools), `prm`, `cam`, and the `*pm`/`*cm` single-prefix space (npm/rpm/gcm/scm/upm/opm). Rejected word families: "switch" (owned by the cc-switch ecosystem in this exact niche), "ctx/context" (now signals memory tools: ctx.rs, aictx, lean-ctx), "env" (drifting toward RL environments).
 
 ## Roadmap
 
-- **Multi-agent adapters**: Codex via `CODEX_HOME` (documented upstream, mechanism confirmed); Gemini CLI / Qwen Code / Kimi pending per-tool mechanism verification. Profile layout grows per-tool sections (`~/.loadouts/<name>/<tool>/`), and the shell wrapper exports one env var per detected tool.
-- **v0.2 — auto-switch**: `.loadout` file in a project root + cd hook (zsh `chpwd`, bash `PROMPT_COMMAND`, or direnv recipe); precedence slots between env var and persistent default.
+- **Multi-agent adapters**: Codex via `CODEX_HOME` (documented upstream, mechanism confirmed); Gemini CLI / Qwen Code / Kimi pending per-tool mechanism verification. Profile layout grows per-tool sections (`~/.agman/<name>/<tool>/`), and the shell wrapper exports one env var per detected tool.
+- **v0.2 — auto-switch**: `.agman` file in a project root + cd hook (zsh `chpwd`, bash `PROMPT_COMMAND`, or direnv recipe); precedence slots between env var and persistent default.
 - fish support, completions, `--fresh-auth`, profile export/import.
