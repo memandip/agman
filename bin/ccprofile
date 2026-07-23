@@ -1,0 +1,458 @@
+#!/usr/bin/env bash
+#
+# ccprofile — profile manager for Claude Code, in the spirit of AWS_PROFILE.
+#
+# Each profile is a self-contained Claude Code config directory under
+# $CCPROFILE_HOME (default: ~/.claude-profiles/<name>). Switching a profile
+# means pointing the CLAUDE_CONFIG_DIR environment variable at that directory.
+# Your stock ~/.claude is never modified; with no profile active, Claude Code
+# behaves exactly as if ccprofile were not installed.
+#
+# Requires bash >= 3.2 (stock macOS bash works). No other dependencies.
+
+set -euo pipefail
+
+CCPROFILE_VERSION="0.1.0"
+
+CCPROFILE_HOME="${CCPROFILE_HOME:-$HOME/.claude-profiles}"
+# Source of truth for seeding new profiles. Only ever read, never written.
+CLAUDE_HOME="${CCPROFILE_CLAUDE_HOME:-$HOME/.claude}"
+DEFAULT_FILE="$CCPROFILE_HOME/.default"
+
+# Ephemeral or machine-local state that should not be cloned into a profile.
+SEED_EXCLUDES=(backups cache downloads file-history ide locks logs paste-cache
+  projects session-env sessions shell-snapshots statsig tasks telemetry todos
+  history.jsonl mcp-needs-auth-cache.json .last-cleanup .DS_Store)
+
+# ---------------------------------------------------------------------------
+# helpers
+
+die() { printf 'ccprofile: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'ccprofile: warning: %s\n' "$*" >&2; }
+
+usage_die() { printf 'ccprofile: %s\n' "$*" >&2; printf "Run 'ccprofile help' for usage.\n" >&2; exit 2; }
+
+profile_dir() { printf '%s/%s' "$CCPROFILE_HOME" "$1"; }
+
+validate_name() {
+  local name="${1:-}"
+  [ -n "$name" ] || usage_die "profile name required"
+  [ "${#name}" -le 64 ] || die "profile name too long (max 64 chars)"
+  case "$name" in
+    .*|-*) die "invalid profile name '$name' (must not start with '.' or '-')" ;;
+    *[!A-Za-z0-9._-]*) die "invalid profile name '$name' (allowed: letters, digits, '.', '_', '-')" ;;
+  esac
+  case "$name" in
+    default|off|none|current|help)
+      die "'$name' is a reserved word and cannot be used as a profile name" ;;
+  esac
+}
+
+require_profile() {
+  validate_name "$1"
+  [ -d "$(profile_dir "$1")" ] || die "profile '$1' not found (run 'ccprofile list')"
+}
+
+default_profile() {
+  [ -f "$DEFAULT_FILE" ] || return 1
+  local name
+  IFS= read -r name < "$DEFAULT_FILE" || true
+  [ -n "$name" ] || return 1
+  printf '%s' "$name"
+}
+
+is_seed_excluded() {
+  local base="$1" x
+  for x in "${SEED_EXCLUDES[@]}"; do
+    if [ "$base" = "$x" ]; then return 0; fi
+  done
+  return 1
+}
+
+# Copy the contents of a config dir into a new profile dir, skipping
+# ephemeral state. Optionally symlink the plugins dir instead of copying it.
+seed_from_dir() {
+  local src="$1" dst="$2" link_plugins="$3" entry base
+  [ -d "$src" ] || { warn "seed source $src not found; profile starts empty"; return 0; }
+  while IFS= read -r -d '' entry; do
+    base="${entry##*/}"
+    if is_seed_excluded "$base"; then continue; fi
+    if [ "$base" = "plugins" ] && [ "$link_plugins" = "1" ]; then
+      if ! ln -s "$entry" "$dst/plugins" 2>/dev/null; then
+        warn "symlinks unavailable on this filesystem; copying plugins instead"
+        cp -R "$entry" "$dst/plugins"
+      fi
+      continue
+    fi
+    cp -R "$entry" "$dst/$base"
+  done < <(find "$src" -mindepth 1 -maxdepth 1 -print0)
+}
+
+# ---------------------------------------------------------------------------
+# commands
+
+cmd_create() {
+  local name="" mode="auto" from="" link_plugins=0 arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --empty) mode="empty" ;;
+      --from-current) mode="current" ;;
+      --from) [ $# -gt 0 ] || usage_die "--from requires a profile name"; from="$1"; shift; mode="clone" ;;
+      --link-plugins) link_plugins=1 ;;
+      -*) usage_die "unknown option '$arg' for create" ;;
+      *) [ -z "$name" ] && name="$arg" || usage_die "unexpected argument '$arg'" ;;
+    esac
+  done
+  validate_name "$name"
+
+  if [ "$mode" = "auto" ]; then
+    if [ -d "$CLAUDE_HOME" ]; then mode="current"; else mode="empty"; fi
+  fi
+
+  mkdir -p "$CCPROFILE_HOME"
+  local dir; dir="$(profile_dir "$name")"
+  [ ! -e "$dir" ] || die "profile '$name' already exists at $dir"
+  mkdir "$dir"
+
+  case "$mode" in
+    empty)
+      printf "Created empty profile '%s' at %s\n" "$name" "$dir"
+      ;;
+    current)
+      seed_from_dir "$CLAUDE_HOME" "$dir" "$link_plugins"
+      # User-scope MCP servers and global state live in .claude.json next to
+      # the config dir; with CLAUDE_CONFIG_DIR set, Claude Code reads it from
+      # inside the config dir instead.
+      local src_json; src_json="$(dirname "$CLAUDE_HOME")/.claude.json"
+      if [ -f "$src_json" ] && [ ! -e "$dir/.claude.json" ]; then
+        cp "$src_json" "$dir/.claude.json"
+      fi
+      printf "Created profile '%s' at %s (seeded from %s)\n" "$name" "$dir" "$CLAUDE_HOME"
+      ;;
+    clone)
+      require_profile "$from"
+      seed_from_dir "$(profile_dir "$from")" "$dir" "$link_plugins"
+      printf "Created profile '%s' at %s (cloned from '%s')\n" "$name" "$dir" "$from"
+      ;;
+  esac
+  printf "Switch to it with: ccprofile use %s\n" "$name"
+}
+
+cmd_list() {
+  [ -d "$CCPROFILE_HOME" ] || { printf "No profiles yet. Create one with: ccprofile create <name>\n"; return 0; }
+  local default_name="" entry name marker suffix found=0
+  default_name="$(default_profile 2>/dev/null || true)"
+  for entry in "$CCPROFILE_HOME"/*/; do
+    [ -d "$entry" ] || continue
+    found=1
+    entry="${entry%/}"
+    name="${entry##*/}"
+    marker="  "
+    [ "$name" = "$default_name" ] && marker="* "
+    suffix=""
+    [ "${CLAUDE_CONFIG_DIR:-}" = "$entry" ] && suffix="  (active in this shell)"
+    printf '%s%s%s\n' "$marker" "$name" "$suffix"
+  done
+  [ "$found" = "1" ] || printf "No profiles yet. Create one with: ccprofile create <name>\n"
+}
+
+cmd_use() {
+  local name="${1:-}"
+  require_profile "$name"
+  mkdir -p "$CCPROFILE_HOME"
+  printf '%s\n' "$name" > "$DEFAULT_FILE"
+  printf "Default profile set to '%s'.\n" "$name"
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ "$CLAUDE_CONFIG_DIR" != "$(profile_dir "$name")" ]; then
+    warn "CLAUDE_CONFIG_DIR is already set in this shell and overrides the default"
+  fi
+  if [ -z "${CCPROFILE_SHELL_INTEGRATION:-}" ]; then
+    printf "Shell integration not detected. To make the 'claude' command honor this,\n"
+    printf "add to your shell rc file:  eval \"\$(ccprofile init zsh)\"   # or: init bash\n"
+  fi
+}
+
+cmd_off() {
+  rm -f "$DEFAULT_FILE"
+  printf "Default profile cleared. Claude Code will use the stock %s.\n" "$CLAUDE_HOME"
+}
+
+cmd_current() {
+  local name
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    name="${CLAUDE_CONFIG_DIR##*/}"
+    if [ "$(profile_dir "$name")" = "$CLAUDE_CONFIG_DIR" ] && [ -d "$CLAUDE_CONFIG_DIR" ]; then
+      printf '%s  (via CLAUDE_CONFIG_DIR in this shell)\n' "$name"
+    else
+      printf '(external dir via CLAUDE_CONFIG_DIR: %s)\n' "$CLAUDE_CONFIG_DIR"
+    fi
+    return 0
+  fi
+  if name="$(default_profile)"; then
+    if [ -d "$(profile_dir "$name")" ]; then
+      printf '%s  (default)\n' "$name"
+    else
+      printf '%s  (default, but its directory is missing — run: ccprofile doctor)\n' "$name"
+    fi
+    return 0
+  fi
+  printf 'none  (stock %s)\n' "$CLAUDE_HOME"
+}
+
+# Machine-readable resolver used by the shell integration's claude() wrapper.
+# Intentionally ignores CLAUDE_CONFIG_DIR: an explicit env var always wins and
+# is handled by the wrapper itself.
+cmd_dir() {
+  local arg="${1:-}"
+  if [ "$arg" = "--active" ]; then
+    local name
+    name="$(default_profile)" || exit 1
+    local dir; dir="$(profile_dir "$name")"
+    [ -d "$dir" ] || exit 1
+    printf '%s\n' "$dir"
+    return 0
+  fi
+  require_profile "$arg"
+  printf '%s\n' "$(profile_dir "$arg")"
+}
+
+cmd_env() {
+  local name="${1:-}"
+  require_profile "$name"
+  printf 'export CLAUDE_CONFIG_DIR=%q\n' "$(profile_dir "$name")"
+}
+
+cmd_run() {
+  local name="${1:-}"
+  require_profile "$name"
+  shift
+  [ "${1:-}" = "--" ] && shift
+  command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
+  exec env CLAUDE_CONFIG_DIR="$(profile_dir "$name")" claude ${1+"$@"}
+}
+
+cmd_exec() {
+  local name="${1:-}"
+  require_profile "$name"
+  shift
+  [ "${1:-}" = "--" ] && shift
+  [ $# -gt 0 ] || usage_die "exec requires a command: ccprofile exec <name> -- <command...>"
+  exec env CLAUDE_CONFIG_DIR="$(profile_dir "$name")" "$@"
+}
+
+cmd_rename() {
+  local old="${1:-}" new="${2:-}"
+  require_profile "$old"
+  validate_name "$new"
+  [ ! -e "$(profile_dir "$new")" ] || die "profile '$new' already exists"
+  mv "$(profile_dir "$old")" "$(profile_dir "$new")"
+  if [ "$(default_profile 2>/dev/null || true)" = "$old" ]; then
+    printf '%s\n' "$new" > "$DEFAULT_FILE"
+  fi
+  printf "Renamed profile '%s' to '%s'.\n" "$old" "$new"
+}
+
+cmd_remove() {
+  local name="" yes=0 arg
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      -y|--yes) yes=1 ;;
+      -*) usage_die "unknown option '$arg' for remove" ;;
+      *) [ -z "$name" ] && name="$arg" || usage_die "unexpected argument '$arg'" ;;
+    esac
+  done
+  require_profile "$name"
+  local dir; dir="$(profile_dir "$name")"
+  if [ "$yes" != "1" ]; then
+    printf "Delete profile '%s' and everything in %s? [y/N] " "$name" "$dir"
+    local reply=""
+    IFS= read -r reply || true
+    case "$reply" in y|Y|yes|YES) ;; *) printf 'Aborted.\n'; return 1 ;; esac
+  fi
+  rm -rf "$dir"
+  if [ "$(default_profile 2>/dev/null || true)" = "$name" ]; then
+    rm -f "$DEFAULT_FILE"
+    printf "Removed profile '%s' (it was the default; default cleared).\n" "$name"
+  else
+    printf "Removed profile '%s'.\n" "$name"
+  fi
+}
+
+cmd_doctor() {
+  printf 'ccprofile %s\n' "$CCPROFILE_VERSION"
+  printf 'profiles home: %s\n' "$CCPROFILE_HOME"
+
+  if command -v claude >/dev/null 2>&1; then
+    local ver=""
+    ver="$(claude --version 2>/dev/null | head -1 || true)"
+    printf 'claude CLI:    %s (%s)\n' "$(command -v claude)" "${ver:-version unknown}"
+  else
+    printf 'claude CLI:    NOT FOUND on PATH\n'
+  fi
+
+  local count=0 entry
+  if [ -d "$CCPROFILE_HOME" ]; then
+    for entry in "$CCPROFILE_HOME"/*/; do
+      [ -d "$entry" ] && count=$((count + 1))
+    done
+  fi
+  printf 'profiles:      %s\n' "$count"
+
+  local name
+  if name="$(default_profile 2>/dev/null)"; then
+    if [ -d "$(profile_dir "$name")" ]; then
+      printf 'default:       %s\n' "$name"
+    else
+      printf 'default:       %s (STALE — directory missing; run: ccprofile off)\n' "$name"
+    fi
+  else
+    printf 'default:       none (stock %s)\n' "$CLAUDE_HOME"
+  fi
+
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    printf 'env override:  CLAUDE_CONFIG_DIR=%s\n' "$CLAUDE_CONFIG_DIR"
+  else
+    printf 'env override:  not set in this shell\n'
+  fi
+
+  if [ -n "${CCPROFILE_SHELL_INTEGRATION:-}" ]; then
+    printf 'shell hook:    installed\n'
+  else
+    printf 'shell hook:    not detected (add: eval "$(ccprofile init zsh)" to your rc file)\n'
+  fi
+
+  local tmp
+  tmp="$(mktemp -d)"
+  if ln -s "$tmp" "$tmp/link-test" 2>/dev/null; then
+    printf 'symlinks:      supported\n'
+  else
+    printf 'symlinks:      NOT supported (--link-plugins will fall back to copying)\n'
+  fi
+  rm -rf "$tmp"
+
+  printf '\nnotes:\n'
+  printf '  - CLAUDE_CONFIG_DIR is honored by the claude CLI but is not officially\n'
+  printf '    documented (anthropics/claude-code#33430).\n'
+  printf '  - The VS Code extension currently ignores CLAUDE_CONFIG_DIR\n'
+  printf '    (anthropics/claude-code#30538); profiles apply to terminal sessions.\n'
+}
+
+cmd_init() {
+  local shell="${1:-auto}"
+  if [ "$shell" = "auto" ]; then
+    shell="${SHELL:-bash}"
+    shell="${shell##*/}"
+  fi
+  case "$shell" in
+    zsh|bash) ;;
+    *) die "unsupported shell '$shell' (zsh and bash are supported; fish is on the roadmap)" ;;
+  esac
+  cat <<'CCPROFILE_SNIPPET'
+# >>> ccprofile shell integration >>>
+export CCPROFILE_SHELL_INTEGRATION=1
+
+# Wraps the ccprofile CLI so `use` / `off` also update the current shell.
+ccprofile() {
+  case "${1:-}" in
+    use)
+      command ccprofile "$@" || return $?
+      local _ccp_dir
+      if _ccp_dir="$(command ccprofile dir "${2:-}" 2>/dev/null)" && [ -n "$_ccp_dir" ]; then
+        export CLAUDE_CONFIG_DIR="$_ccp_dir"
+      fi
+      ;;
+    off)
+      command ccprofile "$@" || return $?
+      unset CLAUDE_CONFIG_DIR
+      ;;
+    *)
+      command ccprofile "$@"
+      ;;
+  esac
+}
+
+# Makes plain `claude` honor the persistent default profile. An explicit
+# CLAUDE_CONFIG_DIR in the environment always wins; with no default set,
+# claude runs completely untouched.
+claude() {
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    command claude "$@"
+    return $?
+  fi
+  local _ccp_dir
+  if _ccp_dir="$(command ccprofile dir --active 2>/dev/null)" && [ -n "$_ccp_dir" ]; then
+    CLAUDE_CONFIG_DIR="$_ccp_dir" command claude "$@"
+  else
+    command claude "$@"
+  fi
+}
+# <<< ccprofile shell integration <<<
+CCPROFILE_SNIPPET
+}
+
+cmd_help() {
+  cat <<EOF
+ccprofile $CCPROFILE_VERSION — profile manager for Claude Code (AWS_PROFILE-style)
+
+Usage: ccprofile <command> [args]
+
+Commands:
+  create <name> [opts]   Create a profile. Default: seeded from ~/.claude.
+                           --empty          start blank
+                           --from <name>    clone another profile
+                           --from-current   seed from ~/.claude (explicit)
+                           --link-plugins   symlink plugins/ instead of copying
+  list                   List profiles (* = default)
+  use <name>             Set persistent default profile
+  off                    Clear default; back to stock ~/.claude
+  current                Show the active profile and how it was selected
+  dir <name>|--active    Print a profile's directory (--active: resolved default)
+  env <name>             Print an export line: eval "\$(ccprofile env work)"
+  run <name> [-- args]   Launch claude once under a profile
+  exec <name> -- <cmd>   Run any command with CLAUDE_CONFIG_DIR set
+  rename <old> <new>     Rename a profile
+  remove <name> [--yes]  Delete a profile directory
+  doctor                 Diagnose setup
+  init [zsh|bash]        Print shell integration; add to rc:
+                           eval "\$(ccprofile init zsh)"
+  help, version
+
+Selection precedence (highest first):
+  1. CLAUDE_CONFIG_DIR set in the environment   (never overridden)
+  2. Persistent default set via 'ccprofile use' (applied by the shell hook)
+  3. None: stock ~/.claude, exactly as without ccprofile
+
+Environment:
+  CCPROFILE_HOME           Profile storage root (default: ~/.claude-profiles)
+  CCPROFILE_CLAUDE_HOME    Seed source (default: ~/.claude)
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+
+main() {
+  local cmd="${1:-help}"
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    create)  cmd_create ${1+"$@"} ;;
+    list|ls) cmd_list ;;
+    use)     cmd_use ${1+"$@"} ;;
+    off)     cmd_off ;;
+    current) cmd_current ;;
+    dir)     cmd_dir ${1+"$@"} ;;
+    env)     cmd_env ${1+"$@"} ;;
+    run)     cmd_run ${1+"$@"} ;;
+    exec)    cmd_exec ${1+"$@"} ;;
+    rename)  cmd_rename ${1+"$@"} ;;
+    remove|rm) cmd_remove ${1+"$@"} ;;
+    doctor)  cmd_doctor ;;
+    init)    cmd_init ${1+"$@"} ;;
+    help|-h|--help) cmd_help ;;
+    version|-v|--version) printf 'ccprofile %s\n' "$CCPROFILE_VERSION" ;;
+    *) usage_die "unknown command '$cmd'" ;;
+  esac
+}
+
+main ${1+"$@"}
