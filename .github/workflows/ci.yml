@@ -21,4 +21,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Lint shell scripts
-        run: shellcheck -S warning bin/agman install.sh tests/run.sh
+        # SC2088 excluded: '~/.claude' appears in user-facing message strings
+        # and test descriptions, never as a path the shell must expand.
+        run: shellcheck -S warning -e SC2088 bin/agman install.sh tests/run.sh
