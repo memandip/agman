@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# ccprofile installer. Works two ways:
+# loadout installer. Works two ways:
 #   1. From a clone:  ./install.sh
-#   2. Piped:         curl -fsSL https://raw.githubusercontent.com/OWNER/ccprofile/main/install.sh | bash
+#   2. Piped:         curl -fsSL https://raw.githubusercontent.com/OWNER/loadout/main/install.sh | bash
 #
-# Installs a single bash script to ~/.local/bin (override: CCPROFILE_BIN_DIR).
+# Installs a single bash script to ~/.local/bin (override: LOADOUT_BIN_DIR).
 set -euo pipefail
 
-BIN_DIR="${CCPROFILE_BIN_DIR:-$HOME/.local/bin}"
-RAW_URL="${CCPROFILE_RAW_URL:-https://raw.githubusercontent.com/OWNER/ccprofile/main}"
+BIN_DIR="${LOADOUT_BIN_DIR:-$HOME/.local/bin}"
+RAW_URL="${LOADOUT_RAW_URL:-https://raw.githubusercontent.com/OWNER/loadout/main}"
 
 script_dir=""
 if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]:-}" ]; then
@@ -16,17 +16,17 @@ fi
 
 mkdir -p "$BIN_DIR"
 
-if [ -n "$script_dir" ] && [ -f "$script_dir/bin/ccprofile" ]; then
-  cp "$script_dir/bin/ccprofile" "$BIN_DIR/ccprofile"
+if [ -n "$script_dir" ] && [ -f "$script_dir/bin/loadout" ]; then
+  cp "$script_dir/bin/loadout" "$BIN_DIR/loadout"
   src="local clone"
 else
   command -v curl >/dev/null 2>&1 || { printf 'installer: curl is required for remote install\n' >&2; exit 1; }
-  curl -fsSL "$RAW_URL/bin/ccprofile" -o "$BIN_DIR/ccprofile"
+  curl -fsSL "$RAW_URL/bin/loadout" -o "$BIN_DIR/loadout"
   src="$RAW_URL"
 fi
-chmod +x "$BIN_DIR/ccprofile"
+chmod +x "$BIN_DIR/loadout"
 
-printf 'Installed ccprofile to %s (from %s)\n' "$BIN_DIR/ccprofile" "$src"
+printf 'Installed loadout to %s (from %s)\n' "$BIN_DIR/loadout" "$src"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
@@ -38,6 +38,6 @@ esac
 
 printf '\nNext steps:\n'
 printf '  1. Add shell integration to ~/.zshrc or ~/.bashrc:\n'
-printf '       eval "$(ccprofile init zsh)"    # or: init bash\n'
-printf '  2. Create profiles:   ccprofile create work && ccprofile create personal\n'
-printf '  3. Switch:            ccprofile use work\n'
+printf '       eval "$(loadout init zsh)"    # or: init bash\n'
+printf '  2. Create profiles:   loadout create work && loadout create personal\n'
+printf '  3. Switch:            loadout use work\n'
