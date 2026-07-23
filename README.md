@@ -2,22 +2,33 @@
 
 **agman** — **ag**ent **man**ager. Config profiles for AI coding agents: switch between complete work/personal setups the way `AWS_PROFILE` switches AWS accounts. Supports [Claude Code](https://code.claude.com/docs) today; Codex and Gemini CLI adapters are on the roadmap.
 
-A profile is everything your agent *is* in a given context: its own `CLAUDE.md`, settings, rules, skills, agents, plugins, and MCP servers, kept as a complete config directory. `agman` creates, lists, and switches them by pointing the `CLAUDE_CONFIG_DIR` environment variable at the right directory. One pure-bash script, no dependencies, works on macOS (stock bash 3.2), Linux, WSL, and Git Bash.
+A profile is everything your agent *is* in a given context: its own `CLAUDE.md`, settings, rules, skills, agents, plugins, and MCP servers, kept as a complete config directory under `~/.agman/<name>`. `agman use` activates one by symlinking `~/.claude` at it — no shell setup required, and it applies to every new Claude Code session on this machine, IDE extensions included. One pure-bash script, no dependencies, works on macOS (stock bash 3.2), Linux, WSL, and Git Bash.
 
 ```console
-$ agman create work        # seeded from your current ~/.claude
-$ agman create personal --empty
+$ agman create personal              # empty profile with a starter CLAUDE.md
+$ agman create work --copy-current   # seeded from your current Claude config
 $ agman use work
-Default profile set to 'work'.
-$ claude                       # runs with the work profile
-$ agman off                # back to stock ~/.claude
+Switched to profile 'work' (~/.claude -> ~/.agman/work).
+Your original Claude config was backed up as the 'global' profile.
+$ claude                             # every new session now uses 'work'
+$ agman off                          # fully restore your original ~/.claude
 ```
 
-## Why
+## How it works
 
-Claude Code layers a single global `~/.claude` (instructions, skills, agents, plugins) into **every** project. If your office and personal work need different rule sets, different skills, or different accounts, there is no native profile mechanism — `CLAUDE_CONFIG_DIR` is the only lever, and it's per-process. `agman` gives it AWS-profile ergonomics: named profiles, a persistent default, per-shell overrides, and one-shot runs.
+`agman use <name>` symlinks `~/.claude` (and `~/.claude.json`, so user-scope MCP servers follow the profile) at the profile directory:
 
-**Guarantee:** your stock `~/.claude` is never modified. Seeding only reads from it, and with no profile active, `claude` runs exactly as if agman were not installed.
+- The **first** time you switch, your original `~/.claude` is moved to `~/.agman/global` — it becomes a normal profile named `global`. Switch back to it anytime with `agman use global`, or run `agman off` to physically restore it and stop managing `~/.claude` entirely.
+- The symlink doubles as the marker: a **real directory** at `~/.claude` means agman isn't managing anything; a **symlink into `~/.agman/`** means that profile is active. `agman current` (or `ls -l ~/.claude`) tells you which.
+- agman refuses to touch a `~/.claude` symlink it didn't create (e.g. dotfiles managers), and refuses to remove the active profile.
+
+Selection precedence, highest first:
+
+1. **`CLAUDE_CONFIG_DIR` set in a shell** — wins in that shell only, never overridden. Use `agman env`, `agman run`, or `agman exec` for per-shell/per-process profiles alongside the global switch.
+2. **The `~/.claude` symlink** set by `agman use` — machine-wide for all new sessions, no shell integration needed.
+3. **Nothing** — stock `~/.claude`, untouched behavior.
+
+Running sessions keep the config they started with; switching affects new sessions.
 
 ## Install
 
@@ -33,45 +44,51 @@ Or piped (no clone):
 curl -fsSL https://raw.githubusercontent.com/memandip/agman/main/install.sh | bash
 ```
 
-Then add shell integration to `~/.zshrc` or `~/.bashrc` — this is what makes plain `claude` honor your default profile:
+Update later with:
 
 ```bash
-eval "$(agman init zsh)"   # or: init bash
+agman update
 ```
+
+(`update` does a `git pull` when agman runs from a checkout, otherwise downloads the latest release script and swaps it in atomically after validation.)
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `create <name>` | New profile, seeded from `~/.claude` (skips sessions/cache/history). Flags: `--empty`, `--from <profile>`, `--link-plugins` |
-| `list` | List profiles; `*` marks the default |
-| `use <name>` | Set the persistent default (shell hook also applies it to the current shell) |
-| `off` | Clear the default — back to stock `~/.claude` |
+| `create <name>` | New **empty** profile with a starter `CLAUDE.md`. Flags: `--copy-current` (seed from current config; skips sessions/cache/history), `--from <profile>`, `--link-plugins` |
+| `use <name>` | Activate: symlink `~/.claude` → profile. First use backs up your original config as the `global` profile |
+| `off` | Deactivate and physically restore your original `~/.claude` |
 | `current` | Show the active profile and how it was selected |
-| `dir <name>` / `dir --active` | Print a profile's directory |
-| `env <name>` | Print an export line: `eval "$(agman env work)"` |
-| `run <name> [-- args]` | Launch `claude` once under a profile, without switching |
+| `list` | List profiles; `(active)` marks the `~/.claude` target |
+| `dir <name>` / `env <name>` | Print a profile's directory / an `export CLAUDE_CONFIG_DIR=…` line |
+| `run <name> [-- args]` | Launch `claude` once under a profile without switching globally |
 | `exec <name> -- <cmd>` | Run any command with `CLAUDE_CONFIG_DIR` set |
-| `rename <old> <new>` / `remove <name>` | Manage profiles |
-| `doctor` | Diagnose setup (CLI found, stale default, symlink support, …) |
-| `init [zsh\|bash]` | Print the shell integration snippet |
+| `rename <old> <new>` / `remove <name>` | Manage profiles (rename repoints the symlink; remove refuses if active) |
+| `update` | Self-update from git or GitHub |
+| `doctor` | Diagnose setup (symlink state, backup presence, stale default, …) |
+| `init [zsh\|bash]` | Optional per-shell integration (see below) |
 
-## How it works
+## Per-shell profiles (optional)
 
-Selection precedence, highest first:
+The global symlink switch needs no shell setup. If you also want *per-shell* profiles — e.g. a work terminal and a personal terminal at the same time — either eval an export line:
 
-1. **`CLAUDE_CONFIG_DIR` set in the environment** — never overridden. Per-shell, so two terminals can run different profiles at once (`eval "$(agman env personal)"`).
-2. **Persistent default** set by `agman use`, stored in `~/.agman/.default` and applied by the shell hook's `claude()` wrapper.
-3. **Nothing set** — stock `~/.claude`, untouched behavior.
+```bash
+eval "$(agman env personal)"
+```
 
-Profiles live under `~/.agman/<name>/` (override with `AGMAN_HOME`). Seeding copies your config but excludes ephemeral state: sessions, caches, history, per-project auto-memory, telemetry. Your user-scope `~/.claude.json` (MCP servers, global state) is copied into the profile, since Claude Code reads it from inside the config dir when `CLAUDE_CONFIG_DIR` is set.
+or add the optional hook to `~/.zshrc` / `~/.bashrc`, which makes `agman use`/`off` also set `CLAUDE_CONFIG_DIR` in the current shell:
+
+```bash
+eval "$(agman init zsh)"   # or: init bash
+```
 
 ## Caveats you should know
 
-- `CLAUDE_CONFIG_DIR` is honored by the Claude Code CLI but **not officially documented** ([anthropics/claude-code#33430](https://github.com/anthropics/claude-code/issues/33430)). It could change; `doctor` and the test suite exist to catch that early.
-- The **VS Code extension ignores it** ([anthropics/claude-code#30538](https://github.com/anthropics/claude-code/issues/30538)) — profiles apply to terminal sessions.
-- **Auth is per config dir.** A seeded profile inherits credentials copied from `~/.claude` where they exist on disk (Linux); on macOS, credentials live in the Keychain and may be shared. To use a different account in a profile, run `claude /login` inside it once. Treat profile dirs as sensitive.
-- On Windows (Git Bash), symlinks may require Developer Mode; `--link-plugins` falls back to copying.
+- **Switching is machine-global** for new sessions (that's the point). Terminals or IDE windows with running Claude sessions keep the config they launched with.
+- `use` requires symlink support; on Windows use WSL, or Git Bash with Developer Mode enabled.
+- **Auth is per profile.** A `--copy-current` profile inherits credentials copied from your config where they exist on disk (Linux); on macOS credentials live in the Keychain and may be shared. To use a different account in a profile, run `claude /login` inside it once. Treat profile dirs as sensitive.
+- `CLAUDE_CONFIG_DIR` (used by the per-shell layer) is honored by the Claude Code CLI but not officially documented ([anthropics/claude-code#33430](https://github.com/anthropics/claude-code/issues/33430)). The global symlink switch does not depend on it.
 
 ## Development
 
@@ -83,7 +100,7 @@ CI runs the suite on Ubuntu + macOS and lints with shellcheck on every push.
 
 ## Roadmap
 
-- **Multi-agent adapters**: Codex (via [`CODEX_HOME`](https://developers.openai.com/codex/environment-variables), mechanism confirmed), then Gemini CLI / Qwen Code / Kimi; profiles grow per-tool sections
+- **Multi-agent adapters**: Codex (via [`CODEX_HOME`](https://developers.openai.com/codex/environment-variables) / `~/.codex`), then Gemini CLI / Qwen Code / Kimi; profiles grow per-tool sections
 - `.agman` file for **per-directory auto-switching** (the `.nvmrc`/direnv analog)
 - fish shell support, tab completions
 - `--fresh-auth` seeding (exclude copied credentials)

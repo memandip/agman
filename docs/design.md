@@ -37,13 +37,25 @@ Two layers, the pyenv/direnv pattern:
 
 Profile names: `^[A-Za-z0-9][A-Za-z0-9._-]*$`, max 64 chars; `default|off|none|current|help` reserved. Validation is what makes `remove`'s `rm -rf "$AGMAN_HOME/$name"` safe.
 
-### Selection precedence (the contract)
+### Selection precedence (the contract, v0.2)
 
-1. `CLAUDE_CONFIG_DIR` already set in the environment — never overridden by the tool.
-2. Persistent default (`.default` file), applied only by the shell hook's `claude()` wrapper.
+1. `CLAUDE_CONFIG_DIR` already set in the environment — per-shell, never overridden by the tool.
+2. The `~/.claude` symlink set by `agman use` — machine-wide for all new sessions.
 3. Nothing: stock `~/.claude`.
 
-`dir --active` resolves only layer 2; the wrapper checks layer 1 itself. This keeps the resolver dumb and the precedence enforced in exactly one place.
+`dir --active` resolves the persistent default (`.default` file) for the optional shell hook; the symlink is the primary activation mechanism and needs no integration.
+
+### v0.2 — symlink activation (2026-07-23)
+
+v0.1 activated profiles purely via `CLAUDE_CONFIG_DIR`, which required shell integration and was ignored by the VS Code extension — first real-world use hit exactly that ("claude still not taking the profile"). v0.2 makes activation physical:
+
+- `use <name>`: if `~/.claude` is a real directory, it is moved to `~/.agman/global` (a normal, switchable profile — the backup); then `~/.claude` is symlinked at the profile. `~/.claude.json` gets the same treatment so user-scope MCP servers follow the profile (an empty `{}` is created in profiles that lack one).
+- The symlink is also the state marker: real dir = unmanaged, symlink into `$AGMAN_HOME` = managed (readlink names the active profile). Foreign symlinks (dotfiles managers) are refused, never replaced.
+- `off`: removes the symlinks and moves `global` back into place — full physical restore.
+- Guards: `remove` refuses the active profile (a dangling `~/.claude` would break Claude); `rename` repoints both symlinks when renaming the active profile; `global` is reserved as a creatable name.
+- Trade-off accepted: switching is machine-global for new sessions. Per-shell divergence remains available via `env`/`run`/`exec` and the optional hook (layer 1).
+- `create` now defaults to an empty profile with a starter CLAUDE.md; `--copy-current` opts into seeding (was the default in v0.1).
+- New `update` command: `git pull --ff-only` when running from a checkout, else download `bin/agman` from `$AGMAN_RAW_URL`, validate with `bash -n`, and atomically swap (same-directory `mktemp` + `mv`).
 
 ### Seeding policy
 
