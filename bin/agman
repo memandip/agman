@@ -1,25 +1,25 @@
 #!/usr/bin/env bash
 #
-# loadout — switchable config profiles ("loadouts") for AI coding agents,
+# agman — agent manager: switchable config profiles for AI coding agents,
 # in the spirit of AWS_PROFILE. Claude Code adapter today; Codex (CODEX_HOME)
 # and Gemini CLI are on the roadmap.
 #
 # Each profile is a self-contained Claude Code config directory under
-# $LOADOUT_HOME (default: ~/.loadouts/<name>). Switching a profile
+# $AGMAN_HOME (default: ~/.agman/<name>). Switching a profile
 # means pointing the CLAUDE_CONFIG_DIR environment variable at that directory.
 # Your stock ~/.claude is never modified; with no profile active, Claude Code
-# behaves exactly as if loadout were not installed.
+# behaves exactly as if agman were not installed.
 #
 # Requires bash >= 3.2 (stock macOS bash works). No other dependencies.
 
 set -euo pipefail
 
-LOADOUT_VERSION="0.1.0"
+AGMAN_VERSION="0.1.0"
 
-LOADOUT_HOME="${LOADOUT_HOME:-$HOME/.loadouts}"
+AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Source of truth for seeding new profiles. Only ever read, never written.
-CLAUDE_HOME="${LOADOUT_CLAUDE_HOME:-$HOME/.claude}"
-DEFAULT_FILE="$LOADOUT_HOME/.default"
+CLAUDE_HOME="${AGMAN_CLAUDE_HOME:-$HOME/.claude}"
+DEFAULT_FILE="$AGMAN_HOME/.default"
 
 # Ephemeral or machine-local state that should not be cloned into a profile.
 SEED_EXCLUDES=(backups cache downloads file-history ide locks logs paste-cache
@@ -29,12 +29,12 @@ SEED_EXCLUDES=(backups cache downloads file-history ide locks logs paste-cache
 # ---------------------------------------------------------------------------
 # helpers
 
-die() { printf 'loadout: %s\n' "$*" >&2; exit 1; }
-warn() { printf 'loadout: warning: %s\n' "$*" >&2; }
+die() { printf 'agman: %s\n' "$*" >&2; exit 1; }
+warn() { printf 'agman: warning: %s\n' "$*" >&2; }
 
-usage_die() { printf 'loadout: %s\n' "$*" >&2; printf "Run 'loadout help' for usage.\n" >&2; exit 2; }
+usage_die() { printf 'agman: %s\n' "$*" >&2; printf "Run 'agman help' for usage.\n" >&2; exit 2; }
 
-profile_dir() { printf '%s/%s' "$LOADOUT_HOME" "$1"; }
+profile_dir() { printf '%s/%s' "$AGMAN_HOME" "$1"; }
 
 validate_name() {
   local name="${1:-}"
@@ -45,14 +45,14 @@ validate_name() {
     *[!A-Za-z0-9._-]*) die "invalid profile name '$name' (allowed: letters, digits, '.', '_', '-')" ;;
   esac
   case "$name" in
-    default|off|none|current|help|equip)
+    default|off|none|current|help)
       die "'$name' is a reserved word and cannot be used as a profile name" ;;
   esac
 }
 
 require_profile() {
   validate_name "$1"
-  [ -d "$(profile_dir "$1")" ] || die "profile '$1' not found (run 'loadout list')"
+  [ -d "$(profile_dir "$1")" ] || die "profile '$1' not found (run 'agman list')"
 }
 
 default_profile() {
@@ -112,7 +112,7 @@ cmd_create() {
     if [ -d "$CLAUDE_HOME" ]; then mode="current"; else mode="empty"; fi
   fi
 
-  mkdir -p "$LOADOUT_HOME"
+  mkdir -p "$AGMAN_HOME"
   local dir; dir="$(profile_dir "$name")"
   [ ! -e "$dir" ] || die "profile '$name' already exists at $dir"
   mkdir "$dir"
@@ -138,14 +138,14 @@ cmd_create() {
       printf "Created profile '%s' at %s (cloned from '%s')\n" "$name" "$dir" "$from"
       ;;
   esac
-  printf "Switch to it with: loadout use %s\n" "$name"
+  printf "Switch to it with: agman use %s\n" "$name"
 }
 
 cmd_list() {
-  [ -d "$LOADOUT_HOME" ] || { printf "No profiles yet. Create one with: loadout create <name>\n"; return 0; }
+  [ -d "$AGMAN_HOME" ] || { printf "No profiles yet. Create one with: agman create <name>\n"; return 0; }
   local default_name="" entry name marker suffix found=0
   default_name="$(default_profile 2>/dev/null || true)"
-  for entry in "$LOADOUT_HOME"/*/; do
+  for entry in "$AGMAN_HOME"/*/; do
     [ -d "$entry" ] || continue
     found=1
     entry="${entry%/}"
@@ -156,21 +156,21 @@ cmd_list() {
     [ "${CLAUDE_CONFIG_DIR:-}" = "$entry" ] && suffix="  (active in this shell)"
     printf '%s%s%s\n' "$marker" "$name" "$suffix"
   done
-  [ "$found" = "1" ] || printf "No profiles yet. Create one with: loadout create <name>\n"
+  [ "$found" = "1" ] || printf "No profiles yet. Create one with: agman create <name>\n"
 }
 
 cmd_use() {
   local name="${1:-}"
   require_profile "$name"
-  mkdir -p "$LOADOUT_HOME"
+  mkdir -p "$AGMAN_HOME"
   printf '%s\n' "$name" > "$DEFAULT_FILE"
   printf "Default profile set to '%s'.\n" "$name"
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ] && [ "$CLAUDE_CONFIG_DIR" != "$(profile_dir "$name")" ]; then
     warn "CLAUDE_CONFIG_DIR is already set in this shell and overrides the default"
   fi
-  if [ -z "${LOADOUT_SHELL_INTEGRATION:-}" ]; then
+  if [ -z "${AGMAN_SHELL_INTEGRATION:-}" ]; then
     printf "Shell integration not detected. To make the 'claude' command honor this,\n"
-    printf "add to your shell rc file:  eval \"\$(loadout init zsh)\"   # or: init bash\n"
+    printf "add to your shell rc file:  eval \"\$(agman init zsh)\"   # or: init bash\n"
   fi
 }
 
@@ -194,7 +194,7 @@ cmd_current() {
     if [ -d "$(profile_dir "$name")" ]; then
       printf '%s  (default)\n' "$name"
     else
-      printf '%s  (default, but its directory is missing — run: loadout doctor)\n' "$name"
+      printf '%s  (default, but its directory is missing — run: agman doctor)\n' "$name"
     fi
     return 0
   fi
@@ -238,7 +238,7 @@ cmd_exec() {
   require_profile "$name"
   shift
   [ "${1:-}" = "--" ] && shift
-  [ $# -gt 0 ] || usage_die "exec requires a command: loadout exec <name> -- <command...>"
+  [ $# -gt 0 ] || usage_die "exec requires a command: agman exec <name> -- <command...>"
   exec env CLAUDE_CONFIG_DIR="$(profile_dir "$name")" "$@"
 }
 
@@ -282,8 +282,8 @@ cmd_remove() {
 }
 
 cmd_doctor() {
-  printf 'loadout %s\n' "$LOADOUT_VERSION"
-  printf 'profiles home: %s\n' "$LOADOUT_HOME"
+  printf 'agman %s\n' "$AGMAN_VERSION"
+  printf 'profiles home: %s\n' "$AGMAN_HOME"
 
   if command -v claude >/dev/null 2>&1; then
     local ver=""
@@ -294,8 +294,8 @@ cmd_doctor() {
   fi
 
   local count=0 entry
-  if [ -d "$LOADOUT_HOME" ]; then
-    for entry in "$LOADOUT_HOME"/*/; do
+  if [ -d "$AGMAN_HOME" ]; then
+    for entry in "$AGMAN_HOME"/*/; do
       [ -d "$entry" ] && count=$((count + 1))
     done
   fi
@@ -306,7 +306,7 @@ cmd_doctor() {
     if [ -d "$(profile_dir "$name")" ]; then
       printf 'default:       %s\n' "$name"
     else
-      printf 'default:       %s (STALE — directory missing; run: loadout off)\n' "$name"
+      printf 'default:       %s (STALE — directory missing; run: agman off)\n' "$name"
     fi
   else
     printf 'default:       none (stock %s)\n' "$CLAUDE_HOME"
@@ -318,10 +318,10 @@ cmd_doctor() {
     printf 'env override:  not set in this shell\n'
   fi
 
-  if [ -n "${LOADOUT_SHELL_INTEGRATION:-}" ]; then
+  if [ -n "${AGMAN_SHELL_INTEGRATION:-}" ]; then
     printf 'shell hook:    installed\n'
   else
-    printf 'shell hook:    not detected (add: eval "$(loadout init zsh)" to your rc file)\n'
+    printf 'shell hook:    not detected (add: eval "$(agman init zsh)" to your rc file)\n'
   fi
 
   local tmp
@@ -350,26 +350,26 @@ cmd_init() {
     zsh|bash) ;;
     *) die "unsupported shell '$shell' (zsh and bash are supported; fish is on the roadmap)" ;;
   esac
-  cat <<'LOADOUT_SNIPPET'
-# >>> loadout shell integration >>>
-export LOADOUT_SHELL_INTEGRATION=1
+  cat <<'AGMAN_SNIPPET'
+# >>> agman shell integration >>>
+export AGMAN_SHELL_INTEGRATION=1
 
-# Wraps the loadout CLI so `use` / `off` also update the current shell.
-loadout() {
+# Wraps the agman CLI so `use` / `off` also update the current shell.
+agman() {
   case "${1:-}" in
     use)
-      command loadout "$@" || return $?
-      local _ccp_dir
-      if _ccp_dir="$(command loadout dir "${2:-}" 2>/dev/null)" && [ -n "$_ccp_dir" ]; then
-        export CLAUDE_CONFIG_DIR="$_ccp_dir"
+      command agman "$@" || return $?
+      local _agman_dir
+      if _agman_dir="$(command agman dir "${2:-}" 2>/dev/null)" && [ -n "$_agman_dir" ]; then
+        export CLAUDE_CONFIG_DIR="$_agman_dir"
       fi
       ;;
     off)
-      command loadout "$@" || return $?
+      command agman "$@" || return $?
       unset CLAUDE_CONFIG_DIR
       ;;
     *)
-      command loadout "$@"
+      command agman "$@"
       ;;
   esac
 }
@@ -382,22 +382,22 @@ claude() {
     command claude "$@"
     return $?
   fi
-  local _ccp_dir
-  if _ccp_dir="$(command loadout dir --active 2>/dev/null)" && [ -n "$_ccp_dir" ]; then
-    CLAUDE_CONFIG_DIR="$_ccp_dir" command claude "$@"
+  local _agman_dir
+  if _agman_dir="$(command agman dir --active 2>/dev/null)" && [ -n "$_agman_dir" ]; then
+    CLAUDE_CONFIG_DIR="$_agman_dir" command claude "$@"
   else
     command claude "$@"
   fi
 }
-# <<< loadout shell integration <<<
-LOADOUT_SNIPPET
+# <<< agman shell integration <<<
+AGMAN_SNIPPET
 }
 
 cmd_help() {
   cat <<EOF
-loadout $LOADOUT_VERSION — config loadouts for AI coding agents (AWS_PROFILE-style)
+agman $AGMAN_VERSION — config profiles for AI coding agents (AWS_PROFILE-style)
 
-Usage: loadout <command> [args]
+Usage: agman <command> [args]
 
 Commands:
   create <name> [opts]   Create a profile. Default: seeded from ~/.claude.
@@ -406,28 +406,28 @@ Commands:
                            --from-current   seed from ~/.claude (explicit)
                            --link-plugins   symlink plugins/ instead of copying
   list                   List profiles (* = default)
-  use <name>             Set persistent default profile (alias: equip)
+  use <name>             Set persistent default profile
   off                    Clear default; back to stock ~/.claude
   current                Show the active profile and how it was selected
   dir <name>|--active    Print a profile's directory (--active: resolved default)
-  env <name>             Print an export line: eval "\$(loadout env work)"
+  env <name>             Print an export line: eval "\$(agman env work)"
   run <name> [-- args]   Launch claude once under a profile
   exec <name> -- <cmd>   Run any command with CLAUDE_CONFIG_DIR set
   rename <old> <new>     Rename a profile
   remove <name> [--yes]  Delete a profile directory
   doctor                 Diagnose setup
   init [zsh|bash]        Print shell integration; add to rc:
-                           eval "\$(loadout init zsh)"
+                           eval "\$(agman init zsh)"
   help, version
 
 Selection precedence (highest first):
   1. CLAUDE_CONFIG_DIR set in the environment   (never overridden)
-  2. Persistent default set via 'loadout use' (applied by the shell hook)
-  3. None: stock ~/.claude, exactly as without loadout
+  2. Persistent default set via 'agman use' (applied by the shell hook)
+  3. None: stock ~/.claude, exactly as without agman
 
 Environment:
-  LOADOUT_HOME           Profile storage root (default: ~/.loadouts)
-  LOADOUT_CLAUDE_HOME    Seed source (default: ~/.claude)
+  AGMAN_HOME           Profile storage root (default: ~/.agman)
+  AGMAN_CLAUDE_HOME    Seed source (default: ~/.claude)
 EOF
 }
 
@@ -440,7 +440,7 @@ main() {
   case "$cmd" in
     create)  cmd_create ${1+"$@"} ;;
     list|ls) cmd_list ;;
-    use|equip) cmd_use ${1+"$@"} ;;
+    use)     cmd_use ${1+"$@"} ;;
     off)     cmd_off ;;
     current) cmd_current ;;
     dir)     cmd_dir ${1+"$@"} ;;
@@ -452,7 +452,7 @@ main() {
     doctor)  cmd_doctor ;;
     init)    cmd_init ${1+"$@"} ;;
     help|-h|--help) cmd_help ;;
-    version|-v|--version) printf 'loadout %s\n' "$LOADOUT_VERSION" ;;
+    version|-v|--version) printf 'agman %s\n' "$AGMAN_VERSION" ;;
     *) usage_die "unknown command '$cmd'" ;;
   esac
 }
