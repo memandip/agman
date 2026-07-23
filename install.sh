@@ -37,7 +37,6 @@ case ":$PATH:" in
 esac
 
 printf '\nNext steps:\n'
-printf '  1. Add shell integration to ~/.zshrc or ~/.bashrc:\n'
-printf '       eval "$(agman init zsh)"    # or: init bash\n'
-printf '  2. Create profiles:   agman create work && agman create personal\n'
-printf '  3. Switch:            agman use work\n'
+printf '  1. Create profiles:   agman create work --copy-current && agman create personal\n'
+printf '  2. Switch globally:   agman use work    (backs up your original config first)\n'
+printf '  3. Stay current:      agman update\n'
