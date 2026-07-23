@@ -1,42 +1,42 @@
-# ccprofile
+# loadout
 
-Profile manager for [Claude Code](https://code.claude.com/docs) — switch between complete work/personal configurations the way `AWS_PROFILE` switches AWS accounts.
+Config loadouts for AI coding agents — switch between complete work/personal setups the way `AWS_PROFILE` switches AWS accounts. Supports [Claude Code](https://code.claude.com/docs) today; Codex and Gemini CLI adapters are on the roadmap.
 
-A profile is a full Claude Code config directory: its own `CLAUDE.md`, settings, rules, skills, agents, plugins, and MCP servers. `ccprofile` creates, lists, and switches them by pointing the `CLAUDE_CONFIG_DIR` environment variable at the right directory. One pure-bash script, no dependencies, works on macOS (stock bash 3.2), Linux, WSL, and Git Bash.
+A loadout is everything your agent *is* in a given context: its own `CLAUDE.md`, settings, rules, skills, agents, plugins, and MCP servers, kept as a complete config directory. `loadout` creates, lists, and switches them by pointing the `CLAUDE_CONFIG_DIR` environment variable at the right directory. One pure-bash script, no dependencies, works on macOS (stock bash 3.2), Linux, WSL, and Git Bash.
 
 ```console
-$ ccprofile create work        # seeded from your current ~/.claude
-$ ccprofile create personal --empty
-$ ccprofile use work
+$ loadout create work        # seeded from your current ~/.claude
+$ loadout create personal --empty
+$ loadout use work           # or: loadout equip work
 Default profile set to 'work'.
 $ claude                       # runs with the work profile
-$ ccprofile off                # back to stock ~/.claude
+$ loadout off                # back to stock ~/.claude
 ```
 
 ## Why
 
-Claude Code layers a single global `~/.claude` (instructions, skills, agents, plugins) into **every** project. If your office and personal work need different rule sets, different skills, or different accounts, there is no native profile mechanism — `CLAUDE_CONFIG_DIR` is the only lever, and it's per-process. `ccprofile` gives it AWS-profile ergonomics: named profiles, a persistent default, per-shell overrides, and one-shot runs.
+Claude Code layers a single global `~/.claude` (instructions, skills, agents, plugins) into **every** project. If your office and personal work need different rule sets, different skills, or different accounts, there is no native profile mechanism — `CLAUDE_CONFIG_DIR` is the only lever, and it's per-process. `loadout` gives it AWS-profile ergonomics: named profiles, a persistent default, per-shell overrides, and one-shot runs.
 
-**Guarantee:** your stock `~/.claude` is never modified. Seeding only reads from it, and with no profile active, `claude` runs exactly as if ccprofile were not installed.
+**Guarantee:** your stock `~/.claude` is never modified. Seeding only reads from it, and with no profile active, `claude` runs exactly as if loadout were not installed.
 
 ## Install
 
 From a clone:
 
 ```bash
-git clone https://github.com/OWNER/ccprofile.git && cd ccprofile && ./install.sh
+git clone https://github.com/OWNER/loadout.git && cd loadout && ./install.sh
 ```
 
 Or piped (no clone):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/OWNER/ccprofile/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/OWNER/loadout/main/install.sh | bash
 ```
 
 Then add shell integration to `~/.zshrc` or `~/.bashrc` — this is what makes plain `claude` honor your default profile:
 
 ```bash
-eval "$(ccprofile init zsh)"   # or: init bash
+eval "$(loadout init zsh)"   # or: init bash
 ```
 
 > Replace `OWNER` with the GitHub owner after the repo is published.
@@ -51,7 +51,7 @@ eval "$(ccprofile init zsh)"   # or: init bash
 | `off` | Clear the default — back to stock `~/.claude` |
 | `current` | Show the active profile and how it was selected |
 | `dir <name>` / `dir --active` | Print a profile's directory |
-| `env <name>` | Print an export line: `eval "$(ccprofile env work)"` |
+| `env <name>` | Print an export line: `eval "$(loadout env work)"` |
 | `run <name> [-- args]` | Launch `claude` once under a profile, without switching |
 | `exec <name> -- <cmd>` | Run any command with `CLAUDE_CONFIG_DIR` set |
 | `rename <old> <new>` / `remove <name>` | Manage profiles |
@@ -62,11 +62,11 @@ eval "$(ccprofile init zsh)"   # or: init bash
 
 Selection precedence, highest first:
 
-1. **`CLAUDE_CONFIG_DIR` set in the environment** — never overridden. Per-shell, so two terminals can run different profiles at once (`eval "$(ccprofile env personal)"`).
-2. **Persistent default** set by `ccprofile use`, stored in `~/.claude-profiles/.default` and applied by the shell hook's `claude()` wrapper.
+1. **`CLAUDE_CONFIG_DIR` set in the environment** — never overridden. Per-shell, so two terminals can run different profiles at once (`eval "$(loadout env personal)"`).
+2. **Persistent default** set by `loadout use`, stored in `~/.loadouts/.default` and applied by the shell hook's `claude()` wrapper.
 3. **Nothing set** — stock `~/.claude`, untouched behavior.
 
-Profiles live under `~/.claude-profiles/<name>/` (override with `CCPROFILE_HOME`). Seeding copies your config but excludes ephemeral state: sessions, caches, history, per-project auto-memory, telemetry. Your user-scope `~/.claude.json` (MCP servers, global state) is copied into the profile, since Claude Code reads it from inside the config dir when `CLAUDE_CONFIG_DIR` is set.
+Profiles live under `~/.loadouts/<name>/` (override with `LOADOUT_HOME`). Seeding copies your config but excludes ephemeral state: sessions, caches, history, per-project auto-memory, telemetry. Your user-scope `~/.claude.json` (MCP servers, global state) is copied into the profile, since Claude Code reads it from inside the config dir when `CLAUDE_CONFIG_DIR` is set.
 
 ## Caveats you should know
 
@@ -85,7 +85,8 @@ CI runs the suite on Ubuntu + macOS and lints with shellcheck on every push.
 
 ## Roadmap
 
-- `.claude-profile` file for **per-directory auto-switching** (the `.nvmrc`/direnv analog)
+- **Multi-agent adapters**: Codex (via [`CODEX_HOME`](https://developers.openai.com/codex/environment-variables), mechanism confirmed), then Gemini CLI / Qwen Code / Kimi; loadouts grow per-tool sections
+- `.loadout` file for **per-directory auto-switching** (the `.nvmrc`/direnv analog)
 - fish shell support, tab completions
 - `--fresh-auth` seeding (exclude copied credentials)
 - Profile export/import for syncing between machines
