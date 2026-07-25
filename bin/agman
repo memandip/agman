@@ -1,36 +1,60 @@
 #!/usr/bin/env bash
 #
 # agman — agent manager: switchable config profiles for AI coding agents,
-# in the spirit of AWS_PROFILE. Claude Code adapter today; Codex (CODEX_HOME)
-# and Gemini CLI are on the roadmap.
+# in the spirit of AWS_PROFILE.
 #
-# Each profile is a self-contained Claude Code config directory under
-# $AGMAN_HOME (default: ~/.agman/<name>). `agman use` activates a profile by
-# symlinking ~/.claude at it; your original ~/.claude is preserved as the
-# 'global' profile the first time you switch, and `agman off` restores it.
-# The symlink itself is the marker: a real ~/.claude directory is unmanaged,
-# a symlink into $AGMAN_HOME is an agman profile.
+# A profile is a directory under $AGMAN_HOME holding one config tree per tool:
+#
+#   ~/.agman/work/claude/       -> ~/.claude
+#   ~/.agman/work/claude.json   -> ~/.claude.json
+#   ~/.agman/work/codex/        -> ~/.codex
+#   ~/.agman/work/gemini/       -> ~/.gemini
+#
+# `agman use` activates a profile by symlinking each tool's config path at it.
+# Symlinks are the only mechanism every tool supports: Codex has CODEX_HOME and
+# Claude Code has CLAUDE_CONFIG_DIR, but Gemini CLI has no config-dir override
+# at all. The original config is preserved as the 'global' profile on the first
+# switch, and `agman off` restores it. The symlink is also the state marker: a
+# real directory is unmanaged, a symlink into $AGMAN_HOME is an agman profile.
 #
 # Requires bash >= 3.2 (stock macOS bash works). No other dependencies.
 
 set -euo pipefail
 
-AGMAN_VERSION="0.3.0"
+AGMAN_VERSION="0.4.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
-# The config dir Claude Code reads. Only ever moved/symlinked, never edited.
-CLAUDE_HOME="${AGMAN_CLAUDE_HOME:-$HOME/.claude}"
-# User-scope MCP servers and global state live next to the config dir.
-CLAUDE_JSON="$(dirname "$CLAUDE_HOME")/.claude.json"
+# Where tool config paths live. Overridable so tests never touch a real home.
+TARGET_HOME="${AGMAN_TARGET_HOME:-$HOME}"
 DEFAULT_FILE="$AGMAN_HOME/.default"
 GLOBAL_BACKUP="$AGMAN_HOME/global"
-# Canonical shared credential file. On Linux/Windows Claude Code keeps
-# .credentials.json inside the config dir, so profiles that share an account
+BACKUP_DIR="$AGMAN_HOME/.backups"
+LAYOUT_FILE=".agman-layout"
+LAYOUT_VERSION="2"
+# Canonical shared Claude credential file. On Linux/Windows Claude Code keeps
+# .credentials.json inside its config dir, so profiles that share an account
 # symlink to this one file and token refreshes stay visible to all of them.
 # On macOS credentials live in the Keychain and this stays absent.
 SHARED_CREDS="$AGMAN_HOME/.credentials.json"
 CREDS_BASENAME=".credentials.json"
 AGMAN_RAW_URL="${AGMAN_RAW_URL:-https://raw.githubusercontent.com/memandip/agman/main}"
+
+# --- adapter registry -------------------------------------------------------
+#
+# Parallel indexed arrays keep this readable under bash 3.2, which has no
+# associative arrays. Each link entry is `profile_path:home_path:type`, where
+# type is d (directory) or f (file).
+ADAPTER_NAMES=(claude codex gemini)
+ADAPTER_LABELS=("Claude Code" "Codex CLI" "Gemini CLI")
+ADAPTER_CMDS=(claude codex gemini)
+ADAPTER_LINKS=(
+  "claude:.claude:d claude.json:.claude.json:f"
+  "codex:.codex:d"
+  "gemini:.gemini:d"
+)
+# Env var that redirects a tool's config dir, or "-" when the tool has none.
+# Used by `agman env`/`run`/`exec` for per-shell overrides.
+ADAPTER_ENVVARS=(CLAUDE_CONFIG_DIR CODEX_HOME -)
 
 # Ephemeral or machine-local state that should not be cloned into a profile.
 SEED_EXCLUDES=(backups cache downloads file-history ide locks logs paste-cache
@@ -50,6 +74,65 @@ profile_dir() { printf '%s/%s' "$AGMAN_HOME" "$1"; }
 
 readlink_once() { readlink "$1" 2>/dev/null || true; }
 
+adapter_count() { printf '%s' "${#ADAPTER_NAMES[@]}"; }
+
+adapter_index() {
+  local want="$1" i=0
+  while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+    if [ "${ADAPTER_NAMES[$i]}" = "$want" ]; then printf '%s' "$i"; return 0; fi
+    i=$((i + 1))
+  done
+  return 1
+}
+
+# Absolute path of a tool config path under the target home. AGMAN_CLAUDE_HOME
+# stays honored for the Claude paths so older setups and the Homebrew formula
+# test keep working.
+target_path() {
+  case "$1" in
+    .claude)
+      printf '%s' "${AGMAN_CLAUDE_HOME:-$TARGET_HOME/.claude}" ;;
+    .claude.json)
+      if [ -n "${AGMAN_CLAUDE_HOME:-}" ]; then
+        printf '%s/.claude.json' "$(dirname "$AGMAN_CLAUDE_HOME")"
+      else
+        printf '%s/.claude.json' "$TARGET_HOME"
+      fi ;;
+    *) printf '%s/%s' "$TARGET_HOME" "$1" ;;
+  esac
+}
+
+# Optional allowlist. AGMAN_TOOLS="claude codex" restricts agman to those tools
+# and leaves every other config path alone.
+adapter_enabled() {
+  local name="$1" t
+  [ -z "${AGMAN_TOOLS:-}" ] && return 0
+  for t in ${AGMAN_TOOLS}; do
+    [ "$t" = "$name" ] && return 0
+  done
+  return 1
+}
+
+# A tool is in scope for a profile when it is enabled and either the profile
+# already carries config for it, the CLI is installed, or its config path
+# exists on this machine.
+adapter_in_scope() {
+  local idx="$1" dir="$2" pair prof_rel home_rel
+  adapter_enabled "${ADAPTER_NAMES[$idx]}" || return 1
+  if [ -n "$dir" ]; then
+    for pair in ${ADAPTER_LINKS[$idx]}; do
+      prof_rel="${pair%%:*}"
+      [ -e "$dir/$prof_rel" ] && return 0
+    done
+  fi
+  command -v "${ADAPTER_CMDS[$idx]}" >/dev/null 2>&1 && return 0
+  for pair in ${ADAPTER_LINKS[$idx]}; do
+    home_rel="${pair#*:}"; home_rel="${home_rel%:*}"
+    [ -e "$(target_path "$home_rel")" ] && return 0
+  done
+  return 1
+}
+
 validate_name() {
   local name="${1:-}"
   [ -n "$name" ] || usage_die "profile name required"
@@ -60,8 +143,6 @@ validate_name() {
   esac
 }
 
-# Names users may create. 'global' is reserved for the automatic backup of the
-# original ~/.claude, so it can exist and be switched to, but not created.
 require_creatable_name() {
   validate_name "$1"
   case "$1" in
@@ -83,31 +164,146 @@ default_profile() {
   printf '%s' "$name"
 }
 
-# State of ~/.claude: real | agman | foreign | absent
-claude_home_kind() {
-  if [ -L "$CLAUDE_HOME" ]; then
-    case "$(readlink_once "$CLAUDE_HOME")" in
-      "$AGMAN_HOME"/*) printf 'agman' ;;
-      *) printf 'foreign' ;;
+# Profile name owning a symlink target, for both layouts:
+#   $AGMAN_HOME/work         (layout 1)
+#   $AGMAN_HOME/work/claude  (layout 2)
+profile_name_from_target() {
+  local t="$1" rest
+  case "$t" in
+    "$AGMAN_HOME"/*)
+      rest="${t#"$AGMAN_HOME"/}"
+      rest="${rest%%/*}"
+      [ -n "$rest" ] || return 1
+      case "$rest" in .*) return 1 ;; esac
+      printf '%s' "$rest" ;;
+    *) return 1 ;;
+  esac
+}
+
+# --- layout versioning -----------------------------------------------------
+
+profile_layout() {
+  local dir="$1" v=""
+  if [ -f "$dir/$LAYOUT_FILE" ]; then
+    IFS= read -r v < "$dir/$LAYOUT_FILE" || true
+    case "$v" in 1|2) printf '%s' "$v"; return 0 ;; esac
+  fi
+  [ -d "$dir/claude" ] && { printf '2'; return 0; }
+  # Layout 1 kept the Claude config tree at the profile root.
+  if [ -f "$dir/.claude.json" ] || [ -f "$dir/CLAUDE.md" ] || [ -f "$dir/settings.json" ] \
+     || [ -d "$dir/skills" ] || [ -d "$dir/agents" ] || [ -d "$dir/plugins" ]; then
+    printf '1'; return 0
+  fi
+  printf '%s' "$LAYOUT_VERSION"
+}
+
+# Claude paths inside a profile, layout-aware, so read-only commands stay
+# correct for profiles that have not been migrated yet.
+profile_claude_dir() {
+  local dir="$1"
+  if [ "$(profile_layout "$dir")" = "1" ]; then printf '%s' "$dir"
+  else printf '%s/claude' "$dir"; fi
+}
+
+profile_identity_file() {
+  local dir="$1"
+  if [ "$(profile_layout "$dir")" = "1" ]; then printf '%s/.claude.json' "$dir"
+  else printf '%s/claude.json' "$dir"; fi
+}
+
+# Move a layout-1 profile into per-tool subdirectories, keeping a full copy of
+# the pre-migration state under $AGMAN_HOME/.backups first.
+migrate_profile() {
+  local dir="$1" name entry base backup stamp
+  name="${dir##*/}"
+  [ "$(profile_layout "$dir")" = "1" ] || return 0
+
+  stamp="$(date +%Y%m%d%H%M%S 2>/dev/null || printf 'backup')"
+  backup="$BACKUP_DIR/${name}-layout1-$stamp"
+  mkdir -p "$BACKUP_DIR"
+  cp -R "$dir" "$backup" || die "could not back up profile '$name' before migrating"
+
+  mkdir -p "$dir/claude"
+  while IFS= read -r -d '' entry; do
+    base="${entry##*/}"
+    case "$base" in
+      claude|claude.json|"$LAYOUT_FILE") continue ;;
+      .claude.json) mv "$entry" "$dir/claude.json" ;;
+      *) mv "$entry" "$dir/claude/$base" ;;
     esac
-  elif [ -d "$CLAUDE_HOME" ]; then
+  done < <(find "$dir" -mindepth 1 -maxdepth 1 -print0)
+
+  printf '%s\n' "$LAYOUT_VERSION" > "$dir/$LAYOUT_FILE"
+  printf "Migrated profile '%s' to the multi-tool layout (backup: %s).\n" "$name" "$backup"
+  return 0
+}
+
+migrate_all_profiles() {
+  [ -d "$AGMAN_HOME" ] || return 0
+  local entry any=0
+  for entry in "$AGMAN_HOME"/*/; do
+    [ -d "$entry" ] || continue
+    entry="${entry%/}"
+    if [ "$(profile_layout "$entry")" = "1" ]; then
+      migrate_profile "$entry"
+      any=1
+    fi
+  done
+  [ "$any" = "1" ] && printf "Profiles now hold one config tree per tool (claude/, codex/, gemini/).\n"
+  return 0
+}
+
+# --- state inspection -------------------------------------------------------
+
+# Kind of a single target path: real | agman | foreign | absent
+target_kind() {
+  local p="$1"
+  if [ -L "$p" ]; then
+    if profile_name_from_target "$(readlink_once "$p")" >/dev/null 2>&1; then
+      printf 'agman'
+    else
+      printf 'foreign'
+    fi
+  elif [ -e "$p" ]; then
     printf 'real'
-  elif [ -e "$CLAUDE_HOME" ]; then
-    printf 'foreign'
   else
     printf 'absent'
   fi
 }
 
-# Name of the profile ~/.claude currently points at; rc 1 if not agman-managed.
+# The active profile, determined from whichever managed path is a symlink.
 active_profile() {
-  [ -L "$CLAUDE_HOME" ] || return 1
-  local target
-  target="$(readlink_once "$CLAUDE_HOME")"
-  case "$target" in
-    "$AGMAN_HOME"/*) printf '%s' "${target##*/}"; return 0 ;;
-  esac
+  local i=0 pair home_rel t name
+  while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+    for pair in ${ADAPTER_LINKS[$i]}; do
+      home_rel="${pair#*:}"; home_rel="${home_rel%:*}"
+      t="$(target_path "$home_rel")"
+      if [ -L "$t" ]; then
+        if name="$(profile_name_from_target "$(readlink_once "$t")")"; then
+          printf '%s' "$name"; return 0
+        fi
+      fi
+    done
+    i=$((i + 1))
+  done
   return 1
+}
+
+# Tool names a profile currently has activated, space separated.
+active_tools() {
+  local i=0 pair home_rel t out=""
+  while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+    for pair in ${ADAPTER_LINKS[$i]}; do
+      home_rel="${pair#*:}"; home_rel="${home_rel%:*}"
+      t="$(target_path "$home_rel")"
+      if [ -L "$t" ] && profile_name_from_target "$(readlink_once "$t")" >/dev/null 2>&1; then
+        out="$out ${ADAPTER_NAMES[$i]}"
+        break
+      fi
+    done
+    i=$((i + 1))
+  done
+  printf '%s' "${out# }"
 }
 
 is_seed_excluded() {
@@ -118,11 +314,12 @@ is_seed_excluded() {
   return 1
 }
 
-# Copy the contents of a config dir into a new profile dir, skipping
-# ephemeral state. Optionally symlink the plugins dir instead of copying it.
+# Copy a config tree into a profile, skipping ephemeral state. Optionally
+# symlinks the plugins dir instead of copying it.
 seed_from_dir() {
   local src="$1" dst="$2" link_plugins="$3" entry base
-  [ -d "$src" ] || { warn "seed source $src not found; profile starts empty"; return 0; }
+  [ -d "$src" ] || return 0
+  mkdir -p "$dst"
   while IFS= read -r -d '' entry; do
     base="${entry##*/}"
     if is_seed_excluded "$base"; then continue; fi
@@ -137,6 +334,21 @@ seed_from_dir() {
   done < <(find "$src" -mindepth 1 -maxdepth 1 -print0)
 }
 
+write_starter_claude_md() {
+  local dir="$1" name="$2"
+  mkdir -p "$dir"
+  cat > "$dir/CLAUDE.md" <<EOF
+# CLAUDE.md — $name profile (managed by agman)
+
+Instructions here apply to every Claude Code session while this profile
+is active. Replace this starter content with your own rules, for example:
+
+- Coding style preferences
+- Workflow rules ("always run tests before committing")
+- Project or client context specific to this profile
+EOF
+}
+
 # --- identity / auth inheritance ------------------------------------------
 #
 # Claude Code decides whether to run first-launch onboarding from
@@ -147,16 +359,12 @@ seed_from_dir() {
 # Seeding these keys is what makes a new profile inherit the current account.
 IDENTITY_KEYS="oauthAccount hasCompletedOnboarding userID machineID lastOnboardingVersion"
 
-# Which helper is available for a structured JSON merge.
 json_tool() {
   if command -v jq >/dev/null 2>&1; then printf 'jq'
   elif command -v python3 >/dev/null 2>&1; then printf 'python3'
   else printf 'none'; fi
 }
 
-# Copy identity keys from a source .claude.json into a profile's own copy,
-# preserving anything already there. Falls back to a whole-file copy when no
-# JSON tool exists, which keeps auth working at the cost of extra state.
 seed_identity() {
   local src="$1" dst="$2" tmp
   [ -f "$src" ] || return 1
@@ -171,8 +379,6 @@ seed_identity() {
             > "$tmp" 2>/dev/null; then
         rm -f "$tmp"; return 1
       fi
-      # Merge onto any existing profile state (profile keys win only if newer
-      # writes happen later; identity is authoritative here).
       if [ -s "$dst" ] && jq -e . "$dst" >/dev/null 2>&1; then
         if jq -s '.[0] * .[1]' "$dst" "$tmp" > "$tmp.2" 2>/dev/null; then
           mv "$tmp.2" "$tmp"
@@ -215,35 +421,32 @@ sys.stdout.write(json.dumps(d, indent=2) + "\n")
   return 0
 }
 
-# Best source of identity state: the live file while it is still a real file,
-# otherwise the backup of the original config.
 identity_source() {
-  if [ -f "$CLAUDE_JSON" ] && [ ! -L "$CLAUDE_JSON" ]; then
-    printf '%s' "$CLAUDE_JSON"; return 0
+  local live; live="$(target_path .claude.json)"
+  if [ -f "$live" ] && [ ! -L "$live" ]; then
+    printf '%s' "$live"; return 0
   fi
-  if [ -f "$GLOBAL_BACKUP/.claude.json" ]; then
-    printf '%s' "$GLOBAL_BACKUP/.claude.json"; return 0
+  if [ -d "$GLOBAL_BACKUP" ]; then
+    local gf; gf="$(profile_identity_file "$GLOBAL_BACKUP")"
+    [ -f "$gf" ] && { printf '%s' "$gf"; return 0; }
   fi
-  if [ -L "$CLAUDE_JSON" ]; then
-    local t; t="$(readlink_once "$CLAUDE_JSON")"
+  if [ -L "$live" ]; then
+    local t; t="$(readlink_once "$live")"
     [ -f "$t" ] && { printf '%s' "$t"; return 0; }
   fi
   return 1
 }
 
-# True when a profile's .claude.json carries usable account identity.
 has_identity() {
-  local f="$1/.claude.json"
+  local f; f="$(profile_identity_file "$1")"
   [ -f "$f" ] || return 1
   grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$f" 2>/dev/null && return 0
   grep -q '"oauthAccount"[[:space:]]*:[[:space:]]*{' "$f" 2>/dev/null && return 0
   return 1
 }
 
-# Move the original credential file to the shared location once, so every
-# profile that shares the account sees the same refreshed tokens.
 adopt_shared_credentials() {
-  local src="$1/$CREDS_BASENAME"
+  local src; src="$(profile_claude_dir "$1")/$CREDS_BASENAME"
   [ -f "$src" ] || return 0
   [ -L "$src" ] && return 0
   if [ ! -e "$SHARED_CREDS" ]; then
@@ -254,11 +457,9 @@ adopt_shared_credentials() {
   return 0
 }
 
-# Point a profile at the shared credential file unless it deliberately holds
-# its own (a real file placed there by the user or a future per-account login).
 link_shared_credentials() {
   local dir="$1" target
-  target="$dir/$CREDS_BASENAME"
+  target="$(profile_claude_dir "$dir")/$CREDS_BASENAME"
   # Drop a link left dangling by a previous 'off', which would otherwise look
   # like a credential file to Claude Code.
   if [ -L "$target" ] && [ ! -e "$target" ]; then rm -f "$target"; fi
@@ -269,11 +470,10 @@ link_shared_credentials() {
   return 0
 }
 
-# Describe a profile's credential situation for doctor/current. Never prints
-# token material.
+# Never prints token material.
 profile_auth_state() {
   local dir="$1" f
-  f="$dir/$CREDS_BASENAME"
+  f="$(profile_claude_dir "$dir")/$CREDS_BASENAME"
   local ident="no-identity" creds="keychain-or-none"
   has_identity "$dir" && ident="identity-seeded"
   if [ -L "$f" ]; then
@@ -284,25 +484,88 @@ profile_auth_state() {
   printf '%s, %s' "$ident" "$creds"
 }
 
-write_starter_claude_md() {
-  local dir="$1" name="$2"
-  cat > "$dir/CLAUDE.md" <<EOF
-# CLAUDE.md — $name profile (managed by agman)
+# --- link engine ------------------------------------------------------------
 
-Instructions here apply to every Claude Code session while this profile
-is active. Replace this starter content with your own rules, for example:
+# Make sure a profile-side path exists so the symlink never dangles.
+ensure_profile_path() {
+  local path="$1" type="$2"
+  if [ "$type" = "d" ]; then
+    [ -d "$path" ] || mkdir -p "$path"
+  else
+    [ -e "$path" ] || printf '{}\n' > "$path"
+  fi
+}
 
-- Coding style preferences
-- Workflow rules ("always run tests before committing")
-- Project or client context specific to this profile
-EOF
+# Whether every path of a tool can be linked. Checked before anything is moved
+# so a tool is never left half-activated: one refused path must not strand the
+# others in the backup profile.
+adapter_can_link() {
+  local idx="$1" pair prof_rel home_rel tgt kind tool="${ADAPTER_NAMES[$1]}"
+  for pair in ${ADAPTER_LINKS[$idx]}; do
+    prof_rel="${pair%%:*}"
+    home_rel="${pair#*:}"; home_rel="${home_rel%:*}"
+    tgt="$(target_path "$home_rel")"
+    kind="$(target_kind "$tgt")"
+    case "$kind" in
+      foreign)
+        warn "$tool: $tgt is a symlink not managed by agman; leaving this tool alone"
+        return 1 ;;
+      real)
+        if [ -e "$GLOBAL_BACKUP/$prof_rel" ]; then
+          warn "$tool: $tgt is a real path but the global backup already has $prof_rel; leaving this tool alone"
+          return 1
+        fi ;;
+    esac
+  done
+  return 0
+}
+
+# Point one target path at a profile, backing a real target up into the global
+# profile first. Only call after adapter_can_link has approved the tool.
+link_one() {
+  local dir="$1" prof_rel="$2" home_rel="$3" type="$4" tool="$5"
+  local src="$dir/$prof_rel" tgt kind
+  tgt="$(target_path "$home_rel")"
+  kind="$(target_kind "$tgt")"
+
+  case "$kind" in
+    foreign)
+      warn "$tool: $tgt is a symlink not managed by agman; leaving it alone"
+      return 1 ;;
+    real)
+      local gdest="$GLOBAL_BACKUP/$prof_rel"
+      mkdir -p "$GLOBAL_BACKUP"
+      if [ -e "$gdest" ]; then
+        warn "$tool: $tgt is a real path but the global backup already has $prof_rel; leaving it alone"
+        return 1
+      fi
+      mv "$tgt" "$gdest" || { warn "$tool: could not back up $tgt"; return 1; }
+      printf '%s\n' "$LAYOUT_VERSION" > "$GLOBAL_BACKUP/$LAYOUT_FILE"
+      ;;
+    agman)
+      rm -f "$tgt" ;;
+  esac
+
+  ensure_profile_path "$src" "$type"
+  ln -s "$src" "$tgt" || { warn "$tool: could not link $tgt"; return 1; }
+  return 0
+}
+
+unlink_one() {
+  local home_rel="$1" tgt
+  tgt="$(target_path "$home_rel")"
+  if [ "$(target_kind "$tgt")" = "agman" ]; then
+    rm -f "$tgt"
+    return 0
+  fi
+  return 1
 }
 
 # ---------------------------------------------------------------------------
 # commands
 
 cmd_create() {
-  local name="" mode="empty" from="" link_plugins=0 arg src_json=""
+  local name="" mode="empty" from="" link_plugins=0 arg src_json="" i=0 dir
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
@@ -317,42 +580,71 @@ cmd_create() {
   require_creatable_name "$name"
 
   mkdir -p "$AGMAN_HOME"
-  local dir; dir="$(profile_dir "$name")"
+  dir="$(profile_dir "$name")"
   [ ! -e "$dir" ] || die "profile '$name' already exists at $dir"
   mkdir "$dir"
+  printf '%s\n' "$LAYOUT_VERSION" > "$dir/$LAYOUT_FILE"
 
+  local tools=""
   case "$mode" in
     empty)
-      write_starter_claude_md "$dir" "$name"
-      if src_json="$(identity_source)" && seed_identity "$src_json" "$dir/.claude.json"; then
-        printf "Created profile '%s' at %s (empty, with a starter CLAUDE.md).\n" "$name" "$dir"
-        printf "It inherits your current Claude account, so no re-login is needed.\n"
+      write_starter_claude_md "$dir/claude" "$name"
+      if src_json="$(identity_source)" && seed_identity "$src_json" "$dir/claude.json"; then
+        tools="inherits your current Claude account"
+      fi
+      # Give every detected tool an empty tree so `use` manages it from the start.
+      i=0
+      while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+        if [ "${ADAPTER_NAMES[$i]}" != "claude" ] && adapter_in_scope "$i" ""; then
+          mkdir -p "$dir/${ADAPTER_NAMES[$i]}"
+        fi
+        i=$((i + 1))
+      done
+      printf "Created profile '%s' at %s (empty, with a starter CLAUDE.md).\n" "$name" "$dir"
+      if [ -n "$tools" ]; then
+        printf "It %s, so no re-login is needed.\n" "$tools"
       else
-        printf "Created profile '%s' at %s (empty, with a starter CLAUDE.md).\n" "$name" "$dir"
         warn "could not read current account state; this profile may prompt for login"
       fi
-      printf "Tip: use --copy-current to seed a profile from your current Claude config.\n"
+      printf "Tip: use --copy-current to seed a profile from your current configs.\n"
       ;;
     current)
-      local src="$CLAUDE_HOME"
-      if [ -L "$CLAUDE_HOME" ]; then
-        src="$(readlink_once "$CLAUDE_HOME")"
-        [ -n "$src" ] || die "cannot resolve ~/.claude symlink"
-      fi
-      seed_from_dir "$src" "$dir" "$link_plugins"
-      if [ -f "$CLAUDE_JSON" ] && [ ! -e "$dir/.claude.json" ]; then
-        cp "$CLAUDE_JSON" "$dir/.claude.json"
-        chmod 600 "$dir/.claude.json" 2>/dev/null || true
-      fi
+      i=0
+      while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+        if adapter_in_scope "$i" ""; then
+          local pair prof_rel home_rel type srcpath
+          for pair in ${ADAPTER_LINKS[$i]}; do
+            prof_rel="${pair%%:*}"
+            home_rel="${pair#*:}"; type="${home_rel##*:}"; home_rel="${home_rel%:*}"
+            srcpath="$(target_path "$home_rel")"
+            if [ -L "$srcpath" ]; then srcpath="$(readlink_once "$srcpath")"; fi
+            if [ "$type" = "d" ]; then
+              seed_from_dir "$srcpath" "$dir/$prof_rel" "$link_plugins"
+            elif [ -f "$srcpath" ]; then
+              cp "$srcpath" "$dir/$prof_rel"
+              chmod 600 "$dir/$prof_rel" 2>/dev/null || true
+            fi
+          done
+          tools="$tools ${ADAPTER_NAMES[$i]}"
+        fi
+        i=$((i + 1))
+      done
       if ! has_identity "$dir" && src_json="$(identity_source)"; then
-        seed_identity "$src_json" "$dir/.claude.json" || true
+        seed_identity "$src_json" "$dir/claude.json" || true
       fi
-      [ -f "$dir/CLAUDE.md" ] || write_starter_claude_md "$dir" "$name"
-      printf "Created profile '%s' at %s (copied from current Claude config).\n" "$name" "$dir"
+      [ -f "$dir/claude/CLAUDE.md" ] || write_starter_claude_md "$dir/claude" "$name"
+      printf "Created profile '%s' at %s (copied from current configs:%s).\n" "$name" "$dir" "${tools:- none}"
       ;;
     clone)
       require_profile "$from"
-      seed_from_dir "$(profile_dir "$from")" "$dir" "$link_plugins"
+      local fromdir; fromdir="$(profile_dir "$from")"
+      [ "$(profile_layout "$fromdir")" = "1" ] && migrate_profile "$fromdir"
+      local entry base
+      while IFS= read -r -d '' entry; do
+        base="${entry##*/}"
+        [ "$base" = "$LAYOUT_FILE" ] && continue
+        cp -R "$entry" "$dir/$base"
+      done < <(find "$fromdir" -mindepth 1 -maxdepth 1 -print0)
       printf "Created profile '%s' at %s (cloned from '%s').\n" "$name" "$dir" "$from"
       ;;
   esac
@@ -361,7 +653,7 @@ cmd_create() {
 
 cmd_list() {
   [ -d "$AGMAN_HOME" ] || { printf "No profiles yet. Create one with: agman create <name>\n"; return 0; }
-  local default_name="" active_name="" entry name marker suffix found=0
+  local default_name="" active_name="" entry name marker suffix found=0 tools
   default_name="$(default_profile 2>/dev/null || true)"
   active_name="$(active_profile 2>/dev/null || true)"
   for entry in "$AGMAN_HOME"/*/; do
@@ -372,8 +664,11 @@ cmd_list() {
     marker="  "
     [ "$name" = "$default_name" ] && marker="* "
     suffix=""
-    [ "$name" = "$active_name" ] && suffix="  (active)"
-    [ "${CLAUDE_CONFIG_DIR:-}" = "$entry" ] && suffix="$suffix  (active in this shell)"
+    if [ "$name" = "$active_name" ]; then
+      tools="$(active_tools)"
+      suffix="  (active: ${tools:-none})"
+    fi
+    [ "$(profile_layout "$entry")" = "1" ] && suffix="$suffix  [legacy layout]"
     printf '%s%s%s\n' "$marker" "$name" "$suffix"
   done
   [ "$found" = "1" ] || printf "No profiles yet. Create one with: agman create <name>\n"
@@ -382,123 +677,110 @@ cmd_list() {
 cmd_use() {
   local name="${1:-}"
   require_profile "$name"
+
+  # One-time migration of every profile to the multi-tool layout.
+  migrate_all_profiles
+
   local dir; dir="$(profile_dir "$name")"
-  local kind; kind="$(claude_home_kind)"
-  local migrated=0
+  local had_global=0
+  [ -d "$GLOBAL_BACKUP" ] && had_global=1
 
-  case "$kind" in
-    foreign)
-      die "~/.claude exists but is not managed by agman ($(readlink_once "$CLAUDE_HOME" || printf 'not a directory')). Refusing to touch it."
-      ;;
-    real)
-      [ ! -e "$GLOBAL_BACKUP" ] || die "cannot back up ~/.claude: a 'global' profile already exists at $GLOBAL_BACKUP. Remove or rename it first."
-      mkdir -p "$AGMAN_HOME"
-      mv "$CLAUDE_HOME" "$GLOBAL_BACKUP"
-      if [ -f "$CLAUDE_JSON" ] && [ ! -L "$CLAUDE_JSON" ] && [ ! -e "$GLOBAL_BACKUP/.claude.json" ]; then
-        mv "$CLAUDE_JSON" "$GLOBAL_BACKUP/.claude.json"
+  local i=0 pair prof_rel home_rel type linked="" skipped=""
+  while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+    if adapter_in_scope "$i" "$dir"; then
+      if adapter_can_link "$i"; then
+        local ok=1
+        for pair in ${ADAPTER_LINKS[$i]}; do
+          prof_rel="${pair%%:*}"
+          home_rel="${pair#*:}"; type="${home_rel##*:}"; home_rel="${home_rel%:*}"
+          link_one "$dir" "$prof_rel" "$home_rel" "$type" "${ADAPTER_NAMES[$i]}" || ok=0
+        done
+        if [ "$ok" = "1" ]; then linked="$linked ${ADAPTER_NAMES[$i]}"
+        else skipped="$skipped ${ADAPTER_NAMES[$i]}"; fi
+      else
+        skipped="$skipped ${ADAPTER_NAMES[$i]}"
       fi
-      migrated=1
-      ;;
-  esac
+    fi
+    i=$((i + 1))
+  done
 
-  # Once the original config is backed up, promote its credential file (present
-  # on Linux/Windows only) to the shared location so refreshed tokens stay
-  # visible to every profile that shares the account.
+  [ -n "${linked# }" ] || die "no tools could be activated for profile '$name'"
+
+  # Claude account inheritance: promote credentials once, then make sure this
+  # profile carries identity so switching never forces a re-login.
   [ -d "$GLOBAL_BACKUP" ] && adopt_shared_credentials "$GLOBAL_BACKUP"
-
-  # Profiles carry their own user-scope state file so MCP servers follow the
-  # profile; make sure the symlink target exists before linking.
-  [ -f "$dir/.claude.json" ] || printf '{}\n' > "$dir/.claude.json"
-
-  # Repair profiles created before identity seeding existed, so switching never
-  # drops the account and forces a re-login.
   local seeded=0 src_json=""
   if ! has_identity "$dir" && src_json="$(identity_source)"; then
-    seed_identity "$src_json" "$dir/.claude.json" && seeded=1
+    seed_identity "$src_json" "$(profile_identity_file "$dir")" && seeded=1
   fi
   link_shared_credentials "$dir"
-
-  [ -L "$CLAUDE_HOME" ] && rm -f "$CLAUDE_HOME"
-  ln -s "$dir" "$CLAUDE_HOME"
-
-  if [ -L "$CLAUDE_JSON" ]; then
-    case "$(readlink_once "$CLAUDE_JSON")" in
-      "$AGMAN_HOME"/*) rm -f "$CLAUDE_JSON"; ln -s "$dir/.claude.json" "$CLAUDE_JSON" ;;
-      *) warn "~/.claude.json is a symlink not managed by agman; leaving it (user-scope MCP stays shared)" ;;
-    esac
-  elif [ ! -e "$CLAUDE_JSON" ]; then
-    ln -s "$dir/.claude.json" "$CLAUDE_JSON"
-  else
-    warn "~/.claude.json is a regular file; leaving it in place (user-scope MCP stays shared across profiles)"
-  fi
 
   mkdir -p "$AGMAN_HOME"
   printf '%s\n' "$name" > "$DEFAULT_FILE"
 
-  printf "Switched to profile '%s' (~/.claude -> %s).\n" "$name" "$dir"
+  printf "Switched to profile '%s' (tools:%s).\n" "$name" "$linked"
+  [ -n "$skipped" ] && warn "left alone:$skipped (see the warnings above)"
   if [ "$seeded" = "1" ]; then
     printf "Seeded this profile with your current Claude account (no re-login needed).\n"
   elif ! has_identity "$dir"; then
     warn "this profile has no saved account identity; Claude Code may prompt for login"
   fi
-  if [ "$migrated" = "1" ]; then
-    printf "Your original Claude config was backed up as the 'global' profile.\n"
+  if [ "$had_global" = "0" ] && [ -d "$GLOBAL_BACKUP" ]; then
+    printf "Your original configs were backed up as the 'global' profile.\n"
     printf "Switch back with 'agman use global', or fully restore with 'agman off'.\n"
   fi
-  printf "New Claude Code sessions everywhere (including IDEs) now use this profile.\n"
+  printf "New sessions everywhere (including IDEs) now use this profile.\n"
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     warn "CLAUDE_CONFIG_DIR is set in this shell and overrides the switch here"
   fi
 }
 
 cmd_off() {
-  local kind; kind="$(claude_home_kind)"
-  case "$kind" in
-    agman)
-      rm -f "$CLAUDE_HOME"
-      if [ -L "$CLAUDE_JSON" ]; then
-        case "$(readlink_once "$CLAUDE_JSON")" in
-          "$AGMAN_HOME"/*) rm -f "$CLAUDE_JSON" ;;
-        esac
-      fi
-      if [ -d "$GLOBAL_BACKUP" ]; then
-        mv "$GLOBAL_BACKUP" "$CLAUDE_HOME"
-        if [ -f "$CLAUDE_HOME/.claude.json" ] && [ ! -e "$CLAUDE_JSON" ]; then
-          mv "$CLAUDE_HOME/.claude.json" "$CLAUDE_JSON"
-        fi
-        # Leave the restored config self-contained: replace the shared
-        # credential link with the real file so it works without agman.
-        if [ -L "$CLAUDE_HOME/$CREDS_BASENAME" ]; then
-          rm -f "$CLAUDE_HOME/$CREDS_BASENAME"
+  local i=0 pair prof_rel home_rel type tgt restored="" kind
+  while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+    for pair in ${ADAPTER_LINKS[$i]}; do
+      prof_rel="${pair%%:*}"
+      home_rel="${pair#*:}"; type="${home_rel##*:}"; home_rel="${home_rel%:*}"
+      tgt="$(target_path "$home_rel")"
+      kind="$(target_kind "$tgt")"
+      [ "$kind" = "foreign" ] && warn "$tgt is a symlink not managed by agman; leaving it untouched"
+      unlink_one "$home_rel" || true
+      if [ -e "$GLOBAL_BACKUP/$prof_rel" ] && [ ! -e "$tgt" ]; then
+        mv "$GLOBAL_BACKUP/$prof_rel" "$tgt" || warn "could not restore $tgt"
+        restored="$restored ${ADAPTER_NAMES[$i]}"
+        # Leave the restored config self-contained: turn the shared credential
+        # link back into a real file so it works without agman.
+        if [ "$type" = "d" ] && [ -L "$tgt/$CREDS_BASENAME" ]; then
+          rm -f "$tgt/$CREDS_BASENAME"
           if [ -f "$SHARED_CREDS" ]; then
-            cp "$SHARED_CREDS" "$CLAUDE_HOME/$CREDS_BASENAME"
-            chmod 600 "$CLAUDE_HOME/$CREDS_BASENAME" 2>/dev/null || true
+            cp "$SHARED_CREDS" "$tgt/$CREDS_BASENAME"
+            chmod 600 "$tgt/$CREDS_BASENAME" 2>/dev/null || true
             rm -f "$SHARED_CREDS"
           fi
         fi
-        printf "Restored your original Claude config to ~/.claude (the 'global' profile was moved back).\n"
-      else
-        printf "Profile deactivated. No 'global' backup existed; Claude Code will start fresh at ~/.claude.\n"
       fi
-      ;;
-    real)
-      printf "Nothing to do: ~/.claude is already your own directory (not managed by agman).\n"
-      ;;
-    foreign)
-      warn "~/.claude is a symlink not managed by agman; leaving it untouched"
-      ;;
-    absent)
-      printf "Nothing to do: ~/.claude does not exist.\n"
-      ;;
-  esac
+    done
+    i=$((i + 1))
+  done
+
+  # An emptied backup profile is just noise.
+  if [ -d "$GLOBAL_BACKUP" ]; then
+    rm -f "$GLOBAL_BACKUP/$LAYOUT_FILE"
+    rmdir "$GLOBAL_BACKUP" 2>/dev/null || true
+  fi
   rm -f "$DEFAULT_FILE"
+
+  if [ -n "$restored" ]; then
+    printf "Restored your original configs (%s) and stopped managing them.\n" "${restored# }"
+  else
+    printf "Nothing was active. Your configs are untouched.\n"
+  fi
 }
 
 cmd_current() {
-  local name
+  local name tools
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
-    name="${CLAUDE_CONFIG_DIR##*/}"
-    if [ "$(profile_dir "$name")" = "$CLAUDE_CONFIG_DIR" ] && [ -d "$CLAUDE_CONFIG_DIR" ]; then
+    if name="$(profile_name_from_target "$CLAUDE_CONFIG_DIR")"; then
       printf '%s  (via CLAUDE_CONFIG_DIR in this shell)\n' "$name"
     else
       printf '(external dir via CLAUDE_CONFIG_DIR: %s)\n' "$CLAUDE_CONFIG_DIR"
@@ -506,37 +788,48 @@ cmd_current() {
     return 0
   fi
   if name="$(active_profile)"; then
-    printf '%s  (active — ~/.claude is symlinked to this profile)\n' "$name"
+    tools="$(active_tools)"
+    printf '%s  (active for: %s)\n' "$name" "${tools:-none}"
     return 0
   fi
-  case "$(claude_home_kind)" in
-    real)    printf 'none  (stock ~/.claude, not managed by agman)\n' ;;
-    foreign) printf 'none  (~/.claude is a symlink not managed by agman)\n' ;;
-    *)       printf 'none  (no ~/.claude yet)\n' ;;
-  esac
+  printf 'none  (no profile active; your configs are unmanaged)\n'
 }
 
-# Machine-readable resolver used by the optional shell integration's claude()
-# wrapper. Resolves the persistent default only; an explicit CLAUDE_CONFIG_DIR
-# always wins and is handled by the wrapper itself.
 cmd_dir() {
-  local arg="${1:-}"
+  local arg="${1:-}" name dir
   if [ "$arg" = "--active" ]; then
-    local name
     name="$(default_profile)" || exit 1
-    local dir; dir="$(profile_dir "$name")"
+    dir="$(profile_dir "$name")"
     [ -d "$dir" ] || exit 1
-    printf '%s\n' "$dir"
+    printf '%s\n' "$(profile_claude_dir "$dir")"
     return 0
   fi
   require_profile "$arg"
-  printf '%s\n' "$(profile_dir "$arg")"
+  printf '%s\n' "$(profile_claude_dir "$(profile_dir "$arg")")"
 }
 
 cmd_env() {
   local name="${1:-}"
   require_profile "$name"
-  printf 'export CLAUDE_CONFIG_DIR=%q\n' "$(profile_dir "$name")"
+  local dir; dir="$(profile_dir "$name")"
+  local i=0 pair prof_rel envvar emitted=0
+  while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+    envvar="${ADAPTER_ENVVARS[$i]}"
+    if [ "$envvar" != "-" ] && adapter_in_scope "$i" "$dir"; then
+      for pair in ${ADAPTER_LINKS[$i]}; do
+        prof_rel="${pair%%:*}"
+        case "$pair" in *:d) ;; *) continue ;; esac
+        printf 'export %s=%q\n' "$envvar" "$dir/$prof_rel"
+        emitted=1
+        break
+      done
+    elif [ "$envvar" = "-" ] && adapter_in_scope "$i" "$dir"; then
+      printf '# %s has no config-dir environment variable; use `agman use %s`\n' \
+        "${ADAPTER_LABELS[$i]}" "$name"
+    fi
+    i=$((i + 1))
+  done
+  [ "$emitted" = "1" ] || warn "no tool in profile '$name' supports a per-shell override"
 }
 
 cmd_run() {
@@ -545,7 +838,8 @@ cmd_run() {
   shift
   [ "${1:-}" = "--" ] && shift
   command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
-  exec env CLAUDE_CONFIG_DIR="$(profile_dir "$name")" claude ${1+"$@"}
+  local dir; dir="$(profile_dir "$name")"
+  exec env CLAUDE_CONFIG_DIR="$(profile_claude_dir "$dir")" claude ${1+"$@"}
 }
 
 cmd_exec() {
@@ -554,7 +848,9 @@ cmd_exec() {
   shift
   [ "${1:-}" = "--" ] && shift
   [ $# -gt 0 ] || usage_die "exec requires a command: agman exec <name> -- <command...>"
-  exec env CLAUDE_CONFIG_DIR="$(profile_dir "$name")" "$@"
+  local dir; dir="$(profile_dir "$name")"
+  exec env CLAUDE_CONFIG_DIR="$(profile_claude_dir "$dir")" \
+           CODEX_HOME="$dir/codex" "$@"
 }
 
 cmd_rename() {
@@ -569,13 +865,21 @@ cmd_rename() {
     printf '%s\n' "$new" > "$DEFAULT_FILE"
   fi
   if [ "$was_active" = "1" ]; then
-    rm -f "$CLAUDE_HOME"
-    ln -s "$(profile_dir "$new")" "$CLAUDE_HOME"
-    if [ -L "$CLAUDE_JSON" ]; then
-      case "$(readlink_once "$CLAUDE_JSON")" in
-        "$AGMAN_HOME"/*) rm -f "$CLAUDE_JSON"; ln -s "$(profile_dir "$new")/.claude.json" "$CLAUDE_JSON" ;;
-      esac
-    fi
+    local dir; dir="$(profile_dir "$new")"
+    local i=0 pair prof_rel home_rel type tgt
+    while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+      for pair in ${ADAPTER_LINKS[$i]}; do
+        prof_rel="${pair%%:*}"
+        home_rel="${pair#*:}"; type="${home_rel##*:}"; home_rel="${home_rel%:*}"
+        tgt="$(target_path "$home_rel")"
+        if [ "$(target_kind "$tgt")" = "agman" ]; then
+          rm -f "$tgt"
+          ensure_profile_path "$dir/$prof_rel" "$type"
+          ln -s "$dir/$prof_rel" "$tgt"
+        fi
+      done
+      i=$((i + 1))
+    done
   fi
   printf "Renamed profile '%s' to '%s'.\n" "$old" "$new"
 }
@@ -592,7 +896,7 @@ cmd_remove() {
   done
   require_profile "$name"
   if [ "$(active_profile 2>/dev/null || true)" = "$name" ]; then
-    die "profile '$name' is active (~/.claude points at it). Switch away first: agman use <other> or agman off"
+    die "profile '$name' is active. Switch away first: agman use <other> or agman off"
   fi
   local dir; dir="$(profile_dir "$name")"
   if [ "$yes" != "1" ]; then
@@ -607,21 +911,30 @@ cmd_remove() {
   fi
   printf "Removed profile '%s'.\n" "$name"
   if [ "$name" = "global" ]; then
-    warn "'global' held the backup of your original ~/.claude; 'agman off' can no longer restore it"
+    warn "'global' held the backup of your original configs; 'agman off' can no longer restore them"
   fi
 }
 
 cmd_doctor() {
   printf 'agman %s\n' "$AGMAN_VERSION"
   printf 'profiles home: %s\n' "$AGMAN_HOME"
+  printf 'layout:        version %s\n' "$LAYOUT_VERSION"
 
-  if command -v claude >/dev/null 2>&1; then
-    local ver=""
-    ver="$(claude --version 2>/dev/null | head -1 || true)"
-    printf 'claude CLI:    %s (%s)\n' "$(command -v claude)" "${ver:-version unknown}"
-  else
-    printf 'claude CLI:    NOT FOUND on PATH\n'
-  fi
+  printf '\ntools:\n'
+  local i=0 pair home_rel tgt cmdpath
+  while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+    cmdpath="$(command -v "${ADAPTER_CMDS[$i]}" 2>/dev/null || printf 'not installed')"
+    printf '  %-8s %-14s cli: %s\n' "${ADAPTER_NAMES[$i]}" "${ADAPTER_LABELS[$i]}" "$cmdpath"
+    for pair in ${ADAPTER_LINKS[$i]}; do
+      home_rel="${pair#*:}"; home_rel="${home_rel%:*}"
+      tgt="$(target_path "$home_rel")"
+      printf '           %-22s %s\n' "$home_rel" "$(target_kind "$tgt")"
+    done
+    if [ "${ADAPTER_ENVVARS[$i]}" = "-" ]; then
+      printf '           %-22s none (symlink switching only)\n' "env override"
+    fi
+    i=$((i + 1))
+  done
 
   local count=0 entry
   if [ -d "$AGMAN_HOME" ]; then
@@ -629,37 +942,19 @@ cmd_doctor() {
       [ -d "$entry" ] && count=$((count + 1))
     done
   fi
-  printf 'profiles:      %s\n' "$count"
+  printf '\nprofiles:      %s\n' "$count"
 
   local name
-  case "$(claude_home_kind)" in
-    agman)   printf '~/.claude:     -> profile %s (managed by agman)\n' "$(active_profile 2>/dev/null || printf '?')" ;;
-    real)    printf '~/.claude:     regular directory (not managed; agman use <name> to switch)\n' ;;
-    foreign) printf '~/.claude:     symlink NOT managed by agman (-> %s)\n' "$(readlink_once "$CLAUDE_HOME")" ;;
-    absent)  printf '~/.claude:     missing\n' ;;
-  esac
+  if name="$(active_profile 2>/dev/null)"; then
+    printf 'active:        %s (tools: %s)\n' "$name" "$(active_tools)"
+  else
+    printf 'active:        none\n'
+  fi
 
   if [ -d "$GLOBAL_BACKUP" ]; then
-    printf "backup:        original config preserved as profile 'global'\n"
+    printf "backup:        original configs preserved as profile 'global'\n"
   else
-    printf 'backup:        none (original config is in place or was never migrated)\n'
-  fi
-
-  if [ -f "$SHARED_CREDS" ]; then
-    printf 'credentials:   shared file at %s (profiles symlink to it)\n' "$SHARED_CREDS"
-  else
-    printf 'credentials:   no shared file (normal on macOS, where Claude Code uses the Keychain)\n'
-  fi
-  printf 'json merge:    %s\n' "$(json_tool)"
-
-  if [ -d "$AGMAN_HOME" ]; then
-    local any=0
-    for entry in "$AGMAN_HOME"/*/; do
-      [ -d "$entry" ] || continue
-      [ "$any" = "0" ] && printf '\nper-profile auth:\n' && any=1
-      entry="${entry%/}"
-      printf '  %-20s %s\n' "${entry##*/}" "$(profile_auth_state "$entry")"
-    done
+    printf 'backup:        none (originals are in place or were never migrated)\n'
   fi
 
   if name="$(default_profile 2>/dev/null)"; then
@@ -672,26 +967,61 @@ cmd_doctor() {
     printf 'default:       none\n'
   fi
 
+  if [ -f "$SHARED_CREDS" ]; then
+    printf 'credentials:   shared file at %s (profiles symlink to it)\n' "$SHARED_CREDS"
+  else
+    printf 'credentials:   no shared file (normal on macOS, where Claude Code uses the Keychain)\n'
+  fi
+  printf 'json merge:    %s\n' "$(json_tool)"
+
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     printf 'env override:  CLAUDE_CONFIG_DIR=%s (wins over the symlink in this shell)\n' "$CLAUDE_CONFIG_DIR"
   else
     printf 'env override:  not set in this shell\n'
   fi
 
+  if [ -d "$AGMAN_HOME" ]; then
+    local any=0
+    for entry in "$AGMAN_HOME"/*/; do
+      [ -d "$entry" ] || continue
+      [ "$any" = "0" ] && printf '\nper-profile auth:\n' && any=1
+      entry="${entry%/}"
+      printf '  %-20s %s' "${entry##*/}" "$(profile_auth_state "$entry")"
+      [ "$(profile_layout "$entry")" = "1" ] && printf ' [legacy layout]'
+      printf '\n'
+    done
+  fi
+
   local tmp
   tmp="$(mktemp -d)"
   if ln -s "$tmp" "$tmp/link-test" 2>/dev/null; then
-    printf 'symlinks:      supported\n'
+    printf '\nsymlinks:      supported\n'
   else
-    printf 'symlinks:      NOT supported (agman use cannot work on this filesystem)\n'
+    printf '\nsymlinks:      NOT supported (agman use cannot work on this filesystem)\n'
   fi
   rm -rf "$tmp"
 
   printf '\nnotes:\n'
-  printf '  - Switching is symlink-based, so it applies to every new Claude Code\n'
-  printf '    session on this machine, including IDE extensions.\n'
-  printf '  - For a per-shell override without switching globally, use:\n'
-  printf '    agman run/exec/env (they set CLAUDE_CONFIG_DIR for one process/shell).\n'
+  printf '  - Switching is symlink-based, so it applies to every new session on\n'
+  printf '    this machine, including IDE extensions.\n'
+  printf '  - Gemini CLI has no config-dir environment variable, so symlink\n'
+  printf '    switching is the only way to profile it.\n'
+}
+
+cmd_migrate() {
+  [ -d "$AGMAN_HOME" ] || die "no profiles to migrate"
+  local before after
+  before="$(active_profile 2>/dev/null || true)"
+  migrate_all_profiles
+  after="$(profile_layout "$GLOBAL_BACKUP" 2>/dev/null || printf '%s' "$LAYOUT_VERSION")"
+  if [ -n "$before" ]; then
+    printf "Re-linking the active profile '%s'.\n" "$before"
+    cmd_use "$before" >/dev/null
+    printf "Done. Active profile relinked to the new layout.\n"
+  else
+    printf "Done. Layout version %s.\n" "$LAYOUT_VERSION"
+  fi
+  [ -n "$after" ] || true
 }
 
 cmd_update() {
@@ -743,7 +1073,7 @@ cmd_init() {
   esac
   cat <<'AGMAN_SNIPPET'
 # >>> agman shell integration (optional) >>>
-# Switching profiles works without this — `agman use` swaps ~/.claude via
+# Switching profiles works without this — `agman use` swaps config paths via
 # symlink. This hook adds per-shell behavior on top: `use`/`off` also
 # export/unset CLAUDE_CONFIG_DIR so the current shell can diverge from the
 # machine-wide profile.
@@ -792,36 +1122,39 @@ Usage: agman <command> [args]
 
 Commands:
   create <name> [opts]   Create a profile (empty, with a starter CLAUDE.md).
-                           --copy-current   seed from your current Claude config
+                           --copy-current   seed from your current configs
                            --from <name>    clone another profile
                            --link-plugins   symlink plugins/ instead of copying
-  list                   List profiles (* = default, (active) = ~/.claude target)
-  use <name>             Activate a profile: symlinks ~/.claude -> profile.
-                         First use backs up your original config as 'global'.
-  off                    Deactivate and restore your original ~/.claude
-  current                Show the active profile and how it was selected
-  dir <name>|--active    Print a profile's directory
-  env <name>             Print an export line: eval "\$(agman env work)"
+  list                   List profiles (* = default, (active: …) = live tools)
+  use <name>             Activate a profile: symlinks each tool's config at it.
+                         First use backs up your originals as 'global'.
+  off                    Deactivate and restore your original configs
+  current                Show the active profile and which tools it covers
+  dir <name>|--active    Print a profile's Claude config directory
+  env <name>             Print export lines: eval "\$(agman env work)"
   run <name> [-- args]   Launch claude once under a profile (per-process)
-  exec <name> -- <cmd>   Run any command with CLAUDE_CONFIG_DIR set
-  rename <old> <new>     Rename a profile (repoints ~/.claude if active)
+  exec <name> -- <cmd>   Run a command with per-tool env vars set
+  rename <old> <new>     Rename a profile (repoints active symlinks)
   remove <name> [--yes]  Delete a profile (refuses if active)
-  update                 Self-update: git pull in a checkout, else download latest
-  doctor                 Diagnose setup
+  migrate                Move profiles to the current layout, then relink
+  update                 Self-update: git pull in a checkout, else download
+  doctor                 Diagnose setup, tools, and per-profile auth
   init [zsh|bash]        Print optional per-shell integration snippet
   help, version
 
-How switching works:
-  'agman use <name>' symlinks ~/.claude (and ~/.claude.json) at the profile, so
-  every new Claude Code session on this machine picks it up — no shell setup,
-  IDE extensions included. Your original config is preserved as the 'global'
-  profile on first switch; 'agman use global' returns to it, 'agman off'
-  restores it fully. A CLAUDE_CONFIG_DIR env var set in a shell overrides the
-  symlink for that shell only (see: env, run, exec).
+Supported tools:
+  claude   Claude Code   ~/.claude + ~/.claude.json   (env: CLAUDE_CONFIG_DIR)
+  codex    Codex CLI     ~/.codex                     (env: CODEX_HOME)
+  gemini   Gemini CLI    ~/.gemini                    (no env override)
+
+Only tools you actually have are managed: a profile covers a tool when it
+holds config for it, the CLI is on PATH, or its config path exists.
 
 Environment:
   AGMAN_HOME             Profile storage root (default: ~/.agman)
-  AGMAN_CLAUDE_HOME      Managed config path (default: ~/.claude)
+  AGMAN_TARGET_HOME      Where tool config paths live (default: \$HOME)
+  AGMAN_TOOLS            Space-separated allowlist, e.g. "claude codex".
+                         Unset means every supported tool you have.
   AGMAN_RAW_URL          Update source (default: GitHub main branch)
 EOF
 }
@@ -844,6 +1177,7 @@ main() {
     exec)    cmd_exec ${1+"$@"} ;;
     rename)  cmd_rename ${1+"$@"} ;;
     remove|rm) cmd_remove ${1+"$@"} ;;
+    migrate) cmd_migrate ;;
     update)  cmd_update ;;
     doctor)  cmd_doctor ;;
     init)    cmd_init ${1+"$@"} ;;
