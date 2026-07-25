@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agman — agent manager for AI coding agent configs</title>
+<meta name="description" content="agman switches complete config profiles for Claude Code, Codex CLI, and Gemini CLI the way AWS_PROFILE switches AWS accounts. One pure-bash script, no dependencies.">
+<meta property="og:title" content="agman — agent manager">
+<meta property="og:description" content="Switch work and personal setups for Claude Code, Codex, and Gemini with one command.">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://memandip.github.io/agman/">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎛️</text></svg>">
+<style>
+  :root {
+    --bg: #fbfbfa;
+    --bg-soft: #f3f2ef;
+    --panel: #ffffff;
+    --ink: #1c1b1a;
+    --ink-soft: #55524d;
+    --ink-faint: #86817a;
+    --line: #e2dfd9;
+    --accent: #b5501f;
+    --accent-soft: #f7ece5;
+    --term-bg: #1f1e1c;
+    --term-ink: #e9e5de;
+    --term-dim: #9a938a;
+    --term-green: #8fbf6a;
+    --term-blue: #7fb0d8;
+    --ok: #2f7d4f;
+    --radius: 10px;
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #17181a;
+      --bg-soft: #1e2023;
+      --panel: #212427;
+      --ink: #ecedee;
+      --ink-soft: #b3b7bc;
+      --ink-faint: #85898f;
+      --line: #33373c;
+      --accent: #e8895c;
+      --accent-soft: #2c2320;
+      --term-bg: #101113;
+      --term-ink: #e9e5de;
+      --ok: #6fbf8b;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16.5px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { width: 100%; max-width: 940px; margin: 0 auto; padding: 0 22px; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, kbd { font-family: var(--mono); font-size: 0.88em; }
+  h1, h2, h3 { line-height: 1.22; letter-spacing: -0.018em; margin: 0; }
+  p { margin: 0 0 1rem; }
+  section { padding: 62px 0; border-top: 1px solid var(--line); }
+  section > .wrap > h2 {
+    font-size: 1.55rem; margin-bottom: 6px;
+  }
+  .kicker {
+    font-family: var(--mono); font-size: 0.74rem; letter-spacing: 0.12em;
+    text-transform: uppercase; color: var(--ink-faint); margin-bottom: 10px;
+  }
+  .lede { color: var(--ink-soft); max-width: 68ch; margin-bottom: 30px; }
+
+  /* ---------- header ---------- */
+  header.top {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: saturate(150%) blur(9px);
+    border-bottom: 1px solid var(--line);
+  }
+  .navrow { display: flex; align-items: center; gap: 18px; height: 56px; }
+  .brand {
+    font-family: var(--mono); font-weight: 700; font-size: 1.02rem;
+    color: var(--ink); letter-spacing: -0.02em;
+  }
+  .brand span { color: var(--accent); }
+  .navlinks { margin-left: auto; display: flex; gap: 20px; align-items: center; }
+  .navlinks a { color: var(--ink-soft); font-size: 0.92rem; }
+  .navlinks a:hover { color: var(--ink); text-decoration: none; }
+  @media (max-width: 700px) { .navlinks a.hide-sm { display: none; } }
+
+  /* ---------- hero ---------- */
+  .hero { padding: 70px 0 58px; }
+  .hero h1 { font-size: clamp(2.15rem, 5.4vw, 3.15rem); margin-bottom: 16px; }
+  .hero h1 .dim { color: var(--ink-faint); font-weight: 400; }
+  .hero .tag { font-size: 1.14rem; color: var(--ink-soft); max-width: 60ch; margin-bottom: 26px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 30px; }
+  .badge {
+    font-family: var(--mono); font-size: 0.74rem; padding: 4px 10px;
+    border: 1px solid var(--line); border-radius: 100px; color: var(--ink-soft);
+    background: var(--panel);
+  }
+  .badge.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, var(--line)); }
+  .cta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 10px 17px; border-radius: 8px; font-size: 0.94rem; font-weight: 550;
+    border: 1px solid transparent;
+  }
+  .btn.primary { background: var(--accent); color: #fff; }
+  .btn.primary:hover { filter: brightness(1.07); text-decoration: none; }
+  .btn.ghost { border-color: var(--line); color: var(--ink); background: var(--panel); }
+  .btn.ghost:hover { border-color: var(--ink-faint); text-decoration: none; }
+
+  /* ---------- terminal ---------- */
+  .term {
+    background: var(--term-bg); color: var(--term-ink); border-radius: var(--radius);
+    font-family: var(--mono); font-size: 0.845rem; line-height: 1.72;
+    overflow-x: auto; border: 1px solid #000; margin: 0;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.14);
+  }
+  .term .bar {
+    display: flex; gap: 6px; align-items: center;
+    padding: 9px 13px; border-bottom: 1px solid #2e2c29;
+  }
+  .term .bar i { width: 10px; height: 10px; border-radius: 50%; background: #46433f; display: block; }
+  .term .bar b {
+    margin-left: 8px; font-weight: 400; font-size: 0.76rem; color: var(--term-dim);
+    letter-spacing: 0.02em;
+  }
+  .term pre { margin: 0; padding: 15px 17px; white-space: pre; }
+  .term .p { color: var(--term-green); }
+  .term .c { color: var(--term-dim); }
+  .term .o { color: var(--term-ink); }
+  .term .hl { color: var(--term-blue); }
+
+  pre.code {
+    background: var(--bg-soft); border: 1px solid var(--line); border-radius: 8px;
+    padding: 13px 15px; overflow-x: auto; font-family: var(--mono);
+    font-size: 0.85rem; margin: 0 0 14px;
+  }
+
+  /* ---------- grids ---------- */
+  .grid { display: grid; gap: 16px; }
+  .g2 { grid-template-columns: repeat(auto-fit, minmax(272px, 1fr)); }
+  .g3 { grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 20px;
+  }
+  .card h3 { font-size: 1.03rem; margin-bottom: 7px; }
+  .card p { color: var(--ink-soft); font-size: 0.94rem; margin: 0; }
+  .card .ico { font-size: 1.15rem; margin-bottom: 9px; display: block; }
+
+  /* ---------- table ---------- */
+  .tablewrap { overflow-x: auto; border: 1px solid var(--line); border-radius: var(--radius); background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; min-width: 540px; }
+  th, td { text-align: left; padding: 11px 15px; border-bottom: 1px solid var(--line); }
+  th { font-size: 0.76rem; text-transform: uppercase; letter-spacing: 0.07em; color: var(--ink-faint); font-weight: 600; }
+  tr:last-child td { border-bottom: none; }
+  td code { background: var(--bg-soft); padding: 1.5px 5px; border-radius: 4px; }
+
+  /* ---------- roadmap ---------- */
+  .rm { list-style: none; padding: 0; margin: 0; }
+  .rm li {
+    display: grid; grid-template-columns: 22px 1fr; gap: 14px;
+    padding: 15px 0; border-bottom: 1px solid var(--line);
+  }
+  .rm li:last-child { border-bottom: none; }
+  .rm .mark { font-family: var(--mono); font-size: 0.95rem; padding-top: 1px; }
+  .rm .done .mark { color: var(--ok); }
+  .rm .next .mark { color: var(--accent); }
+  .rm .later .mark { color: var(--ink-faint); }
+  .rm h3 { font-size: 1rem; margin-bottom: 3px; display: flex; flex-wrap: wrap; gap: 9px; align-items: baseline; }
+  .rm .ver {
+    font-family: var(--mono); font-size: 0.72rem; color: var(--ink-faint);
+    border: 1px solid var(--line); border-radius: 100px; padding: 1px 8px;
+  }
+  .rm p { margin: 0; color: var(--ink-soft); font-size: 0.93rem; }
+
+  .note {
+    background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--line));
+    border-radius: var(--radius); padding: 16px 18px; font-size: 0.93rem; color: var(--ink-soft);
+  }
+  .note strong { color: var(--ink); }
+
+  footer {
+    padding: 40px 0 56px; border-top: 1px solid var(--line);
+    color: var(--ink-faint); font-size: 0.88rem;
+  }
+  footer .frow { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
+  footer a { color: var(--ink-soft); }
+  .sp { margin-left: auto; }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap navrow">
+    <span class="brand">ag<span>man</span></span>
+    <nav class="navlinks">
+      <a href="#why" class="hide-sm">Why</a>
+      <a href="#use-cases">Use cases</a>
+      <a href="#how" class="hide-sm">How it works</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="https://github.com/memandip/agman">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="wrap hero">
+  <h1>agman <span class="dim">— agent manager</span></h1>
+  <p class="tag">
+    Switch between complete work and personal setups for your AI coding agents, the way
+    <code>AWS_PROFILE</code> switches AWS accounts. One command swaps instructions, skills,
+    agents, MCP servers, and settings across Claude Code, Codex, and Gemini.
+  </p>
+  <div class="badges">
+    <span class="badge ok">v0.5.0</span>
+    <span class="badge">pure bash, zero dependencies</span>
+    <span class="badge">macOS · Linux · WSL</span>
+    <span class="badge">204 tests, CI on two platforms</span>
+    <span class="badge">MIT</span>
+  </div>
+  <div class="cta">
+    <a class="btn primary" href="#install">Install</a>
+    <a class="btn ghost" href="https://github.com/memandip/agman">View source</a>
+    <a class="btn ghost" href="https://github.com/memandip/agman/releases">Releases</a>
+  </div>
+</div>
+
+<div class="wrap" style="padding-bottom:56px">
+  <div class="term">
+    <div class="bar"><i></i><i></i><i></i><b>zsh — agman</b></div>
+<pre><span class="c"># one profile per context, seeded however you like</span>
+<span class="p">$</span> agman create personal
+<span class="p">$</span> agman create work --copy-current
+
+<span class="p">$</span> agman use work
+<span class="o">Switched to profile 'work' (tools: <span class="hl">claude codex gemini</span>).</span>
+<span class="o">Seeded this profile with your current Claude account (no re-login needed).</span>
+<span class="o">Your original configs were backed up as the 'global' profile.</span>
+<span class="o">New sessions everywhere (including IDEs) now use this profile.</span>
+
+<span class="p">$</span> claude          <span class="c"># work rules, work skills, work MCP servers</span>
+<span class="p">$</span> agman use personal   <span class="c"># and back, instantly</span>
+<span class="p">$</span> agman off            <span class="c"># restore your original setup entirely</span></pre>
+  </div>
+</div>
+
+<section id="why">
+  <div class="wrap">
+    <div class="kicker">The problem</div>
+    <h2>One global config for every context you work in</h2>
+    <p class="lede">
+      Claude Code layers a single <code>~/.claude</code> into every project: your instructions,
+      skills, subagents, plugins, and MCP servers apply everywhere. Codex and Gemini do the same
+      with their own directories. That is fine until your office work and your personal projects
+      want different rules — or a different account.
+    </p>
+    <div class="grid g2">
+      <div class="card">
+        <span class="ico">🧩</span>
+        <h3>Project files don't solve it</h3>
+        <p>
+          A project <code>CLAUDE.md</code> layers <em>on top of</em> your global one; it never
+          replaces it. Work rules still follow you into personal repos, and skills, subagents,
+          and MCP servers have no per-context scoping at all.
+        </p>
+      </div>
+      <div class="card">
+        <span class="ico">🔗</span>
+        <h3>Environment variables don't cover it</h3>
+        <p>
+          Claude Code has <code>CLAUDE_CONFIG_DIR</code> and Codex has <code>CODEX_HOME</code>,
+          but Gemini CLI has no config-dir override at all — and IDE extensions ignore your
+          shell environment. agman switches by symlink, so it works everywhere.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="use-cases">
+  <div class="wrap">
+    <div class="kicker">Use cases</div>
+    <h2>What people actually use it for</h2>
+    <p class="lede">Any time "who the agent is" should change with what you're working on.</p>
+    <div class="grid g3">
+      <div class="card">
+        <span class="ico">🏢</span>
+        <h3>Work vs personal</h3>
+        <p>Company conventions, internal tooling, and compliance reminders stay in the work
+        profile. Weekend projects get a blank slate.</p>
+      </div>
+      <div class="card">
+        <span class="ico">👥</span>
+        <h3>Per client or team</h3>
+        <p>Separate instructions, skills, and MCP servers per client — with no chance of one
+        client's context leaking into another's session.</p>
+      </div>
+      <div class="card">
+        <span class="ico">🔑</span>
+        <h3>Two accounts, one machine</h3>
+        <p>Profiles share your current login by default. Give one its own company account with
+        <code>agman login</code> — it applies in IDEs too.</p>
+      </div>
+      <div class="card">
+        <span class="ico">🧪</span>
+        <h3>Risk-free experiments</h3>
+        <p>Try an aggressive global ruleset, a new plugin set, or someone else's dotfiles in a
+        throwaway profile. <code>agman off</code> puts everything back.</p>
+      </div>
+      <div class="card">
+        <span class="ico">🎛️</span>
+        <h3>One switch, three tools</h3>
+        <p>Claude Code, Codex, and Gemini flip together, so a context switch doesn't mean
+        remembering three different mechanisms.</p>
+      </div>
+      <div class="card">
+        <span class="ico">💤</span>
+        <h3>Lighter context windows</h3>
+        <p>Only the instructions and skills that matter for this context get loaded, instead of
+        one global file that grew to cover everything.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="how">
+  <div class="wrap">
+    <div class="kicker">How it works</div>
+    <h2>Symlinks, not shell tricks</h2>
+    <p class="lede">
+      A profile holds one config tree per tool. <code>agman use</code> points each tool's config
+      path at the active profile, so every new session picks it up — terminal, editor, or agent
+      SDK — with no shell integration required.
+    </p>
+    <pre class="code">~/.agman/work/claude/       ->  ~/.claude
+~/.agman/work/claude.json   ->  ~/.claude.json
+~/.agman/work/codex/        ->  ~/.codex
+~/.agman/work/gemini/       ->  ~/.gemini</pre>
+    <div class="tablewrap" style="margin-bottom:20px">
+      <table>
+        <thead><tr><th>Tool</th><th>Config paths</th><th>Env override</th></tr></thead>
+        <tbody>
+          <tr><td>Claude Code</td><td><code>~/.claude</code>, <code>~/.claude.json</code></td><td><code>CLAUDE_CONFIG_DIR</code></td></tr>
+          <tr><td>Codex CLI</td><td><code>~/.codex</code></td><td><code>CODEX_HOME</code></td></tr>
+          <tr><td>Gemini CLI</td><td><code>~/.gemini</code></td><td>none — symlink only</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="grid g3">
+      <div class="card">
+        <h3>Your setup is never lost</h3>
+        <p>The first switch moves your existing configs into a normal profile called
+        <code>global</code>. Switch back to it any time, or run <code>agman off</code> to put the
+        real directories back and stop managing them.</p>
+      </div>
+      <div class="card">
+        <h3>Inactive means invisible</h3>
+        <p>With no profile active, agman is indistinguishable from not being installed. A real
+        directory means unmanaged; a symlink into <code>~/.agman</code> means a profile is live.
+        It refuses to touch symlinks it didn't create.</p>
+      </div>
+      <div class="card">
+        <h3>Switching doesn't log you out</h3>
+        <p>New profiles inherit your current account, because Claude Code keeps login state and
+        credentials in two different places. agman handles both, per platform.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <div class="kicker">Install</div>
+    <h2>Two commands and you're running</h2>
+    <p class="lede">
+      One bash script with no dependencies. Works on stock macOS bash 3.2, Linux, WSL, and Git Bash.
+    </p>
+    <div class="grid g2">
+      <div>
+        <h3 style="font-size:1rem;margin-bottom:8px">Homebrew</h3>
+        <pre class="code">brew install memandip/agman/agman</pre>
+        <h3 style="font-size:1rem;margin:18px 0 8px">Or the installer</h3>
+        <pre class="code">curl -fsSL https://raw.githubusercontent.com/\
+memandip/agman/main/install.sh | bash</pre>
+        <p style="font-size:0.9rem;color:var(--ink-faint);margin:0">
+          Keep it current with <code>agman update</code>.
+        </p>
+      </div>
+      <div>
+        <h3 style="font-size:1rem;margin-bottom:8px">First run</h3>
+        <pre class="code">agman create work --copy-current
+agman use work
+
+agman list       # what exists, what's live
+agman current    # active profile and tools
+agman doctor     # diagnose anything odd
+agman off        # hand your configs back</pre>
+        <p style="font-size:0.9rem;color:var(--ink-faint);margin:0">
+          Nothing on disk changes until you run <code>agman use</code>.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="accounts">
+  <div class="wrap">
+    <div class="kicker">Accounts</div>
+    <h2>Share one login, or give a profile its own</h2>
+    <p class="lede">
+      Profiles share your current Claude account by default — switching never drops you at a login
+      prompt. When a profile needs a different account, opt in per profile.
+    </p>
+    <pre class="code">agman login work     # paste a token from 'claude setup-token' (hidden input)
+agman logout work    # back to your shared account</pre>
+    <div class="note">
+      <strong>Why a token rather than copied credentials.</strong> Refresh tokens rotate on every
+      use, so snapshotting the Keychain or a credentials file leaves you with a stale copy that
+      logs you out on the next switch. agman stores a long-lived <code>setup-token</code> value at
+      mode <code>600</code> and wires it through Claude Code's own <code>apiKeyHelper</code>
+      setting, which also applies to the VS Code extension and the Agent SDK. Tokens are never
+      printed, and cloning a profile never copies its account.
+    </div>
+  </div>
+</section>
+
+<section id="roadmap">
+  <div class="wrap">
+    <div class="kicker">Roadmap</div>
+    <h2>Shipped, and what's next</h2>
+    <p class="lede">
+      Each release is verified on macOS and Linux before it ships, including against the real
+      vendor CLIs. The
+      <a href="https://github.com/memandip/agman/blob/main/docs/roadmap.md">full roadmap</a>
+      records the research and the bugs testing caught.
+    </p>
+    <ul class="rm">
+      <li class="done">
+        <span class="mark">✓</span>
+        <div>
+          <h3>Profiles inherit your account <span class="ver">v0.3.0</span></h3>
+          <p>Switching stopped triggering login prompts. Claude Code keeps account identity in
+          <code>~/.claude.json</code> and credentials in the Keychain or a file, depending on the
+          platform; agman now handles both.</p>
+        </div>
+      </li>
+      <li class="done">
+        <span class="mark">✓</span>
+        <div>
+          <h3>Homebrew distribution <span class="ver">v0.3.0</span></h3>
+          <p>A tap you can install from, audited and test-installed on every release.</p>
+        </div>
+      </li>
+      <li class="done">
+        <span class="mark">✓</span>
+        <div>
+          <h3>Multi-tool profiles <span class="ver">v0.4.0</span></h3>
+          <p>Claude Code, Codex CLI, and Gemini CLI in one profile, with automatic migration of
+          older profiles and a backup kept. Verified against the real CLIs.</p>
+        </div>
+      </li>
+      <li class="done">
+        <span class="mark">✓</span>
+        <div>
+          <h3>Per-profile accounts <span class="ver">v0.5.0</span></h3>
+          <p><code>agman login</code> and <code>agman logout</code>, using a non-rotating token so
+          a profile's account holds up in editors as well as the terminal.</p>
+        </div>
+      </li>
+      <li class="next">
+        <span class="mark">→</span>
+        <div>
+          <h3>Shareable profiles <span class="ver">next</span></h3>
+          <p>Push and pull profiles through a git remote you own, plus an <code>.agman</code> file
+          in a project root so <code>agman use</code> fetches the right profile for that repo.
+          Credentials stay excluded by design.</p>
+        </div>
+      </li>
+      <li class="later">
+        <span class="mark">·</span>
+        <div>
+          <h3>More tools and shells <span class="ver">later</span></h3>
+          <p>Qwen Code and Kimi CLI adapters once their layouts are verified, fish support, and
+          shell completions.</p>
+        </div>
+      </li>
+      <li class="later">
+        <span class="mark">·</span>
+        <div>
+          <h3>Hosted profile sync <span class="ver">exploring</span></h3>
+          <p>Optional cloud storage with end-to-end encryption and company sign-in, only if there
+          is real demand for it. Git remotes cover most of the need without a service.</p>
+        </div>
+      </li>
+    </ul>
+  </div>
+</section>
+
+<section id="trust">
+  <div class="wrap">
+    <div class="kicker">Built carefully</div>
+    <h2>What "verified" means here</h2>
+    <div class="grid g3">
+      <div class="card">
+        <h3>204 assertions, two platforms</h3>
+        <p>Every release runs the suite on macOS bash 3.2 and Linux bash 5.2 — one of them
+        without <code>jq</code>, <code>python3</code>, or <code>curl</code>, so the fallback paths
+        are exercised too. shellcheck runs on every commit.</p>
+      </div>
+      <div class="card">
+        <h3>Checked against the real tools</h3>
+        <p>Gemini and Codex were traced at the syscall level to confirm they read the symlinked
+        config, don't replace the symlink when writing, and keep their state inside the active
+        profile.</p>
+      </div>
+      <div class="card">
+        <h3>Tests that found real bugs</h3>
+        <p>A clone that would have inherited another profile's account, a half-completed
+        activation, and a silent <code>set -e</code> failure were all caught before release and
+        are written up in the roadmap.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap frow">
+    <span>agman — MIT licensed</span>
+    <a href="https://github.com/memandip/agman">GitHub</a>
+    <a href="https://github.com/memandip/agman/releases">Releases</a>
+    <a href="https://github.com/memandip/agman/blob/main/docs/roadmap.md">Roadmap</a>
+    <a href="https://github.com/memandip/agman/issues">Issues</a>
+    <span class="sp">Not affiliated with Anthropic, OpenAI, or Google.</span>
+  </div>
+</footer>
+
+</body>
+</html>
