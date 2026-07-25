@@ -446,6 +446,111 @@ assert_contains "doctor lists codex" "$out" "Codex CLI"
 assert_contains "doctor lists gemini" "$out" "Gemini CLI"
 assert_contains "doctor notes gemini has no env override" "$out" "symlink switching only"
 
+# A minimal PATH with neither jq nor python3, reused by the fallback tests.
+mkdir -p "$TMP/barebin"
+for c in ls cp mv rm mkdir ln cat find chmod readlink grep sed printf date mktemp \
+         sort head cut wc dirname basename tr awk uname id env rmdir; do
+  p="$(command -v "$c" 2>/dev/null)" && ln -sf "$p" "$TMP/barebin/$c" 2>/dev/null
+done
+BASH_BIN="$(command -v bash)"
+
+# --- per-profile accounts (login / logout) ---------------------------------------------
+
+A="$TMP/acct"
+mkdir -p "$A/.claude"
+cp "$HOME/.claude.json" "$A/.claude.json"
+printf 'ACCT RULES\n' > "$A/.claude/CLAUDE.md"
+arun() { env HOME="$A" AGMAN_HOME="$A/.agman" AGMAN_TOOLS="claude" "$AGM" "$@"; }
+AA="$A/.agman"
+FAKE_TOKEN="sk-ant-oat01-FAKE-PROFILE-TOKEN"
+
+arun create client >/dev/null
+# A pre-existing setting must survive the apiKeyHelper merge.
+printf '{"theme":"dark"}\n' > "$AA/client/claude/settings.json"
+
+assert_fail "login without a token fails" sh -c "printf '' | env HOME=$A AGMAN_HOME=$AA AGMAN_TOOLS=claude $AGM login client --token-stdin"
+
+out="$(printf '%s\n' "$FAKE_TOKEN" | arun login client --token-stdin 2>&1)"
+assert_contains "login reports the profile now has its own account" "$out" "own account"
+assert_lacks "login never echoes the token" "$out" "$FAKE_TOKEN"
+assert_contains "login documents the setup-token limits" "$out" "no Remote Control"
+
+assert_exists "token file written" "$AA/client/claude/.agman-token"
+perm="$(ls -l "$AA/client/claude/.agman-token" | cut -c1-10)"
+assert_eq "token file is owner-only" "-rw-------" "$perm"
+assert_exists "helper script written" "$AA/client/claude/agman-apikey.sh"
+if [ -x "$AA/client/claude/agman-apikey.sh" ]; then ok "helper script is executable"; else bad "helper script is executable"; fi
+
+# The helper is what Claude Code actually calls: it must print the token.
+assert_eq "helper prints the profile token" "$FAKE_TOKEN" "$("$AA/client/claude/agman-apikey.sh")"
+
+settings="$(cat "$AA/client/claude/settings.json")"
+assert_contains "settings.json gains apiKeyHelper" "$settings" '"apiKeyHelper"'
+assert_contains "apiKeyHelper points at the profile helper" "$settings" "$AA/client/claude/agman-apikey.sh"
+assert_contains "existing settings preserved by the merge" "$settings" '"theme"'
+
+json="$(cat "$AA/client/claude.json")"
+assert_lacks "shared account metadata dropped so /status is not misleading" "$json" 'oauthAccount'
+assert_contains "onboarding flag kept so no onboarding runs" "$json" 'hasCompletedOnboarding'
+
+out="$(arun doctor)"
+assert_contains "doctor reports the profile's own account" "$out" "own-account (token)"
+assert_lacks "doctor never prints the token" "$out" "$FAKE_TOKEN"
+
+# Activating must not clobber the profile's own account with shared identity.
+out="$(arun use client 2>&1)"
+assert_lacks "use does not warn about login for an own-account profile" "$out" "may prompt for login"
+assert_lacks "use does not re-seed shared identity over an own account" "$(cat "$AA/client/claude.json")" 'oauthAccount'
+assert_eq "helper still prints the token after activation" "$FAKE_TOKEN" "$("$AA/client/claude/agman-apikey.sh")"
+
+# Renaming must leave apiKeyHelper pointing at a path that still exists.
+arun rename client client2 >/dev/null
+arun use client2 >/dev/null
+settings="$(cat "$AA/client2/claude/settings.json")"
+assert_contains "rename self-heals the apiKeyHelper path" "$settings" "$AA/client2/claude/agman-apikey.sh"
+assert_lacks "stale apiKeyHelper path removed" "$settings" "$AA/client/claude/agman-apikey.sh"
+
+# A clone must not inherit another profile's account.
+arun create cloned --from client2 >/dev/null
+assert_missing "clone does not carry the token" "$AA/cloned/claude/.agman-token"
+assert_missing "clone does not carry the helper" "$AA/cloned/claude/agman-apikey.sh"
+# Critically, the clone must not keep an apiKeyHelper pointing at the source
+# profile's helper, which would authenticate it as that account.
+assert_lacks "clone does not reference the source profile's helper" "$(cat "$AA/cloned/claude/settings.json" 2>/dev/null || echo '{}')" 'apiKeyHelper'
+out="$(arun create cloned2 --from client2 2>&1)"
+assert_contains "clone of an own-account profile says it uses the shared account" "$out" "shared Claude account"
+
+out="$(arun logout client2 2>&1)"
+assert_contains "logout reports the shared account is back" "$out" "shared Claude account"
+assert_missing "logout removes the token" "$AA/client2/claude/.agman-token"
+assert_missing "logout removes the helper" "$AA/client2/claude/agman-apikey.sh"
+assert_lacks "logout removes apiKeyHelper from settings" "$(cat "$AA/client2/claude/settings.json")" 'apiKeyHelper'
+assert_contains "logout keeps unrelated settings" "$(cat "$AA/client2/claude/settings.json")" '"theme"'
+assert_contains "logout restores shared account identity" "$(cat "$AA/client2/claude.json")" 'oauthAccount'
+out="$(arun logout client2 2>&1)"
+assert_contains "logout is idempotent" "$out" "nothing to do"
+arun off >/dev/null
+
+# Without jq or python3: login still works when settings.json is absent (a fresh
+# file can be written safely), and refuses rather than clobbering an existing one.
+rm -rf "$TMP/barelogin"; mkdir -p "$TMP/barelogin"
+cp "$HOME/.claude.json" "$TMP/barelogin/.claude.json"
+barelogin() {
+  env -i HOME="$TMP/barelogin" AGMAN_HOME="$TMP/barelogin/.agman" AGMAN_TOOLS="claude" \
+    PATH="$TMP/barebin" "$BASH_BIN" "$AGM" "$@"
+}
+barelogin create fresh >/dev/null 2>&1
+out="$(printf '%s\n' "$FAKE_TOKEN" | barelogin login fresh --token-stdin 2>&1)"
+assert_contains "login works without jq/python3 when settings.json is absent" "$out" "own account"
+assert_contains "fresh settings.json got apiKeyHelper" "$(cat "$TMP/barelogin/.agman/fresh/claude/settings.json")" 'apiKeyHelper'
+
+barelogin create fresh2 >/dev/null 2>&1
+printf '{"theme":"dark"}\n' > "$TMP/barelogin/.agman/fresh2/claude/settings.json"
+out="$(printf '%s\n' "$FAKE_TOKEN" | barelogin login fresh2 --token-stdin 2>&1 || true)"
+assert_contains "login refuses to clobber existing settings without a JSON tool" "$out" "without jq or python3"
+assert_missing "refused login leaves no orphan token" "$TMP/barelogin/.agman/fresh2/claude/.agman-token"
+assert_contains "existing settings untouched after refusal" "$(cat "$TMP/barelogin/.agman/fresh2/claude/settings.json")" '"theme"'
+
 # --- JSON backend coverage: jq, python3, and the no-tool fallback ------------------------
 
 if command -v jq >/dev/null 2>&1; then
@@ -462,14 +567,8 @@ else
 fi
 
 # Minimal PATH with neither jq nor python3: must still preserve login.
-mkdir -p "$TMP/barebin"
-for c in ls cp mv rm mkdir ln cat find chmod readlink grep sed printf date mktemp \
-         sort head cut wc dirname basename tr awk uname id env rmdir; do
-  p="$(command -v "$c" 2>/dev/null)" && ln -sf "$p" "$TMP/barebin/$c" 2>/dev/null
-done
 rm -rf "$TMP/barehome"; mkdir -p "$TMP/barehome"
 cp "$HOME/.claude.json" "$TMP/barehome/.claude.json"
-BASH_BIN="$(command -v bash)"
 out="$(env -i HOME="$TMP/barehome" AGMAN_HOME="$TMP/barehome/.agman" AGMAN_TOOLS="claude" \
   PATH="$TMP/barebin" "$BASH_BIN" "$AGM" create barefallback 2>&1)"
 assert_contains "fallback warns when no JSON tool exists" "$out" "neither jq nor python3"
