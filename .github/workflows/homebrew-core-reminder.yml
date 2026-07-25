@@ -1,0 +1,132 @@
+name: homebrew-core eligibility reminder
+
+# Homebrew's Package Acceptance Policy says "a code repository less than 30 days
+# old is normally not eligible" for its official taps. This workflow waits for
+# that window to close, then opens one issue with the live numbers, so the
+# reminder arrives as a GitHub notification instead of living in someone's head.
+#
+# It is idempotent: once the issue exists (open or closed) it never opens another.
+# The issue body lives in .github/homebrew-core-reminder.md.
+#
+# Delete this workflow once agman is in homebrew-core, or if the third-party tap
+# turns out to be the permanent answer.
+
+on:
+  schedule:
+    # Daily at 09:00 UTC so the reminder lands the morning the gate clears.
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Render the reminder into the run summary without opening an issue"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    name: Check eligibility
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the reminder template
+        uses: actions/checkout@v5
+
+      - name: Evaluate the age and notability gates
+        id: gates
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          created=$(gh api "repos/$REPO" --jq '.created_at')
+          stars=$(gh api "repos/$REPO" --jq '.stargazers_count')
+          forks=$(gh api "repos/$REPO" --jq '.forks_count')
+          watchers=$(gh api "repos/$REPO" --jq '.subscribers_count')
+
+          created_epoch=$(date -u -d "$created" +%s)
+          eligible_epoch=$((created_epoch + 30 * 24 * 3600))
+          now_epoch=$(date -u +%s)
+          age_days=$(((now_epoch - created_epoch) / 86400))
+          eligible_date=$(date -u -d "@$eligible_epoch" +%Y-%m-%d)
+
+          # A self-submission by the repository owner is held to 90 forks,
+          # 90 watchers or 225 stars rather than 30/30/75.
+          if [ "$forks" -ge 90 ] || [ "$watchers" -ge 90 ] || [ "$stars" -ge 225 ]; then
+            verdict="**Both gates are clear.** A homebrew-core pull request from you would meet the documented criteria."
+          elif [ "$forks" -ge 30 ] || [ "$watchers" -ge 30 ] || [ "$stars" -ge 75 ]; then
+            verdict="**The age gate is clear and notability meets the third-party bar, but not the self-submission bar.** Someone else proposing agman would qualify today; your own submission needs 90 forks, 90 watchers or 225 stars."
+          else
+            verdict="**The age gate is clear, but notability is not there yet.** The tap remains the right home until it is."
+          fi
+
+          {
+            echo "age_days=$age_days"
+            echo "eligible_date=$eligible_date"
+            echo "stars=$stars"
+            echo "forks=$forks"
+            echo "watchers=$watchers"
+            echo "verdict=$verdict"
+          } >> "$GITHUB_OUTPUT"
+
+          if [ "$now_epoch" -lt "$eligible_epoch" ] && [ "$DRY_RUN" != "true" ]; then
+            echo "::notice::Repository is $age_days days old; the 30-day gate clears on $eligible_date. Nothing to do."
+            echo "proceed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "proceed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open the reminder issue
+        if: steps.gates.outputs.proceed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          DRY_RUN: ${{ github.event.inputs.dry_run }}
+          AGE: ${{ steps.gates.outputs.age_days }}
+          ELIGIBLE: ${{ steps.gates.outputs.eligible_date }}
+          STARS: ${{ steps.gates.outputs.stars }}
+          FORKS: ${{ steps.gates.outputs.forks }}
+          WATCHERS: ${{ steps.gates.outputs.watchers }}
+          VERDICT: ${{ steps.gates.outputs.verdict }}
+          TITLE: "agman: the 30-day homebrew-core waiting period has passed"
+        run: |
+          set -euo pipefail
+          sed -e "s|__OWNER__|$OWNER|g" \
+              -e "s|__ELIGIBLE__|$ELIGIBLE|g" \
+              -e "s|__AGE__|$AGE|g" \
+              -e "s|__STARS__|$STARS|g" \
+              -e "s|__FORKS__|$FORKS|g" \
+              -e "s|__WATCHERS__|$WATCHERS|g" \
+              -e "s|__VERDICT__|$VERDICT|g" \
+              .github/homebrew-core-reminder.md > body.md
+
+          if [ "$DRY_RUN" = "true" ]; then
+            {
+              echo "## Dry run — no issue was opened"
+              echo ""
+              echo "Title: \`$TITLE\`"
+              echo ""
+              echo "---"
+              echo ""
+              cat body.md
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::Dry run complete; the rendered reminder is in the run summary."
+            exit 0
+          fi
+
+          existing=$(gh issue list --repo "$REPO" --state all --limit 100 \
+            --search "in:title homebrew-core waiting period" --json number --jq 'length')
+          if [ "$existing" != "0" ]; then
+            echo "::notice::The reminder issue already exists; nothing to do."
+            exit 0
+          fi
+
+          if ! url=$(gh issue create --repo "$REPO" --title "$TITLE" \
+                       --body-file body.md --assignee "$OWNER"); then
+            url=$(gh issue create --repo "$REPO" --title "$TITLE" --body-file body.md)
+          fi
+          echo "::notice::Opened $url"
