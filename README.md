@@ -30,6 +30,33 @@ Selection precedence, highest first:
 
 Running sessions keep the config they started with; switching affects new sessions.
 
+## Accounts: switching profiles does not log you out
+
+New profiles **inherit your current Claude account**, so switching never drops you at a
+login prompt. This needs care because Claude Code splits auth across two places:
+
+- **Account identity** lives in `~/.claude.json`. Claude Code runs first-launch onboarding
+  when `hasCompletedOnboarding` is absent, and treats auth as cached when `oauthAccount` is
+  set. `agman create` seeds those keys (plus `userID` and `machineID`) from your live config,
+  and `agman use` backfills any profile that predates this behavior.
+- **Credentials** live in the macOS Keychain, or in `<config dir>/.credentials.json` on
+  Linux and Windows. On macOS the symlink keeps the path `~/.claude`, so the Keychain entry
+  is shared automatically. On Linux and Windows, agman promotes the credential file to
+  `~/.agman/.credentials.json` and symlinks each profile at it, so a token refresh in one
+  profile is visible to all of them. `agman off` turns that link back into a real file, so
+  your restored config works without agman.
+
+Only account identity is copied — personal project state, history, and caches stay out of
+new profiles. A clean structured merge uses `jq` or `python3` when available; with neither
+installed agman copies the whole state file instead and says so, rather than silently
+breaking your login.
+
+Run `agman doctor` to see per-profile auth state. It reports presence only and never prints
+token material.
+
+Giving a profile its **own** account (a separate work login) is Phase 4 on the roadmap; a
+profile that already holds its own real `.credentials.json` is left untouched today.
+
 ## Install
 
 From a clone:
@@ -56,7 +83,7 @@ agman update
 
 | Command | What it does |
 |---|---|
-| `create <name>` | New **empty** profile with a starter `CLAUDE.md`. Flags: `--copy-current` (seed from current config; skips sessions/cache/history), `--from <profile>`, `--link-plugins` |
+| `create <name>` | New **empty** profile with a starter `CLAUDE.md`, inheriting your current account. Flags: `--copy-current` (seed from current config; skips sessions/cache/history), `--from <profile>`, `--link-plugins` |
 | `use <name>` | Activate: symlink `~/.claude` → profile. First use backs up your original config as the `global` profile |
 | `off` | Deactivate and physically restore your original `~/.claude` |
 | `current` | Show the active profile and how it was selected |
@@ -87,7 +114,8 @@ eval "$(agman init zsh)"   # or: init bash
 
 - **Switching is machine-global** for new sessions (that's the point). Terminals or IDE windows with running Claude sessions keep the config they launched with.
 - `use` requires symlink support; on Windows use WSL, or Git Bash with Developer Mode enabled.
-- **Auth is per profile.** A `--copy-current` profile inherits credentials copied from your config where they exist on disk (Linux); on macOS credentials live in the Keychain and may be shared. To use a different account in a profile, run `claude /login` inside it once. Treat profile dirs as sensitive.
+- **Profiles share one account by default** — see [Accounts](#accounts-switching-profiles-does-not-log-you-out). Per-profile accounts are Phase 4 on the roadmap. Treat profile dirs as sensitive: they can hold credentials and MCP tokens.
+- **`agman update` and the curl installer need `curl`.** Everything else is bash plus standard tools; `jq` or `python3` improves profile creation but is not required.
 - `CLAUDE_CONFIG_DIR` (used by the per-shell layer) is honored by the Claude Code CLI but not officially documented ([anthropics/claude-code#33430](https://github.com/anthropics/claude-code/issues/33430)). The global symlink switch does not depend on it.
 
 ## Development

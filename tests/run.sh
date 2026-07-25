@@ -20,7 +20,30 @@ printf '{}\n' > "$HOME/.claude/settings.json"
 printf 'ephemeral\n' > "$HOME/.claude/sessions/s1.jsonl"
 printf 'a skill\n' > "$HOME/.claude/skills/foo.md"
 printf 'plugin data\n' > "$HOME/.claude/plugins/p.json"
-printf '{"mcpServers":{}}\n' > "$HOME/.claude.json"
+# Realistic identity state: the keys Claude Code checks for onboarding/auth,
+# plus noise that a clean seed must leave behind.
+cat > "$HOME/.claude.json" <<'EOF'
+{
+  "mcpServers": {},
+  "hasCompletedOnboarding": true,
+  "lastOnboardingVersion": "2.1.205",
+  "userID": "user-abc123",
+  "machineID": "machine-xyz789",
+  "oauthAccount": {
+    "accountUuid": "acct-1111",
+    "emailAddress": "dev@example.com",
+    "organizationName": "Example Org"
+  },
+  "numStartups": 42,
+  "tipsHistory": {"tip-a": 1},
+  "projects": {"/some/personal/path": {"hasTrustDialogAccepted": true}}
+}
+EOF
+# Simulates the Linux/Windows layout, where Claude Code keeps credentials
+# inside the config dir. Absent on macOS (Keychain), and agman's handling is
+# driven by file existence rather than OS detection, so this exercises it.
+printf '{"claudeAiOauth":{"accessToken":"FAKE-TOKEN-DO-NOT-USE"}}\n' > "$HOME/.claude/.credentials.json"
+chmod 600 "$HOME/.claude/.credentials.json"
 
 export AGMAN_HOME="$HOME/.agman"
 unset CLAUDE_CONFIG_DIR AGMAN_SHELL_INTEGRATION AGMAN_CLAUDE_HOME AGMAN_RAW_URL 2>/dev/null || true
@@ -215,10 +238,19 @@ cp "$AGM" "$TMP/self/agman"
 chmod +x "$TMP/self/agman"
 sed 's/^AGMAN_VERSION=.*/AGMAN_VERSION="9.9.9"/' "$AGM" > "$TMP/remote/bin/agman"
 
-out="$(AGMAN_RAW_URL="file://$TMP/remote" "$TMP/self/agman" update)"
-assert_contains "update reports new version" "$out" "9.9.9"
-assert_contains "update replaced the script" "$(grep -m1 '^AGMAN_VERSION=' "$TMP/self/agman")" "9.9.9"
-assert_fail "update fails cleanly on bad source" env AGMAN_RAW_URL="file://$TMP/nonexistent" "$TMP/self/agman" update
+if command -v curl >/dev/null 2>&1; then
+  out="$(AGMAN_RAW_URL="file://$TMP/remote" "$TMP/self/agman" update)"
+  assert_contains "update reports new version" "$out" "9.9.9"
+  assert_contains "update replaced the script" "$(grep -m1 '^AGMAN_VERSION=' "$TMP/self/agman")" "9.9.9"
+  assert_fail "update fails cleanly on bad source" env AGMAN_RAW_URL="file://$TMP/nonexistent" "$TMP/self/agman" update
+else
+  # agman correctly refuses to self-update without curl; assert that instead.
+  assert_fail "update requires curl and fails cleanly without it" \
+    env AGMAN_RAW_URL="file://$TMP/remote" "$TMP/self/agman" update
+  out="$(env AGMAN_RAW_URL="file://$TMP/remote" "$TMP/self/agman" update 2>&1 || true)"
+  assert_contains "update explains the curl requirement" "$out" "curl is required"
+  ok "update replacement check skipped (curl not installed)"
+fi
 
 # --- misc ------------------------------------------------------------------------------------------
 
@@ -231,6 +263,133 @@ assert_missing "removed profile dir gone" "$AGMAN_HOME/staging"
 assert_fail "remove unknown profile fails" "$AGM" remove staging --yes
 assert_fail "use unknown profile fails" "$AGM" use nosuch
 assert_fail "dir for unknown profile fails" "$AGM" dir nosuch
+
+# --- identity seeding (the login-prompt fix) -----------------------------------------
+
+# Fresh sandbox so migration state from the tests above doesn't interfere.
+ID_HOME="$TMP/idhome"
+mkdir -p "$ID_HOME/.claude"
+cp "$HOME/.claude.json" "$ID_HOME/.claude.json"
+printf 'GLOBAL RULES\n' > "$ID_HOME/.claude/CLAUDE.md"
+printf '{"claudeAiOauth":{"accessToken":"FAKE-TOKEN-DO-NOT-USE"}}\n' > "$ID_HOME/.claude/.credentials.json"
+idrun() { env HOME="$ID_HOME" AGMAN_HOME="$ID_HOME/.agman" "$AGM" "$@"; }
+IDA="$ID_HOME/.agman"
+
+assert_ok "empty profile creation succeeds" idrun create solo
+json="$(cat "$IDA/solo/.claude.json")"
+assert_contains "seeds hasCompletedOnboarding (the onboarding gate)" "$json" '"hasCompletedOnboarding"'
+assert_contains "onboarding gate seeded as true" "$json" 'true'
+assert_contains "seeds oauthAccount (account identity)" "$json" '"oauthAccount"'
+assert_contains "oauthAccount carries the account uuid" "$json" 'acct-1111'
+assert_contains "seeds userID" "$json" '"userID"'
+assert_contains "seeds machineID" "$json" '"machineID"'
+
+# A clean seed must not drag personal project state into a new profile.
+case "$json" in
+  *'/some/personal/path'*) bad "clean seed excludes projects state" ;;
+  *) ok "clean seed excludes projects state" ;;
+esac
+case "$json" in
+  *'tipsHistory'*) bad "clean seed excludes tips history" ;;
+  *) ok "clean seed excludes tips history" ;;
+esac
+
+out="$(idrun create seeded2 2>&1)"
+assert_contains "create reports account inheritance" "$out" "inherits your current Claude account"
+
+assert_ok "copy-current profile creation succeeds" idrun create fullcopy --copy-current
+assert_contains "copy-current profile has identity" "$(cat "$IDA/fullcopy/.claude.json")" '"oauthAccount"'
+assert_missing "credentials are never copied into a profile (would go stale)" "$IDA/fullcopy/.credentials.json"
+
+# --- repair path: profiles created before this fix ------------------------------------
+
+mkdir -p "$IDA/legacy"
+printf '{}\n' > "$IDA/legacy/.claude.json"
+out="$(idrun use legacy 2>&1)"
+assert_contains "use repairs a profile with no identity" "$out" "Seeded this profile"
+assert_contains "repaired profile gained identity" "$(cat "$IDA/legacy/.claude.json")" '"hasCompletedOnboarding"'
+
+# --- shared credentials (Linux/Windows layout) ----------------------------------------
+
+assert_exists "first switch promotes credentials to the shared file" "$IDA/.credentials.json"
+assert_contains "shared credential content preserved" "$(cat "$IDA/.credentials.json")" "FAKE-TOKEN-DO-NOT-USE"
+assert_symlink_to "backup profile links to shared credentials" "$IDA/global/.credentials.json" "$IDA/.credentials.json"
+assert_symlink_to "active profile links to shared credentials" "$IDA/legacy/.credentials.json" "$IDA/.credentials.json"
+perm="$(ls -l "$IDA/.credentials.json" | cut -c1-10)"
+assert_eq "shared credentials stay owner-only" "-rw-------" "$perm"
+
+assert_ok "switching to another profile works" idrun use solo
+assert_symlink_to "second profile also links to shared credentials" "$IDA/solo/.credentials.json" "$IDA/.credentials.json"
+
+# A profile holding its own real credential file is left alone (Phase 4 path).
+printf '{"own":"creds"}\n' > "$IDA/seeded2/.credentials.json"
+idrun use seeded2 >/dev/null
+if [ -L "$IDA/seeded2/.credentials.json" ]; then
+  bad "profile with its own credentials keeps them"
+else
+  assert_contains "profile with its own credentials keeps them" "$(cat "$IDA/seeded2/.credentials.json")" '"own"'
+fi
+
+# --- off leaves a self-contained config ------------------------------------------------
+
+assert_ok "off restores the original config" idrun off
+if [ -L "$ID_HOME/.claude/.credentials.json" ]; then
+  bad "restored credentials are a real file, not a link"
+else
+  ok "restored credentials are a real file, not a link"
+fi
+assert_contains "restored credentials keep their content" "$(cat "$ID_HOME/.claude/.credentials.json")" "FAKE-TOKEN-DO-NOT-USE"
+assert_missing "shared credential file cleaned up after off" "$IDA/.credentials.json"
+
+# Links left dangling by 'off' must not be presented to Claude Code as creds.
+idrun use solo >/dev/null
+if [ -L "$IDA/solo/.credentials.json" ] && [ ! -e "$IDA/solo/.credentials.json" ]; then
+  bad "dangling credential link is cleaned up on switch"
+else
+  ok "dangling credential link is cleaned up on switch"
+fi
+idrun off >/dev/null
+
+# --- doctor auth reporting --------------------------------------------------------------
+
+out="$(idrun doctor)"
+assert_contains "doctor reports per-profile auth" "$out" "per-profile auth:"
+assert_contains "doctor reports identity state" "$out" "identity-seeded"
+assert_contains "doctor reports the json merge backend" "$out" "json merge:"
+case "$out" in
+  *FAKE-TOKEN*) bad "doctor never prints token material" ;;
+  *) ok "doctor never prints token material" ;;
+esac
+
+# --- JSON backend coverage: jq, python3, and the no-tool fallback ------------------------
+
+if command -v jq >/dev/null 2>&1; then
+  rm -rf "$TMP/jqhome"; mkdir -p "$TMP/jqhome"
+  cp "$HOME/.claude.json" "$TMP/jqhome/.claude.json"
+  env HOME="$TMP/jqhome" AGMAN_HOME="$TMP/jqhome/.agman" "$AGM" create viajq >/dev/null 2>&1
+  assert_contains "jq backend seeds identity" "$(cat "$TMP/jqhome/.agman/viajq/.claude.json")" '"oauthAccount"'
+  case "$(cat "$TMP/jqhome/.agman/viajq/.claude.json")" in
+    *'/some/personal/path'*) bad "jq backend produces a clean seed" ;;
+    *) ok "jq backend produces a clean seed" ;;
+  esac
+else
+  ok "jq backend skipped (jq not installed)"
+  ok "jq clean-seed check skipped (jq not installed)"
+fi
+
+# Minimal PATH with neither jq nor python3: must still preserve login.
+mkdir -p "$TMP/barebin"
+for c in ls cp mv rm mkdir ln cat find chmod readlink grep sed printf date mktemp \
+         sort head cut wc dirname basename tr awk uname id env; do
+  p="$(command -v "$c" 2>/dev/null)" && ln -sf "$p" "$TMP/barebin/$c" 2>/dev/null
+done
+rm -rf "$TMP/barehome"; mkdir -p "$TMP/barehome"
+cp "$HOME/.claude.json" "$TMP/barehome/.claude.json"
+BASH_BIN="$(command -v bash)"
+out="$(env -i HOME="$TMP/barehome" AGMAN_HOME="$TMP/barehome/.agman" PATH="$TMP/barebin" \
+  "$BASH_BIN" "$AGM" create barefallback 2>&1)"
+assert_contains "fallback warns when no JSON tool exists" "$out" "neither jq nor python3"
+assert_contains "fallback still preserves login state" "$(cat "$TMP/barehome/.agman/barefallback/.claude.json")" '"hasCompletedOnboarding"'
 
 # --- summary --------------------------------------------------------------------
 
