@@ -93,7 +93,8 @@
   @media (max-width: 700px) { .navlinks a.hide-sm { display: none; } }
 
   /* ---------- hero ---------- */
-  .hero { padding: 70px 0 58px; }
+  /* Keep the horizontal padding from .wrap; a shorthand here would drop it. */
+  .hero { padding: 70px 22px 58px; }
   .hero h1 { font-size: clamp(2.15rem, 5.4vw, 3.15rem); margin-bottom: 16px; }
   .hero h1 .dim { color: var(--ink-faint); font-weight: 400; }
   .hero .tag { font-size: 1.14rem; color: var(--ink-soft); max-width: 60ch; margin-bottom: 26px; }
