@@ -111,6 +111,41 @@ so enterprise-managed machines may not be able to use this path; `--bare` ignore
 
 ---
 
+### Phase 1 verification record (v0.3.0)
+
+Evidence gathered while implementing, beyond the docs above:
+
+**[Certain]** Extracted from the shipped `claude` 2.1.205 binary (it embeds its JS bundle):
+onboarding is gated by `if (!config.hasCompletedOnboarding)`, and Claude's own telemetry
+defines cached auth as `oauthAccount !== undefined || hasCompletedOnboarding === true`.
+
+**[Certain]** Claude Code's own sandbox provisioning does exactly what agman now does: it
+writes a fresh config with `{hasCompletedOnboarding: true, …}` and copies the host's
+`~/.claude.json` into the target config dir. The seeding approach matches upstream behavior
+rather than working around it.
+
+**[Certain]** `oauthAccount` holds only identity and plan metadata (account/org UUIDs,
+email, display name, tiers) — no tokens or secrets — so seeding it carries no credential
+material. It is PII, which is why cloud sync (Phase 5) must exclude it by default.
+
+**[Certain]** `.claude.json` resolves under the home directory, so the symlink agman
+maintains at `~/.claude.json` is the file sessions actually read.
+
+Reproduction and fix, verified in an isolated Linux container against the conditions above:
+a profile with `{}` (v0.2 behavior) yields "onboarding: WOULD RUN / auth: MISSING"; the same
+switch under v0.3.0 yields "onboarding: SKIPPED / auth: CACHED", with the profile's own
+`CLAUDE.md` active and no personal `projects` state leaked.
+
+**Bug found by cross-platform testing:** bash 3.2 rejects self-referencing single-statement
+declarations (`local dir="$1" f="$dir/x"`) under `set -u`. Two functions had it. One failed
+loudly; the other silently resolved `dir` from the *caller's* scope via dynamic scoping and
+only worked by coincidence. Both split into separate statements; the pattern is now absent
+from the file.
+
+Test matrix: 122 assertions passing on macOS (bash 3.2.57, jq + python3 + curl) and Debian
+stable (bash 5.2.37, jq only, no curl, no python3 — exercising the fallback and
+missing-curl paths). shellcheck `-S warning -e SC2088` clean.
+
 ## 2. Releases and Homebrew
 
 **[Certain]** homebrew-core requires notability of **at least 30 forks, 30 watchers, or 75
@@ -259,7 +294,7 @@ TLDs for new registrations; Porkbun is the practical option for `.sh`.
 
 | Phase | Scope | Effort | Risk | Why this order |
 |---|---|---|---|---|
-| **1** | **Fix the login prompt.** Seed `.claude.json` identity keys on create; handle Linux/Windows `.credentials.json`; `doctor` reports auth state per profile | S | Low | The only user-visible defect; blocks daily use |
+| **1** ✅ | **Fix the login prompt** — shipped in v0.3.0. Seeds `.claude.json` identity keys on create and backfills on `use`; promotes Linux/Windows `.credentials.json` to a shared file every profile links to; `doctor` reports per-profile auth | S | Low | The only user-visible defect; blocks daily use |
 | **2** | **Release engineering.** Tag v0.3.0, GitHub Release, `homebrew-agman` tap, automated formula bump | S | Low | Distribution unblocks adoption; also the notability path to homebrew-core |
 | **3** | **Multi-tool adapters.** Registry + profile layout migration; Codex and Gemini first (documented mechanisms), Qwen/Kimi after verification | M | Med | Makes the "agent manager" name honest; layout migration is the risky part |
 | **4** | **Per-profile accounts.** `agman login <profile>` wrapping `setup-token`, token at `0600`, wired through profile `settings.json` `apiKeyHelper` | M | Med | Depends on Phase 1's auth model; document the Remote-Control/connector and `forceLoginOrgUUID` limits |

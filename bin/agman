@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.2.0"
+AGMAN_VERSION="0.3.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # The config dir Claude Code reads. Only ever moved/symlinked, never edited.
@@ -24,12 +24,19 @@ CLAUDE_HOME="${AGMAN_CLAUDE_HOME:-$HOME/.claude}"
 CLAUDE_JSON="$(dirname "$CLAUDE_HOME")/.claude.json"
 DEFAULT_FILE="$AGMAN_HOME/.default"
 GLOBAL_BACKUP="$AGMAN_HOME/global"
+# Canonical shared credential file. On Linux/Windows Claude Code keeps
+# .credentials.json inside the config dir, so profiles that share an account
+# symlink to this one file and token refreshes stay visible to all of them.
+# On macOS credentials live in the Keychain and this stays absent.
+SHARED_CREDS="$AGMAN_HOME/.credentials.json"
+CREDS_BASENAME=".credentials.json"
 AGMAN_RAW_URL="${AGMAN_RAW_URL:-https://raw.githubusercontent.com/memandip/agman/main}"
 
 # Ephemeral or machine-local state that should not be cloned into a profile.
 SEED_EXCLUDES=(backups cache downloads file-history ide locks logs paste-cache
   projects session-env sessions shell-snapshots statsig tasks telemetry todos
-  history.jsonl mcp-needs-auth-cache.json .last-cleanup .DS_Store)
+  history.jsonl mcp-needs-auth-cache.json .last-cleanup .DS_Store
+  .credentials.json)
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -130,6 +137,153 @@ seed_from_dir() {
   done < <(find "$src" -mindepth 1 -maxdepth 1 -print0)
 }
 
+# --- identity / auth inheritance ------------------------------------------
+#
+# Claude Code decides whether to run first-launch onboarding from
+# ~/.claude.json, not from the credential store: its own code gates on
+# `if (!config.hasCompletedOnboarding)`, and it treats auth as cached when
+# `oauthAccount !== undefined || hasCompletedOnboarding === true`. A profile
+# with an empty {} therefore triggers login even when a valid token exists.
+# Seeding these keys is what makes a new profile inherit the current account.
+IDENTITY_KEYS="oauthAccount hasCompletedOnboarding userID machineID lastOnboardingVersion"
+
+# Which helper is available for a structured JSON merge.
+json_tool() {
+  if command -v jq >/dev/null 2>&1; then printf 'jq'
+  elif command -v python3 >/dev/null 2>&1; then printf 'python3'
+  else printf 'none'; fi
+}
+
+# Copy identity keys from a source .claude.json into a profile's own copy,
+# preserving anything already there. Falls back to a whole-file copy when no
+# JSON tool exists, which keeps auth working at the cost of extra state.
+seed_identity() {
+  local src="$1" dst="$2" tmp
+  [ -f "$src" ] || return 1
+  tmp="$dst.agman-tmp.$$"
+  case "$(json_tool)" in
+    jq)
+      if ! jq -n --arg keys "$IDENTITY_KEYS" \
+            --slurpfile s "$src" \
+            '($keys | split(" ")) as $k
+             | ($s[0] // {}) as $src
+             | reduce $k[] as $key ({}; if ($src | has($key)) then .[$key] = $src[$key] else . end)' \
+            > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; return 1
+      fi
+      # Merge onto any existing profile state (profile keys win only if newer
+      # writes happen later; identity is authoritative here).
+      if [ -s "$dst" ] && jq -e . "$dst" >/dev/null 2>&1; then
+        if jq -s '.[0] * .[1]' "$dst" "$tmp" > "$tmp.2" 2>/dev/null; then
+          mv "$tmp.2" "$tmp"
+        else
+          rm -f "$tmp.2"
+        fi
+      fi
+      ;;
+    python3)
+      if ! SRC="$src" DST="$dst" KEYS="$IDENTITY_KEYS" python3 -c '
+import json, os, sys
+src, dst, keys = os.environ["SRC"], os.environ["DST"], os.environ["KEYS"].split()
+try:
+    s = json.load(open(src))
+except Exception:
+    sys.exit(1)
+if not isinstance(s, dict):
+    sys.exit(1)
+try:
+    d = json.load(open(dst))
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+for k in keys:
+    if k in s:
+        d[k] = s[k]
+sys.stdout.write(json.dumps(d, indent=2) + "\n")
+' > "$tmp" 2>/dev/null; then
+        rm -f "$tmp"; return 1
+      fi
+      ;;
+    none)
+      warn "neither jq nor python3 found; copying the whole config state to preserve login"
+      cp "$src" "$tmp" || { rm -f "$tmp"; return 1; }
+      ;;
+  esac
+  mv "$tmp" "$dst" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$dst" 2>/dev/null || true
+  return 0
+}
+
+# Best source of identity state: the live file while it is still a real file,
+# otherwise the backup of the original config.
+identity_source() {
+  if [ -f "$CLAUDE_JSON" ] && [ ! -L "$CLAUDE_JSON" ]; then
+    printf '%s' "$CLAUDE_JSON"; return 0
+  fi
+  if [ -f "$GLOBAL_BACKUP/.claude.json" ]; then
+    printf '%s' "$GLOBAL_BACKUP/.claude.json"; return 0
+  fi
+  if [ -L "$CLAUDE_JSON" ]; then
+    local t; t="$(readlink_once "$CLAUDE_JSON")"
+    [ -f "$t" ] && { printf '%s' "$t"; return 0; }
+  fi
+  return 1
+}
+
+# True when a profile's .claude.json carries usable account identity.
+has_identity() {
+  local f="$1/.claude.json"
+  [ -f "$f" ] || return 1
+  grep -q '"hasCompletedOnboarding"[[:space:]]*:[[:space:]]*true' "$f" 2>/dev/null && return 0
+  grep -q '"oauthAccount"[[:space:]]*:[[:space:]]*{' "$f" 2>/dev/null && return 0
+  return 1
+}
+
+# Move the original credential file to the shared location once, so every
+# profile that shares the account sees the same refreshed tokens.
+adopt_shared_credentials() {
+  local src="$1/$CREDS_BASENAME"
+  [ -f "$src" ] || return 0
+  [ -L "$src" ] && return 0
+  if [ ! -e "$SHARED_CREDS" ]; then
+    mv "$src" "$SHARED_CREDS" || return 1
+    chmod 600 "$SHARED_CREDS" 2>/dev/null || true
+    ln -s "$SHARED_CREDS" "$src" 2>/dev/null || cp "$SHARED_CREDS" "$src"
+  fi
+  return 0
+}
+
+# Point a profile at the shared credential file unless it deliberately holds
+# its own (a real file placed there by the user or a future per-account login).
+link_shared_credentials() {
+  local dir="$1" target
+  target="$dir/$CREDS_BASENAME"
+  # Drop a link left dangling by a previous 'off', which would otherwise look
+  # like a credential file to Claude Code.
+  if [ -L "$target" ] && [ ! -e "$target" ]; then rm -f "$target"; fi
+  [ -f "$SHARED_CREDS" ] || return 0
+  [ -L "$target" ] && return 0
+  [ -e "$target" ] && return 0
+  ln -s "$SHARED_CREDS" "$target" 2>/dev/null || cp "$SHARED_CREDS" "$target"
+  return 0
+}
+
+# Describe a profile's credential situation for doctor/current. Never prints
+# token material.
+profile_auth_state() {
+  local dir="$1" f
+  f="$dir/$CREDS_BASENAME"
+  local ident="no-identity" creds="keychain-or-none"
+  has_identity "$dir" && ident="identity-seeded"
+  if [ -L "$f" ]; then
+    creds="shared-credentials"
+  elif [ -f "$f" ]; then
+    creds="own-credentials"
+  fi
+  printf '%s, %s' "$ident" "$creds"
+}
+
 write_starter_claude_md() {
   local dir="$1" name="$2"
   cat > "$dir/CLAUDE.md" <<EOF
@@ -148,7 +302,7 @@ EOF
 # commands
 
 cmd_create() {
-  local name="" mode="empty" from="" link_plugins=0 arg
+  local name="" mode="empty" from="" link_plugins=0 arg src_json=""
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
@@ -170,7 +324,13 @@ cmd_create() {
   case "$mode" in
     empty)
       write_starter_claude_md "$dir" "$name"
-      printf "Created profile '%s' at %s (empty, with a starter CLAUDE.md).\n" "$name" "$dir"
+      if src_json="$(identity_source)" && seed_identity "$src_json" "$dir/.claude.json"; then
+        printf "Created profile '%s' at %s (empty, with a starter CLAUDE.md).\n" "$name" "$dir"
+        printf "It inherits your current Claude account, so no re-login is needed.\n"
+      else
+        printf "Created profile '%s' at %s (empty, with a starter CLAUDE.md).\n" "$name" "$dir"
+        warn "could not read current account state; this profile may prompt for login"
+      fi
       printf "Tip: use --copy-current to seed a profile from your current Claude config.\n"
       ;;
     current)
@@ -182,6 +342,10 @@ cmd_create() {
       seed_from_dir "$src" "$dir" "$link_plugins"
       if [ -f "$CLAUDE_JSON" ] && [ ! -e "$dir/.claude.json" ]; then
         cp "$CLAUDE_JSON" "$dir/.claude.json"
+        chmod 600 "$dir/.claude.json" 2>/dev/null || true
+      fi
+      if ! has_identity "$dir" && src_json="$(identity_source)"; then
+        seed_identity "$src_json" "$dir/.claude.json" || true
       fi
       [ -f "$dir/CLAUDE.md" ] || write_starter_claude_md "$dir" "$name"
       printf "Created profile '%s' at %s (copied from current Claude config).\n" "$name" "$dir"
@@ -237,9 +401,22 @@ cmd_use() {
       ;;
   esac
 
+  # Once the original config is backed up, promote its credential file (present
+  # on Linux/Windows only) to the shared location so refreshed tokens stay
+  # visible to every profile that shares the account.
+  [ -d "$GLOBAL_BACKUP" ] && adopt_shared_credentials "$GLOBAL_BACKUP"
+
   # Profiles carry their own user-scope state file so MCP servers follow the
   # profile; make sure the symlink target exists before linking.
   [ -f "$dir/.claude.json" ] || printf '{}\n' > "$dir/.claude.json"
+
+  # Repair profiles created before identity seeding existed, so switching never
+  # drops the account and forces a re-login.
+  local seeded=0 src_json=""
+  if ! has_identity "$dir" && src_json="$(identity_source)"; then
+    seed_identity "$src_json" "$dir/.claude.json" && seeded=1
+  fi
+  link_shared_credentials "$dir"
 
   [ -L "$CLAUDE_HOME" ] && rm -f "$CLAUDE_HOME"
   ln -s "$dir" "$CLAUDE_HOME"
@@ -259,6 +436,11 @@ cmd_use() {
   printf '%s\n' "$name" > "$DEFAULT_FILE"
 
   printf "Switched to profile '%s' (~/.claude -> %s).\n" "$name" "$dir"
+  if [ "$seeded" = "1" ]; then
+    printf "Seeded this profile with your current Claude account (no re-login needed).\n"
+  elif ! has_identity "$dir"; then
+    warn "this profile has no saved account identity; Claude Code may prompt for login"
+  fi
   if [ "$migrated" = "1" ]; then
     printf "Your original Claude config was backed up as the 'global' profile.\n"
     printf "Switch back with 'agman use global', or fully restore with 'agman off'.\n"
@@ -283,6 +465,16 @@ cmd_off() {
         mv "$GLOBAL_BACKUP" "$CLAUDE_HOME"
         if [ -f "$CLAUDE_HOME/.claude.json" ] && [ ! -e "$CLAUDE_JSON" ]; then
           mv "$CLAUDE_HOME/.claude.json" "$CLAUDE_JSON"
+        fi
+        # Leave the restored config self-contained: replace the shared
+        # credential link with the real file so it works without agman.
+        if [ -L "$CLAUDE_HOME/$CREDS_BASENAME" ]; then
+          rm -f "$CLAUDE_HOME/$CREDS_BASENAME"
+          if [ -f "$SHARED_CREDS" ]; then
+            cp "$SHARED_CREDS" "$CLAUDE_HOME/$CREDS_BASENAME"
+            chmod 600 "$CLAUDE_HOME/$CREDS_BASENAME" 2>/dev/null || true
+            rm -f "$SHARED_CREDS"
+          fi
         fi
         printf "Restored your original Claude config to ~/.claude (the 'global' profile was moved back).\n"
       else
@@ -451,6 +643,23 @@ cmd_doctor() {
     printf "backup:        original config preserved as profile 'global'\n"
   else
     printf 'backup:        none (original config is in place or was never migrated)\n'
+  fi
+
+  if [ -f "$SHARED_CREDS" ]; then
+    printf 'credentials:   shared file at %s (profiles symlink to it)\n' "$SHARED_CREDS"
+  else
+    printf 'credentials:   no shared file (normal on macOS, where Claude Code uses the Keychain)\n'
+  fi
+  printf 'json merge:    %s\n' "$(json_tool)"
+
+  if [ -d "$AGMAN_HOME" ]; then
+    local any=0
+    for entry in "$AGMAN_HOME"/*/; do
+      [ -d "$entry" ] || continue
+      [ "$any" = "0" ] && printf '\nper-profile auth:\n' && any=1
+      entry="${entry%/}"
+      printf '  %-20s %s\n' "${entry##*/}" "$(profile_auth_state "$entry")"
+    done
   fi
 
   if name="$(default_profile 2>/dev/null)"; then
