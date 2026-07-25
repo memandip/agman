@@ -112,6 +112,22 @@ Homebrew (macOS and Linux):
 brew install memandip/agman/agman
 ```
 
+That first install also trusts the tap, so from then on the short name works for everything:
+
+```bash
+brew install agman
+brew upgrade agman
+```
+
+To use the short name from the start, trust the tap explicitly first — Homebrew will not
+resolve a bare formula name from an untrusted third-party tap:
+
+```bash
+brew tap memandip/agman
+brew trust memandip/agman
+brew install agman
+```
+
 From a clone:
 
 ```bash
