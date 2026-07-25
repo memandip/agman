@@ -1,0 +1,66 @@
+name: Bump Homebrew formula
+
+# Keeps memandip/homebrew-agman in step with releases. Requires a repository
+# secret named HOMEBREW_TAP_TOKEN: a personal access token with 'repo' and
+# 'workflow' scopes (the action needs to commit to the tap repository). Without
+# that secret this workflow reports a notice and exits cleanly rather than
+# failing every release.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to bump the formula to (e.g. v0.3.0)"
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    name: Bump formula
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          tag="${RELEASE_TAG:-$INPUT_TAG}"
+          if [ -z "$tag" ]; then
+            echo "::error::could not determine a tag to bump to"
+            exit 1
+          fi
+          echo "name=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Check tap token
+        id: guard
+        env:
+          TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the formula bump. Add the secret to enable it."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump agman formula in the tap
+        if: steps.guard.outputs.ready == 'true'
+        uses: mislav/bump-homebrew-formula-action@v4
+        with:
+          formula-name: agman
+          formula-path: Formula/agman.rb
+          homebrew-tap: memandip/homebrew-agman
+          base-branch: main
+          tag-name: ${{ steps.tag.outputs.name }}
+          download-url: https://github.com/memandip/agman/archive/refs/tags/${{ steps.tag.outputs.name }}.tar.gz
+          commit-message: |
+            agman {{version}}
+
+            Bumped by the release workflow in memandip/agman.
+        env:
+          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
