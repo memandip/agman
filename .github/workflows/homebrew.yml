@@ -1,10 +1,12 @@
 name: Bump Homebrew formula
 
-# Keeps memandip/homebrew-agman in step with releases. Requires a repository
-# secret named HOMEBREW_TAP_TOKEN: a personal access token with 'repo' and
-# 'workflow' scopes (the action needs to commit to the tap repository). Without
-# that secret this workflow reports a notice and exits cleanly rather than
-# failing every release.
+# Keeps memandip/homebrew-agman in step with releases by opening a pull request
+# against the tap, so brew test-bot validates the formula on Linux and two
+# macOS runners before it lands. Merge the PR to publish.
+#
+# Requires a repository secret named HOMEBREW_TAP_TOKEN: a personal access
+# token with 'repo' and 'workflow' scopes. Without that secret this workflow
+# reports a notice and exits cleanly rather than failing every release.
 
 on:
   release:
@@ -58,6 +60,11 @@ jobs:
           base-branch: main
           tag-name: ${{ steps.tag.outputs.name }}
           download-url: https://github.com/memandip/agman/archive/refs/tags/${{ steps.tag.outputs.name }}.tar.gz
+          # Open a pull request rather than committing to the tap directly.
+          # `brew test-bot --only-formulae`, which installs the formula and runs
+          # its test block on Linux and two macOS runners, only runs on pull
+          # requests — a direct push would land an unverified formula.
+          create-pullrequest: true
           commit-message: |
             agman {{version}}
 
