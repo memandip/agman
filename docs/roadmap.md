@@ -297,7 +297,7 @@ TLDs for new registrations; Porkbun is the practical option for `.sh`.
 | **1** ✅ | **Fix the login prompt** — shipped in v0.3.0. Seeds `.claude.json` identity keys on create and backfills on `use`; promotes Linux/Windows `.credentials.json` to a shared file every profile links to; `doctor` reports per-profile auth | S | Low | The only user-visible defect; blocks daily use |
 | **2** ✅ | **Release engineering** — v0.3.0 tagged and released; [memandip/homebrew-agman](https://github.com/memandip/homebrew-agman) tap live (`brew audit --strict --online` clean, `brew install` + `brew test` verified); bump workflow added, pending the `HOMEBREW_TAP_TOKEN` secret | S | Low | Distribution unblocks adoption; also the notability path to homebrew-core |
 | **3** ✅ | **Multi-tool adapters** — shipped in v0.4.0. Adapter registry with per-tool link pairs, layout-2 profiles with automatic migration and backup, `AGMAN_TOOLS` allowlist. Codex and Gemini verified against the real CLIs; Qwen/Kimi deferred | M | Med | Makes the "agent manager" name honest; layout migration is the risky part |
-| **4** | **Per-profile accounts.** `agman login <profile>` wrapping `setup-token`, token at `0600`, wired through profile `settings.json` `apiKeyHelper` | M | Med | Depends on Phase 1's auth model; document the Remote-Control/connector and `forceLoginOrgUUID` limits |
+| **4** ✅ | **Per-profile accounts** — shipped in v0.5.0. `agman login`/`logout`, token at `0600`, helper script wired through the profile's `settings.json` `apiKeyHelper`; clones never inherit an account | M | Med | Depends on Phase 1's auth model; limits documented in the README |
 | **5** | **Git-backed sync + `.agman`.** `push`/`pull`, `.agman` resolution with remote fetch, trust prompt, secret exclusion | M | Med | Delivers the cloud requirement with zero infrastructure |
 | **6** | **Hosted cloud + SSO.** E2E encryption, PKCE/device flow, org accounts | L | High | Only with real demand; ongoing cost and security liability |
 | **—** | **Domain `agman.sh`** | S | Low | Defer: $47/yr for cosmetics |
@@ -351,3 +351,47 @@ tools still activate. Regression assertions added.
 Test matrix: 167 assertions passing on macOS (bash 3.2.57) and Debian stable (bash 5.2.37,
 jq-only, no curl or python3). shellcheck clean, including an unused-variable warning it
 caught in `cmd_off`.
+
+
+### Phase 4 verification record (v0.5.0)
+
+`agman login <profile>` stores a `claude setup-token` value (one year, non-rotating) at mode
+`600` inside the profile and writes a helper script that prints it, wired in through the
+profile's own `settings.json` as `apiKeyHelper`. That setting is honored from user-scope
+settings and applies to the CLI, the VS Code extension, and the Agent SDK, so a profile's
+account follows into IDEs — which no environment variable can do. `logout` removes all three
+and re-seeds the shared identity.
+
+Deliberate design choices:
+
+- The token is read with echo disabled and never printed back, including by `doctor`, which
+  reports only `own-account (token)`.
+- `login` strips `oauthAccount` and `userID` from the profile's identity file while keeping
+  `hasCompletedOnboarding`, so `/status` cannot display the shared account's email while
+  requests authenticate as a different one.
+- `use` re-points `apiKeyHelper` if the path moved (rename, relocated `AGMAN_HOME`), so
+  activation is self-healing.
+- Without `jq` or `python3`, `login` still works when `settings.json` is absent (a fresh file
+  is safe to write) and refuses rather than clobbering an existing one — verified both ways.
+
+**Two bugs found by testing, both real:**
+
+1. **Cloning leaked an account.** `create --from` copied the profile wholesale, carrying the
+   source token *and* an `apiKeyHelper` still pointing at the source profile's helper — so a
+   clone would have authenticated as the source account. Now `strip_account_material` removes
+   the token, the helper, and the setting, and the clone reports that it uses the shared
+   account.
+2. **`set -e` is global, not function-scoped.** Helpers that toggled `set +e`/`set -e`
+   internally re-enabled it before returning, defeating the caller's `set +e`: a "cannot
+   merge settings" condition aborted the whole script silently with exit 2 instead of
+   reporting the problem and cleaning up the orphaned token. All toggling replaced with the
+   `|| rc=$?` idiom; no `set +e` remains in the file.
+
+**Verification ceiling, stated plainly:** the mechanics are tested with a fake token
+(storage mode, helper output, settings merge, identity stripping, clone isolation, idempotent
+logout). Proving that a profile *actually* authenticates as a second Claude account requires
+a second account and an interactive browser login, which only you can do. The apiKeyHelper
+contract itself is documented behavior, not an inference.
+
+Test matrix: 204 assertions on macOS (bash 3.2.57) and Debian stable (bash 5.2.37, jq-only,
+no curl or python3). shellcheck clean.

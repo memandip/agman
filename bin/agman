@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.4.0"
+AGMAN_VERSION="0.5.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -37,6 +37,10 @@ LAYOUT_VERSION="2"
 # On macOS credentials live in the Keychain and this stays absent.
 SHARED_CREDS="$AGMAN_HOME/.credentials.json"
 CREDS_BASENAME=".credentials.json"
+# Per-profile account: a long-lived token plus the helper script Claude Code
+# calls to read it. Never synced, never printed.
+TOKEN_BASENAME=".agman-token"
+HELPER_BASENAME="agman-apikey.sh"
 AGMAN_RAW_URL="${AGMAN_RAW_URL:-https://raw.githubusercontent.com/memandip/agman/main}"
 
 # --- adapter registry -------------------------------------------------------
@@ -60,7 +64,7 @@ ADAPTER_ENVVARS=(CLAUDE_CONFIG_DIR CODEX_HOME -)
 SEED_EXCLUDES=(backups cache downloads file-history ide locks logs paste-cache
   projects session-env sessions shell-snapshots statsig tasks telemetry todos
   history.jsonl mcp-needs-auth-cache.json .last-cleanup .DS_Store
-  .credentials.json)
+  .credentials.json .agman-token agman-apikey.sh)
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -470,13 +474,157 @@ link_shared_credentials() {
   return 0
 }
 
+# --- per-profile accounts ---------------------------------------------------
+#
+# A profile can authenticate as a different Claude account than the rest. The
+# mechanism is Claude Code's own apiKeyHelper setting, which the docs state
+# "appl[ies] to the CLI and the surfaces that wrap it, including the VS Code
+# extension, the Agent SDK, and GitHub Actions", and which is honored from
+# user-scope settings — exactly what `agman use` symlinks into place.
+#
+# The credential is a long-lived token from `claude setup-token` (one year, and
+# it does not rotate). Snapshotting Keychain entries or .credentials.json is
+# deliberately avoided: refresh tokens rotate on every use, so a snapshot is
+# stale by the time you switch back and restoring it logs you out.
+
+profile_token_file() { printf '%s/%s' "$(profile_claude_dir "$1")" "$TOKEN_BASENAME"; }
+profile_helper_file() { printf '%s/%s' "$(profile_claude_dir "$1")" "$HELPER_BASENAME"; }
+profile_settings_file() { printf '%s/settings.json' "$(profile_claude_dir "$1")"; }
+
+profile_has_own_account() { [ -s "$(profile_token_file "$1")" ]; }
+
+# Set a string key in a JSON file, preserving everything else. Returns 2 when a
+# non-empty file cannot be merged safely for lack of jq and python3.
+json_set_string_key() {
+  local file="$1" key="$2" value="$3" tmp
+  tmp="$file.agman-tmp.$$"
+  case "$(json_tool)" in
+    jq)
+      if [ -s "$file" ] && jq -e . "$file" >/dev/null 2>&1; then
+        jq --arg k "$key" --arg v "$value" '.[$k] = $v' "$file" > "$tmp" 2>/dev/null \
+          || { rm -f "$tmp"; return 1; }
+      else
+        jq -n --arg k "$key" --arg v "$value" '{($k): $v}' > "$tmp" 2>/dev/null \
+          || { rm -f "$tmp"; return 1; }
+      fi ;;
+    python3)
+      if ! FILE="$file" KEY="$key" VALUE="$value" python3 -c '
+import json, os, sys
+f, k, v = os.environ["FILE"], os.environ["KEY"], os.environ["VALUE"]
+try:
+    d = json.load(open(f))
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+d[k] = v
+sys.stdout.write(json.dumps(d, indent=2) + "\n")
+' > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi ;;
+    none)
+      if [ -s "$file" ]; then rm -f "$tmp"; return 2; fi
+      printf '{\n  "%s": "%s"\n}\n' "$key" "$value" > "$tmp" ;;
+  esac
+  mv "$tmp" "$file"
+}
+
+# Delete keys from a JSON file. Returns 2 when it cannot be done safely.
+json_del_keys() {
+  local file="$1"; shift
+  local keys="$*" tmp
+  [ -f "$file" ] || return 0
+  tmp="$file.agman-tmp.$$"
+  case "$(json_tool)" in
+    jq)
+      jq --arg keys "$keys" 'delpaths([($keys | split(" "))[] | [.]])' "$file" > "$tmp" 2>/dev/null \
+        || { rm -f "$tmp"; return 1; } ;;
+    python3)
+      if ! FILE="$file" KEYS="$keys" python3 -c '
+import json, os, sys
+f, keys = os.environ["FILE"], os.environ["KEYS"].split()
+try:
+    d = json.load(open(f))
+    if not isinstance(d, dict):
+        d = {}
+except Exception:
+    d = {}
+for k in keys:
+    d.pop(k, None)
+sys.stdout.write(json.dumps(d, indent=2) + "\n")
+' > "$tmp" 2>/dev/null; then rm -f "$tmp"; return 1; fi ;;
+    none) rm -f "$tmp"; return 2 ;;
+  esac
+  mv "$tmp" "$file"
+}
+
+write_api_key_helper() {
+  local dir="$1" helper rc
+  helper="$(profile_helper_file "$dir")"
+  mkdir -p "$(profile_claude_dir "$dir")"
+  cat > "$helper" <<EOF
+#!/bin/sh
+# Written by agman. Prints this profile's Claude Code auth token.
+# Claude Code calls this via apiKeyHelper and sends the value as an
+# Authorization/X-Api-Key header. Failing loudly beats printing nothing.
+set -e
+f="\$(dirname "\$0")/$TOKEN_BASENAME"
+[ -s "\$f" ] || { echo "agman: no token for this profile" >&2; exit 1; }
+cat "\$f"
+EOF
+  chmod 700 "$helper"
+  rc=0
+  json_set_string_key "$(profile_settings_file "$dir")" apiKeyHelper "$helper" || rc=$?
+  return "$rc"
+}
+
+remove_api_key_helper() {
+  local dir="$1" rc
+  rm -f "$(profile_helper_file "$dir")" "$(profile_token_file "$dir")"
+  rc=0
+  json_del_keys "$(profile_settings_file "$dir")" apiKeyHelper || rc=$?
+  return "$rc"
+}
+
+# Keep a profile's apiKeyHelper path correct if AGMAN_HOME moved or the profile
+# was renamed. Called from `use`, so activation is self-healing.
+# Remove any per-account credential material from a profile. Used after cloning
+# so a copy never inherits another profile's account: the token itself, the
+# helper script, and the apiKeyHelper setting, which would otherwise still point
+# at the source profile's helper and authenticate as that account.
+strip_account_material() {
+  local dir="$1" cdir
+  cdir="$(profile_claude_dir "$dir")"
+  rm -f "$cdir/$TOKEN_BASENAME" "$cdir/$HELPER_BASENAME"
+  if [ -f "$cdir/settings.json" ] && grep -q '"apiKeyHelper"' "$cdir/settings.json" 2>/dev/null; then
+    local rc=0
+    json_del_keys "$cdir/settings.json" apiKeyHelper || rc=$?
+    [ "$rc" = "0" ] || warn "could not remove apiKeyHelper from $cdir/settings.json; edit it by hand so this profile does not use another account's token"
+  fi
+  return 0
+}
+
+refresh_api_key_helper() {
+  local dir="$1" settings helper
+  profile_has_own_account "$dir" || return 0
+  helper="$(profile_helper_file "$dir")"
+  settings="$(profile_settings_file "$dir")"
+  [ -f "$helper" ] || write_api_key_helper "$dir" >/dev/null 2>&1 || true
+  if [ -f "$settings" ] && grep -q '"apiKeyHelper"' "$settings" 2>/dev/null; then
+    grep -q "$helper" "$settings" 2>/dev/null && return 0
+  fi
+  write_api_key_helper "$dir" >/dev/null 2>&1 || \
+    warn "profile has its own account but apiKeyHelper could not be written to $settings"
+  return 0
+}
+
 # Never prints token material.
 profile_auth_state() {
   local dir="$1" f
   f="$(profile_claude_dir "$dir")/$CREDS_BASENAME"
   local ident="no-identity" creds="keychain-or-none"
   has_identity "$dir" && ident="identity-seeded"
-  if [ -L "$f" ]; then
+  if profile_has_own_account "$dir"; then
+    creds="own-account (token)"
+  elif [ -L "$f" ]; then
     creds="shared-credentials"
   elif [ -f "$f" ]; then
     creds="own-credentials"
@@ -645,7 +793,11 @@ cmd_create() {
         [ "$base" = "$LAYOUT_FILE" ] && continue
         cp -R "$entry" "$dir/$base"
       done < <(find "$fromdir" -mindepth 1 -maxdepth 1 -print0)
+      strip_account_material "$dir"
       printf "Created profile '%s' at %s (cloned from '%s').\n" "$name" "$dir" "$from"
+      if profile_has_own_account "$fromdir"; then
+        printf "The clone uses your shared Claude account; run 'agman login %s' to give it its own.\n" "$name"
+      fi
       ;;
   esac
   printf "Switch to it with: agman use %s\n" "$name"
@@ -710,10 +862,11 @@ cmd_use() {
   # profile carries identity so switching never forces a re-login.
   [ -d "$GLOBAL_BACKUP" ] && adopt_shared_credentials "$GLOBAL_BACKUP"
   local seeded=0 src_json=""
-  if ! has_identity "$dir" && src_json="$(identity_source)"; then
+  if ! profile_has_own_account "$dir" && ! has_identity "$dir" && src_json="$(identity_source)"; then
     seed_identity "$src_json" "$(profile_identity_file "$dir")" && seeded=1
   fi
   link_shared_credentials "$dir"
+  refresh_api_key_helper "$dir"
 
   mkdir -p "$AGMAN_HOME"
   printf '%s\n' "$name" > "$DEFAULT_FILE"
@@ -1008,6 +1161,107 @@ cmd_doctor() {
   printf '    switching is the only way to profile it.\n'
 }
 
+cmd_login() {
+  local name="" from_stdin=0 no_run=0 arg token="" rc
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --token-stdin) from_stdin=1 ;;
+      --no-run) no_run=1 ;;
+      -*) usage_die "unknown option '$arg' for login" ;;
+      *) [ -z "$name" ] && name="$arg" || usage_die "unexpected argument '$arg'" ;;
+    esac
+  done
+  require_profile "$name"
+  local dir; dir="$(profile_dir "$name")"
+  [ "$(profile_layout "$dir")" = "1" ] && migrate_profile "$dir"
+
+  if [ "$from_stdin" = "1" ]; then
+    IFS= read -r token || true
+  else
+    [ -t 0 ] || die "not a terminal; pipe a token instead: agman login $name --token-stdin"
+    printf "Giving profile '%s' its own Claude account.\n\n" "$name"
+    printf "This needs a long-lived token from 'claude setup-token', which opens a\n"
+    printf "browser and prints a token once (valid one year, and it does not rotate).\n\n"
+    if [ "$no_run" = "0" ] && command -v claude >/dev/null 2>&1; then
+      printf "Running 'claude setup-token' now — approve the account you want for this profile.\n\n"
+      claude setup-token || warn "'claude setup-token' did not finish cleanly; you can still paste a token below"
+      printf "\n"
+    else
+      printf "Run this in another terminal, then come back:\n  claude setup-token\n\n"
+    fi
+    printf 'Paste the token (input hidden): '
+    if command -v stty >/dev/null 2>&1; then
+      stty -echo 2>/dev/null || true
+      IFS= read -r token || true
+      stty echo 2>/dev/null || true
+      printf '\n'
+    else
+      IFS= read -r token || true
+    fi
+  fi
+
+  # Strip whitespace without ever echoing the value.
+  token="$(printf '%s' "$token" | tr -d '[:space:]')"
+  [ -n "$token" ] || die "no token provided; nothing changed"
+  case "$token" in
+    sk-ant-oat*) ;;
+    *) warn "token does not look like a 'claude setup-token' value (expected sk-ant-oat…); storing it anyway" ;;
+  esac
+
+  local tf; tf="$(profile_token_file "$dir")"
+  mkdir -p "$(profile_claude_dir "$dir")"
+  ( umask 177; printf '%s\n' "$token" > "$tf" )
+  chmod 600 "$tf" 2>/dev/null || true
+
+  rc=0
+  write_api_key_helper "$dir" || rc=$?
+  if [ "$rc" = "2" ]; then
+    rm -f "$tf" "$(profile_helper_file "$dir")"
+    die "cannot merge apiKeyHelper into $(profile_settings_file "$dir") without jq or python3; install one and retry"
+  elif [ "$rc" != "0" ]; then
+    rm -f "$tf" "$(profile_helper_file "$dir")"
+    die "could not write apiKeyHelper to $(profile_settings_file "$dir")"
+  fi
+
+  # The seeded identity describes the shared account, which would make /status
+  # show the wrong email for this profile. Keep the onboarding flag, drop the
+  # account metadata.
+  json_del_keys "$(profile_identity_file "$dir")" oauthAccount userID || true
+
+  printf "\nProfile '%s' now authenticates with its own account.\n" "$name"
+  printf "  token:  %s (mode 600, never synced)\n" "$tf"
+  printf "  helper: %s (called by Claude Code as apiKeyHelper)\n" "$(profile_helper_file "$dir")"
+  printf "\nThis applies to the CLI, the VS Code extension, and the Agent SDK.\n"
+  printf "Undo with: agman logout %s\n" "$name"
+  printf "\nKnown limits of setup-token credentials:\n"
+  printf "  - requires a Pro, Max, Team, or Enterprise plan\n"
+  printf "  - model requests only: no Remote Control, no claude.ai connectors\n"
+  printf "    (locally configured MCP servers still work)\n"
+  printf "  - managed setups pinning forceLoginOrgUUID reject environment credentials\n"
+  printf "  - expires after about a year; rerun this command to replace it\n"
+}
+
+cmd_logout() {
+  local name="${1:-}" rc
+  require_profile "$name"
+  local dir; dir="$(profile_dir "$name")"
+  if ! profile_has_own_account "$dir" && [ ! -f "$(profile_helper_file "$dir")" ]; then
+    printf "Profile '%s' has no account of its own; nothing to do.\n" "$name"
+    return 0
+  fi
+  rc=0
+  remove_api_key_helper "$dir" || rc=$?
+  [ "$rc" = "2" ] && warn "removed the token and helper, but could not edit $(profile_settings_file "$dir") without jq or python3; delete its apiKeyHelper line by hand"
+
+  # Restore the shared account's identity so the profile stops prompting.
+  local src_json=""
+  if src_json="$(identity_source)"; then
+    seed_identity "$src_json" "$(profile_identity_file "$dir")" || true
+  fi
+  printf "Profile '%s' is back on your shared Claude account.\n" "$name"
+}
+
 cmd_migrate() {
   [ -d "$AGMAN_HOME" ] || die "no profiles to migrate"
   local before after
@@ -1134,6 +1388,10 @@ Commands:
   env <name>             Print export lines: eval "\$(agman env work)"
   run <name> [-- args]   Launch claude once under a profile (per-process)
   exec <name> -- <cmd>   Run a command with per-tool env vars set
+  login <name>           Give a profile its own Claude account (own token)
+                           --token-stdin    read the token from stdin
+                           --no-run         don't run 'claude setup-token' first
+  logout <name>          Drop that account; back to your shared login
   rename <old> <new>     Rename a profile (repoints active symlinks)
   remove <name> [--yes]  Delete a profile (refuses if active)
   migrate                Move profiles to the current layout, then relink
@@ -1177,6 +1435,8 @@ main() {
     exec)    cmd_exec ${1+"$@"} ;;
     rename)  cmd_rename ${1+"$@"} ;;
     remove|rm) cmd_remove ${1+"$@"} ;;
+    login)   cmd_login ${1+"$@"} ;;
+    logout)  cmd_logout ${1+"$@"} ;;
     migrate) cmd_migrate ;;
     update)  cmd_update ;;
     doctor)  cmd_doctor ;;

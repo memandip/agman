@@ -72,8 +72,37 @@ breaking your login.
 Run `agman doctor` to see per-profile auth state. It reports presence only and never prints
 token material.
 
-Giving a profile its **own** account (a separate work login) is Phase 4 on the roadmap; a
-profile that already holds its own real `.credentials.json` is left untouched today.
+### Giving a profile its own account
+
+To have a profile authenticate as a *different* Claude account — a work login separate from
+your personal one:
+
+```bash
+agman login work      # runs 'claude setup-token', then paste the token (hidden input)
+agman logout work     # back to your shared account
+```
+
+This stores a long-lived token (`claude setup-token`, valid about a year and it does **not**
+rotate) at mode `600` inside the profile, and points the profile's `settings.json` at a small
+helper script through Claude Code's `apiKeyHelper` setting. Because that setting applies to
+the CLI, the VS Code extension, and the Agent SDK, the profile's account follows you into
+IDEs — which an environment variable could not do.
+
+Deliberately *not* used: snapshotting Keychain entries or `.credentials.json`. Refresh tokens
+rotate on every use, so a snapshot is already stale by the time you switch back, and
+restoring it logs you out.
+
+Limits of `setup-token` credentials, worth knowing before you rely on them:
+
+- requires a Pro, Max, Team, or Enterprise plan
+- model requests only: no Remote Control and no claude.ai connectors (locally configured MCP
+  servers still work)
+- managed setups that pin `forceLoginOrgUUID` reject environment credentials, so this path
+  may be blocked on company-managed machines
+- expires after about a year; rerun `agman login` to replace it
+
+Cloning a profile never copies its account: the token, helper, and `apiKeyHelper` setting are
+stripped, so the clone starts on your shared login.
 
 ## Install
 
@@ -117,6 +146,7 @@ agman update
 | `exec <name> -- <cmd>` | Run any command with `CLAUDE_CONFIG_DIR` and `CODEX_HOME` set |
 | `rename <old> <new>` / `remove <name>` | Manage profiles (rename repoints active symlinks; remove refuses if active) |
 | `migrate` | Move profiles to the current layout and relink (runs automatically on `use`) |
+| `login <name>` / `logout <name>` | Give a profile its own Claude account, or return it to your shared login |
 | `update` | Self-update from git or GitHub |
 | `doctor` | Diagnose setup: tool detection, per-path link state, per-profile auth, layout version |
 | `init [zsh\|bash]` | Optional per-shell integration (see below) |
