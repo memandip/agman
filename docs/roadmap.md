@@ -296,7 +296,7 @@ TLDs for new registrations; Porkbun is the practical option for `.sh`.
 |---|---|---|---|---|
 | **1** ✅ | **Fix the login prompt** — shipped in v0.3.0. Seeds `.claude.json` identity keys on create and backfills on `use`; promotes Linux/Windows `.credentials.json` to a shared file every profile links to; `doctor` reports per-profile auth | S | Low | The only user-visible defect; blocks daily use |
 | **2** ✅ | **Release engineering** — v0.3.0 tagged and released; [memandip/homebrew-agman](https://github.com/memandip/homebrew-agman) tap live (`brew audit --strict --online` clean, `brew install` + `brew test` verified); bump workflow added, pending the `HOMEBREW_TAP_TOKEN` secret | S | Low | Distribution unblocks adoption; also the notability path to homebrew-core |
-| **3** | **Multi-tool adapters.** Registry + profile layout migration; Codex and Gemini first (documented mechanisms), Qwen/Kimi after verification | M | Med | Makes the "agent manager" name honest; layout migration is the risky part |
+| **3** ✅ | **Multi-tool adapters** — shipped in v0.4.0. Adapter registry with per-tool link pairs, layout-2 profiles with automatic migration and backup, `AGMAN_TOOLS` allowlist. Codex and Gemini verified against the real CLIs; Qwen/Kimi deferred | M | Med | Makes the "agent manager" name honest; layout migration is the risky part |
 | **4** | **Per-profile accounts.** `agman login <profile>` wrapping `setup-token`, token at `0600`, wired through profile `settings.json` `apiKeyHelper` | M | Med | Depends on Phase 1's auth model; document the Remote-Control/connector and `forceLoginOrgUUID` limits |
 | **5** | **Git-backed sync + `.agman`.** `push`/`pull`, `.agman` resolution with remote fetch, trust prompt, secret exclusion | M | Med | Delivers the cloud requirement with zero infrastructure |
 | **6** | **Hosted cloud + SSO.** E2E encryption, PKCE/device flow, org accounts | L | High | Only with real demand; ongoing cost and security liability |
@@ -309,3 +309,45 @@ TLDs for new registrations; Porkbun is the practical option for `.sh`.
 - Test suite grows with each phase (86 assertions today); auth paths need fake-Keychain and
   fake-token fixtures so CI never touches real credentials.
 - Never log or echo token values; `doctor` reports presence and expiry only.
+
+### Phase 3 verification record (v0.4.0)
+
+**Layout.** Profiles became `~/.agman/<name>/<tool>/` with a `.agman-layout` marker.
+Layout-1 profiles are detected by shape and migrated automatically on the next `use`, after
+a full copy of the pre-migration profile is written to `~/.agman/.backups/<name>-layout1-<stamp>`.
+`agman migrate` runs the same pass explicitly and relinks the active profile.
+
+**Adapter registry.** Tools are declared as parallel arrays (bash 3.2 has no associative
+arrays): name, label, CLI command, link pairs (`profile_path:home_path:type`), and the
+config-dir env var or `-` when none exists. Adding a tool is one row per array. A tool is
+managed only when it is enabled and either the profile carries config for it, its CLI is on
+PATH, or its config path exists — so single-tool users see no behavior change. `AGMAN_TOOLS`
+restricts the set explicitly, which also makes tests independent of the host's installed CLIs.
+
+**Verified against the real CLIs** (Docker, `node:22-slim`, `@google/gemini-cli` and
+`@openai/codex` installed, syscall tracing with strace):
+
+- Gemini CLI performs 10 `openat` calls under the symlinked `~/.gemini` (`settings.json`,
+  `projects.json`, `history/`), Codex 3 under `~/.codex` (`.env`, `tmp/`, its lock file).
+  Both read config through the symlink.
+- Neither tool replaced the symlink while writing — the failure mode that would silently
+  break profiling. Both `~/.gemini` and `~/.codex` remained symlinks after use.
+- Writes landed **inside the active profile**: the profile's gemini tree gained `history`,
+  `projects.json`, and `tmp`, while the `global` backup still held only its original
+  `settings.json`. This is the isolation guarantee, demonstrated rather than assumed.
+- `agman off` restored both originals byte-for-byte.
+
+Note on method: an earlier trace grepped for the *profile* path and found nothing. That was
+a bad test, not a bad result — `openat` records the path the process requests
+(`~/.gemini/...`), and the kernel resolves the symlink, so the profile path never appears in
+the syscall arguments. The corrected trace greps the requested path.
+
+**Bug found by testing:** activation was not atomic per tool. With `~/.claude` a foreign
+symlink, agman refused it but had already moved `~/.claude.json` into the backup profile,
+leaving a half-migrated config. Fixed by an `adapter_can_link` pre-check that validates every
+path of a tool before anything moves; a refused tool is now skipped whole, and the other
+tools still activate. Regression assertions added.
+
+Test matrix: 167 assertions passing on macOS (bash 3.2.57) and Debian stable (bash 5.2.37,
+jq-only, no curl or python3). shellcheck clean, including an unused-variable warning it
+caught in `cmd_off`.

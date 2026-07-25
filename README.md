@@ -1,31 +1,49 @@
 # agman
 
-**agman** — **ag**ent **man**ager. Config profiles for AI coding agents: switch between complete work/personal setups the way `AWS_PROFILE` switches AWS accounts. Supports [Claude Code](https://code.claude.com/docs) today; Codex and Gemini CLI adapters are on the roadmap.
+**agman** — **ag**ent **man**ager. Config profiles for AI coding agents: switch between complete work/personal setups the way `AWS_PROFILE` switches AWS accounts. Manages [Claude Code](https://code.claude.com/docs), [Codex CLI](https://developers.openai.com/codex), and [Gemini CLI](https://github.com/google-gemini/gemini-cli).
 
-A profile is everything your agent *is* in a given context: its own `CLAUDE.md`, settings, rules, skills, agents, plugins, and MCP servers, kept as a complete config directory under `~/.agman/<name>`. `agman use` activates one by symlinking `~/.claude` at it — no shell setup required, and it applies to every new Claude Code session on this machine, IDE extensions included. One pure-bash script, no dependencies, works on macOS (stock bash 3.2), Linux, WSL, and Git Bash.
+A profile is everything your agents *are* in a given context — instructions, settings, rules, skills, agents, plugins, MCP servers — kept as one config tree per tool under `~/.agman/<name>`:
+
+```
+~/.agman/work/claude/       ->  ~/.claude
+~/.agman/work/claude.json   ->  ~/.claude.json
+~/.agman/work/codex/        ->  ~/.codex
+~/.agman/work/gemini/       ->  ~/.gemini
+```
+
+`agman use` activates a profile by symlinking each tool's config path at it — no shell setup required, and it applies to every new session on this machine, IDE extensions included. One pure-bash script, no dependencies, works on macOS (stock bash 3.2), Linux, WSL, and Git Bash.
+
+| Tool | Config paths | Env override |
+|---|---|---|
+| Claude Code | `~/.claude`, `~/.claude.json` | `CLAUDE_CONFIG_DIR` |
+| Codex CLI | `~/.codex` | `CODEX_HOME` |
+| Gemini CLI | `~/.gemini` | none — symlink switching is the only way |
+
+Only tools you actually have are touched: a profile covers a tool when it holds config for that tool, the CLI is on your PATH, or its config path exists. Restrict the set explicitly with `AGMAN_TOOLS="claude codex"` if you'd rather manage a subset. Gemini CLI is the reason agman switches by symlink rather than environment variables — it has no config-dir override at all, so nothing else generalizes.
 
 ```console
 $ agman create personal              # empty profile with a starter CLAUDE.md
-$ agman create work --copy-current   # seeded from your current Claude config
+$ agman create work --copy-current   # seeded from your current configs
 $ agman use work
-Switched to profile 'work' (~/.claude -> ~/.agman/work).
-Your original Claude config was backed up as the 'global' profile.
+Switched to profile 'work' (tools: claude codex gemini).
+Seeded this profile with your current Claude account (no re-login needed).
+Your original configs were backed up as the 'global' profile.
 $ claude                             # every new session now uses 'work'
-$ agman off                          # fully restore your original ~/.claude
+$ agman off                          # fully restore your original configs
 ```
 
 ## How it works
 
-`agman use <name>` symlinks `~/.claude` (and `~/.claude.json`, so user-scope MCP servers follow the profile) at the profile directory:
+`agman use <name>` symlinks every managed config path at the profile (including `~/.claude.json`, so user-scope MCP servers follow it):
 
-- The **first** time you switch, your original `~/.claude` is moved to `~/.agman/global` — it becomes a normal profile named `global`. Switch back to it anytime with `agman use global`, or run `agman off` to physically restore it and stop managing `~/.claude` entirely.
-- The symlink doubles as the marker: a **real directory** at `~/.claude` means agman isn't managing anything; a **symlink into `~/.agman/`** means that profile is active. `agman current` (or `ls -l ~/.claude`) tells you which.
-- agman refuses to touch a `~/.claude` symlink it didn't create (e.g. dotfiles managers), and refuses to remove the active profile.
+- The **first** time you switch, your original configs are moved into `~/.agman/global` — a normal profile named `global`. Switch back to it anytime with `agman use global`, or run `agman off` to physically restore it and stop managing `~/.claude` entirely.
+- The symlink doubles as the marker: a **real directory** means agman isn't managing that tool; a **symlink into `~/.agman/`** means that profile is active. `agman current` (or `ls -l ~/.claude`) tells you which.
+- agman refuses to touch a config symlink it didn't create (e.g. dotfiles managers) and skips that tool entirely rather than half-activating it; it also refuses to remove the active profile.
 
 Selection precedence, highest first:
 
 1. **`CLAUDE_CONFIG_DIR` set in a shell** — wins in that shell only, never overridden. Use `agman env`, `agman run`, or `agman exec` for per-shell/per-process profiles alongside the global switch.
-2. **The `~/.claude` symlink** set by `agman use` — machine-wide for all new sessions, no shell integration needed.
+2. **The config symlinks** set by `agman use` — machine-wide for all new sessions, no shell integration needed. This is the only mechanism that works for Gemini CLI.
 3. **Nothing** — stock `~/.claude`, untouched behavior.
 
 Running sessions keep the config they started with; switching affects new sessions.
@@ -90,16 +108,17 @@ agman update
 | Command | What it does |
 |---|---|
 | `create <name>` | New **empty** profile with a starter `CLAUDE.md`, inheriting your current account. Flags: `--copy-current` (seed from current config; skips sessions/cache/history), `--from <profile>`, `--link-plugins` |
-| `use <name>` | Activate: symlink `~/.claude` → profile. First use backs up your original config as the `global` profile |
-| `off` | Deactivate and physically restore your original `~/.claude` |
-| `current` | Show the active profile and how it was selected |
-| `list` | List profiles; `(active)` marks the `~/.claude` target |
-| `dir <name>` / `env <name>` | Print a profile's directory / an `export CLAUDE_CONFIG_DIR=…` line |
+| `use <name>` | Activate: symlink each tool's config path → profile. First use backs up your originals as the `global` profile, and migrates older profiles to the current layout |
+| `off` | Deactivate and physically restore your original configs |
+| `current` | Show the active profile and which tools it covers |
+| `list` | List profiles; `(active: …)` shows the live tools |
+| `dir <name>` / `env <name>` | Print a profile's Claude config dir / `export` lines for every tool that supports one |
 | `run <name> [-- args]` | Launch `claude` once under a profile without switching globally |
-| `exec <name> -- <cmd>` | Run any command with `CLAUDE_CONFIG_DIR` set |
-| `rename <old> <new>` / `remove <name>` | Manage profiles (rename repoints the symlink; remove refuses if active) |
+| `exec <name> -- <cmd>` | Run any command with `CLAUDE_CONFIG_DIR` and `CODEX_HOME` set |
+| `rename <old> <new>` / `remove <name>` | Manage profiles (rename repoints active symlinks; remove refuses if active) |
+| `migrate` | Move profiles to the current layout and relink (runs automatically on `use`) |
 | `update` | Self-update from git or GitHub |
-| `doctor` | Diagnose setup (symlink state, backup presence, stale default, …) |
+| `doctor` | Diagnose setup: tool detection, per-path link state, per-profile auth, layout version |
 | `init [zsh\|bash]` | Optional per-shell integration (see below) |
 
 ## Per-shell profiles (optional)
@@ -134,7 +153,7 @@ CI runs the suite on Ubuntu + macOS and lints with shellcheck on every push.
 
 ## Roadmap
 
-- **Multi-agent adapters**: Codex (via [`CODEX_HOME`](https://developers.openai.com/codex/environment-variables) / `~/.codex`), then Gemini CLI / Qwen Code / Kimi; profiles grow per-tool sections
+- **More tools**: Qwen Code and Kimi CLI adapters, once their config layouts are verified against the real CLIs
 - `.agman` file for **per-directory auto-switching** (the `.nvmrc`/direnv analog)
 - fish shell support, tab completions
 - `--fresh-auth` seeding (exclude copied credentials)
