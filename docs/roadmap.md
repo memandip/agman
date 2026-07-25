@@ -295,7 +295,7 @@ TLDs for new registrations; Porkbun is the practical option for `.sh`.
 | Phase | Scope | Effort | Risk | Why this order |
 |---|---|---|---|---|
 | **1** ✅ | **Fix the login prompt** — shipped in v0.3.0. Seeds `.claude.json` identity keys on create and backfills on `use`; promotes Linux/Windows `.credentials.json` to a shared file every profile links to; `doctor` reports per-profile auth | S | Low | The only user-visible defect; blocks daily use |
-| **2** | **Release engineering.** Tag v0.3.0, GitHub Release, `homebrew-agman` tap, automated formula bump | S | Low | Distribution unblocks adoption; also the notability path to homebrew-core |
+| **2** ✅ | **Release engineering** — v0.3.0 tagged and released; [memandip/homebrew-agman](https://github.com/memandip/homebrew-agman) tap live (`brew audit --strict --online` clean, `brew install` + `brew test` verified); bump workflow added, pending the `HOMEBREW_TAP_TOKEN` secret | S | Low | Distribution unblocks adoption; also the notability path to homebrew-core |
 | **3** | **Multi-tool adapters.** Registry + profile layout migration; Codex and Gemini first (documented mechanisms), Qwen/Kimi after verification | M | Med | Makes the "agent manager" name honest; layout migration is the risky part |
 | **4** | **Per-profile accounts.** `agman login <profile>` wrapping `setup-token`, token at `0600`, wired through profile `settings.json` `apiKeyHelper` | M | Med | Depends on Phase 1's auth model; document the Remote-Control/connector and `forceLoginOrgUUID` limits |
 | **5** | **Git-backed sync + `.agman`.** `push`/`pull`, `.agman` resolution with remote fetch, trust prompt, secret exclusion | M | Med | Delivers the cloud requirement with zero infrastructure |

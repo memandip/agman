@@ -59,6 +59,12 @@ profile that already holds its own real `.credentials.json` is left untouched to
 
 ## Install
 
+Homebrew (macOS and Linux):
+
+```bash
+brew install memandip/agman/agman
+```
+
 From a clone:
 
 ```bash
