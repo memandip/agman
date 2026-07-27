@@ -454,6 +454,115 @@ for c in ls cp mv rm mkdir ln cat find chmod readlink grep sed printf date mktem
 done
 BASH_BIN="$(command -v bash)"
 
+# --- shared session state: `claude --resume` must survive a switch -----------------------
+#
+# Claude Code stores a resumable session at
+#   <config dir>/projects/<encoded-cwd>/<session-id>.jsonl
+# so a per-profile config dir would strand every earlier session. These check
+# the paths a real `claude --resume` reads; the end-to-end check against the
+# actual CLI lives in the Docker scripts referenced in docs/roadmap.md.
+
+ST="$TMP/state"
+mkdir -p "$ST/.claude/projects/-root-work" "$ST/.claude/todos"
+cp "$HOME/.claude.json" "$ST/.claude.json"
+printf 'STATE RULES\n' > "$ST/.claude/CLAUDE.md"
+printf '{"sessionId":"sess-old"}\n' > "$ST/.claude/projects/-root-work/sess-old.jsonl"
+printf 'a prompt\n' > "$ST/.claude/history.jsonl"
+printf '{"t":1}\n' > "$ST/.claude/todos/t1.json"
+strun() { env HOME="$ST" AGMAN_HOME="$ST/.agman" AGMAN_TOOLS="claude" "$AGM" "$@"; }
+SA="$ST/.agman"
+SESS="projects/-root-work/sess-old.jsonl"
+
+strun create alpha >/dev/null 2>&1
+strun create beta >/dev/null 2>&1
+strun use alpha >/dev/null 2>&1
+
+assert_exists "session history promoted to shared state" "$SA/.state/$SESS"
+assert_exists "prompt history promoted to shared state" "$SA/.state/history.jsonl"
+assert_symlink_to "active profile links projects at shared state" "$SA/alpha/claude/projects" "$SA/.state/projects"
+assert_exists "transcript is reachable through ~/.claude (what --resume reads)" "$ST/.claude/$SESS"
+assert_eq "transcript content intact" '{"sessionId":"sess-old"}' "$(cat "$ST/.claude/$SESS")"
+
+strun use beta >/dev/null 2>&1
+assert_exists "transcript still reachable after switching profiles" "$ST/.claude/$SESS"
+assert_exists "prompt history still reachable after switching" "$ST/.claude/history.jsonl"
+
+# A session written while beta is active must be visible from alpha too.
+printf '{"sessionId":"sess-new"}\n' > "$ST/.claude/projects/-root-work/sess-new.jsonl"
+strun use alpha >/dev/null 2>&1
+assert_exists "session created under one profile is visible from the other" "$ST/.claude/projects/-root-work/sess-new.jsonl"
+
+out="$(strun doctor)"
+assert_contains "doctor reports shared session state" "$out" "session state: shared at"
+
+# off must hand the history back as real paths, not leave dangling links.
+strun off >/dev/null 2>&1
+assert_real_dir "off restores ~/.claude" "$ST/.claude"
+if [ -L "$ST/.claude/projects" ]; then
+  bad "off restores projects as a real directory"
+else
+  assert_exists "off restores projects as a real directory" "$ST/.claude/$SESS"
+fi
+assert_exists "off keeps the session written under a profile" "$ST/.claude/projects/-root-work/sess-new.jsonl"
+assert_exists "off restores prompt history" "$ST/.claude/history.jsonl"
+assert_missing "shared state directory cleaned up by off" "$SA/.state"
+
+# Re-activating after off must not leave a dangling link where history should be.
+strun use alpha >/dev/null 2>&1
+assert_exists "history survives an off/use round trip" "$ST/.claude/$SESS"
+strun off >/dev/null 2>&1
+
+# --- recursive merge: two profiles holding history for the same project ------------------
+#
+# Regression guard. Merging only top-level entries left each profile with a real
+# projects/ directory that shadowed the shared one, so each saw half the history.
+
+MG="$TMP/merge"
+mkdir -p "$MG/.agman/global/claude/projects/-root-work" \
+         "$MG/.agman/one/claude/projects/-root-work"
+printf '2\n' > "$MG/.agman/global/.agman-layout"
+printf '2\n' > "$MG/.agman/one/.agman-layout"
+cp "$HOME/.claude.json" "$MG/.agman/global/claude.json"
+cp "$HOME/.claude.json" "$MG/.agman/one/claude.json"
+printf '{"id":"from-global"}\n' > "$MG/.agman/global/claude/projects/-root-work/g.jsonl"
+printf '{"id":"from-one"}\n'    > "$MG/.agman/one/claude/projects/-root-work/o.jsonl"
+ln -s "$MG/.agman/one/claude" "$MG/.claude"
+ln -s "$MG/.agman/one/claude.json" "$MG/.claude.json"
+mgrun() { env HOME="$MG" AGMAN_HOME="$MG/.agman" AGMAN_TOOLS="claude" "$AGM" "$@"; }
+
+mgrun use one >/dev/null 2>&1
+assert_exists "merge keeps the session from the backup profile" "$MG/.agman/.state/projects/-root-work/g.jsonl"
+assert_exists "merge keeps the session from the active profile" "$MG/.agman/.state/projects/-root-work/o.jsonl"
+if [ -L "$MG/.agman/one/claude/projects" ]; then
+  ok "merged profile links projects rather than shadowing shared state"
+else
+  bad "merged profile links projects rather than shadowing shared state"
+fi
+assert_exists "both sessions reachable from the active profile" "$MG/.claude/projects/-root-work/g.jsonl"
+assert_exists "second session reachable too" "$MG/.claude/projects/-root-work/o.jsonl"
+
+# Encoded project directories start with '-', which trips tools that read them
+# as options. Guard the path that used to call dirname on them.
+mgrun create two >/dev/null 2>&1
+printf '{"id":"deep"}\n' > "$MG/.agman/.state/projects/-root-work/deep.jsonl"
+out="$(mgrun use two 2>&1)"
+assert_lacks "no tool parses an encoded project dir as an option" "$out" "invalid option"
+assert_exists "history intact after switching to a new profile" "$MG/.claude/projects/-root-work/deep.jsonl"
+mgrun off >/dev/null 2>&1
+
+# --- opt-out: AGMAN_SHARE_STATE=0 keeps history per-profile -------------------------------
+
+PP="$TMP/perprofile"
+mkdir -p "$PP/.claude/projects/-root-work"
+cp "$HOME/.claude.json" "$PP/.claude.json"
+printf '{"id":"iso"}\n' > "$PP/.claude/projects/-root-work/iso.jsonl"
+pprun() { env HOME="$PP" AGMAN_HOME="$PP/.agman" AGMAN_TOOLS="claude" AGMAN_SHARE_STATE=0 "$AGM" "$@"; }
+pprun create solo >/dev/null 2>&1
+pprun use solo >/dev/null 2>&1
+assert_missing "opt-out creates no shared state directory" "$PP/.agman/.state"
+assert_contains "doctor reports the opt-out" "$(pprun doctor)" "per-profile (AGMAN_SHARE_STATE=0)"
+pprun off >/dev/null 2>&1
+
 # --- per-profile accounts (login / logout) ---------------------------------------------
 
 A="$TMP/acct"
