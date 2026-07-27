@@ -48,6 +48,34 @@ Selection precedence, highest first:
 
 Running sessions keep the config they started with; switching affects new sessions.
 
+## Sessions: `claude --resume` keeps working across switches
+
+Claude Code stores a resumable session inside the config directory, at
+`<config dir>/projects/<encoded-cwd>/<session-id>.jsonl`. Swapping that directory per profile
+would strand every earlier session, so agman keeps session and history state in one shared
+place that all profiles symlink:
+
+```
+~/.agman/.state/projects/        <- session transcripts (and auto memory)
+~/.agman/.state/history.jsonl    <- prompt history
+~/.agman/.state/todos, file-history, shell-snapshots, session-env, sessions
+```
+
+The practical effect: `claude --resume <id>` finds your session no matter which profile is
+active, and a session started under one profile is resumable under another. What stays
+per-profile is the persona — `CLAUDE.md`, settings, rules, skills, agents, plugins, MCP
+servers.
+
+Upgrading from an earlier agman recovers history automatically: the next `agman use` merges
+whatever each profile is holding into shared state, file by file, and never overwrites. Since
+transcripts are UUID-named, collisions effectively don't happen; if one does, your copy is
+kept aside as `projects.agman-conflict` rather than being lost.
+
+`agman off` turns the shared links back into real directories under `~/.claude`, so a restored
+config works without agman. Set `AGMAN_SHARE_STATE=0` if you would rather each profile keep
+its own history — for example to keep client work strictly separate — at the cost of
+cross-profile resuming.
+
 ## Accounts: switching profiles does not log you out
 
 New profiles **inherit your current Claude account**, so switching never drops you at a

@@ -395,3 +395,48 @@ contract itself is documented behavior, not an inference.
 
 Test matrix: 204 assertions on macOS (bash 3.2.57) and Debian stable (bash 5.2.37, jq-only,
 no curl or python3). shellcheck clean.
+
+
+### v0.6.0 — session history survives profile switches
+
+**Report:** after switching profiles, `claude --resume <session_id>` could not find earlier
+sessions.
+
+**Root cause.** Claude Code keeps resumable sessions inside the config directory, at
+`<config dir>/projects/<encoded-cwd>/<session-id>.jsonl` — the same directory `agman use`
+swaps. Nothing was deleted: the transcripts stayed in whichever profile was active when they
+were written, and on a first switch that is the automatically created `global` backup. `agman
+off` always made them resumable again.
+
+**Reproduced with the real CLI** in Docker (`@anthropic-ai/claude-code` 2.1.220). `claude
+--resume` validates the session locally before contacting the API, so "No conversation found
+with session ID" is a reliable signal with no credentials. Baseline FOUND → after `agman use`
+MISSING → transcript located under `~/.agman/global/claude/projects/` → after `agman off`
+FOUND again.
+
+**Fix.** Session and history state now lives in `$AGMAN_HOME/.state` and every profile
+symlinks it: `projects`, `history.jsonl`, `todos`, `shell-snapshots`, `file-history`,
+`session-env`, `sessions`. Persona state (CLAUDE.md, settings, skills, agents, plugins, MCP)
+stays per-profile. `off` converts the links back to real directories; `AGMAN_SHARE_STATE=0`
+opts out.
+
+All six steps of the reproduction now report FOUND, and the upgrade path — history stranded in
+`global` plus more written under another profile — recovers both sets on the next `use`.
+
+**Three bugs found while building the fix, each by a test rather than by inspection:**
+
+1. **`off` stopped restoring.** The first implementation only converted symlinks back, but the
+   `global` backup has no symlink — its history was *moved* into shared state on the first
+   switch. Restore now hands back the shared entry whether or not a link exists.
+2. **The merge shadowed history.** Merging only top-level entries treated
+   `projects/<encoded-cwd>/` as one colliding unit, so a profile kept a real directory that
+   shadowed the shared one and each profile saw half the sessions. The merge is now recursive
+   and file-level; leftovers move to `<name>.agman-conflict` so a real directory never shadows
+   shared state.
+3. **`dirname` parsed a project directory as options.** Encoded paths start with `-`
+   (`-Users-me-work`), producing `dirname: invalid option -- 'r'`. It worked only by accident
+   where the destination already existed. Replaced with parameter expansion; other `dirname`
+   calls in the file take absolute paths and are unaffected.
+
+Test matrix: 228 assertions on macOS (bash 3.2.57) and Debian stable (bash 5.2.37), plus two
+Docker scripts driving the real Claude CLI. shellcheck clean.
