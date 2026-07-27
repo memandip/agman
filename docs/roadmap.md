@@ -440,3 +440,37 @@ All six steps of the reproduction now report FOUND, and the upgrade path — his
 
 Test matrix: 228 assertions on macOS (bash 3.2.57) and Debian stable (bash 5.2.37), plus two
 Docker scripts driving the real Claude CLI. shellcheck clean.
+
+
+### Post-v0.6.0 audit of the three bug classes
+
+Each v0.6.0 bug was systemic rather than a one-off, so the codebase was swept for further
+instances of all three:
+
+- **Self-referencing `local` under `set -u`** — none remain (checked by parsing every `local`
+  declaration, not by eye).
+- **Shell options toggled inside functions** — none. The one `set -e` left in the file is
+  inside the generated `apiKeyHelper` script, where it belongs.
+- **Dash-prefixed paths read as options** — none reachable. Every path handed to a command is
+  absolute, and the one place relative encoded names are handled uses parameter expansion.
+
+Proven rather than asserted: `tests/docker-session-adversarial.sh` builds project directories
+named `-Users-me-work`, `--help`, `-rf-danger`, `-n`, `with space` and a nested variant, splits
+them across the backup and an active profile, and includes a deliberate same-path conflict.
+Ten session files in, ten accounted for after the merge — nine in shared state and one
+preserved as a conflict copy. Nothing deleted, and the profile still ends up with a symlink
+rather than a shadowing directory.
+
+The sweep did turn up two real defects, fixed separately:
+
+1. **`doctor` reported the flag instead of the filesystem.** Setting `AGMAN_SHARE_STATE=0`
+   after history was already shared leaves the existing links in place — history stays shared —
+   yet `doctor` claimed "session state: per-profile". It now counts profiles actually linked
+   into shared state and says what to do about them.
+2. **Preserved conflict copies were invisible.** A merge never deletes, but nothing mentioned
+   the copies it kept aside, so they could sit unnoticed indefinitely. `doctor` and `off` now
+   list them.
+
+Test matrix: 238 assertions on macOS (bash 3.2.57) and Debian stable (bash 5.2.37), plus three
+Docker scripts driving the real Claude CLI. shellcheck clean over `bin/agman`, `install.sh` and
+every script in `tests/`.
