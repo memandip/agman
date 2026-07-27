@@ -662,6 +662,38 @@ merge_tree() {
   return 1
 }
 
+# How many profiles currently point their session paths at shared state. The
+# env var alone is not the truth: disabling sharing later leaves existing links
+# in place, and a diagnostic that reports the flag instead of the filesystem
+# sends people looking in the wrong place.
+count_shared_linked_profiles() {
+  local n=0 entry cdir pair name target
+  [ -d "$AGMAN_HOME" ] || { printf '0'; return 0; }
+  for entry in "$AGMAN_HOME"/*/; do
+    [ -d "$entry" ] || continue
+    entry="${entry%/}"
+    cdir="$(profile_claude_dir "$entry")"
+    for pair in "${SHARED_STATE_ENTRIES[@]}"; do
+      name="${pair%%:*}"
+      target="$cdir/$name"
+      if [ -L "$target" ]; then
+        case "$(readlink_once "$target")" in
+          "$SHARED_STATE"/*) n=$((n + 1)); break ;;
+        esac
+      fi
+    done
+  done
+  printf '%s' "$n"
+}
+
+# Copies a merge could not place. They are preserved rather than deleted, so
+# they need to be discoverable or they sit unnoticed forever.
+list_conflict_leftovers() {
+  [ -d "$AGMAN_HOME" ] || return 0
+  find "$AGMAN_HOME" -maxdepth 3 \
+    \( -name '*.agman-conflict' -o -name '*.agman-orphaned' \) 2>/dev/null | sort
+}
+
 # Move a config dir's real session/history entries into the shared directory.
 # Merges directory contents when both sides exist rather than overwriting, and
 # never deletes anything it could not place.
@@ -1062,6 +1094,13 @@ cmd_off() {
   fi
   rm -f "$DEFAULT_FILE"
 
+  local leftovers; leftovers="$(list_conflict_leftovers)"
+  if [ -n "$leftovers" ]; then
+    warn "these copies were kept aside by an earlier merge and were not restored:"
+    printf '%s\n' "$leftovers" | sed 's|^|  |' >&2
+    warn "review them, then delete them by hand once you are satisfied"
+  fi
+
   if [ -n "$restored" ]; then
     printf "Restored your original configs (%s) and stopped managing them.\n" "${restored# }"
   else
@@ -1265,14 +1304,28 @@ cmd_doctor() {
     printf 'credentials:   no shared file (normal on macOS, where Claude Code uses the Keychain)\n'
   fi
   printf 'json merge:    %s\n' "$(json_tool)"
-  if ! share_state_enabled; then
-    printf 'session state: per-profile (AGMAN_SHARE_STATE=0)\n'
-  elif [ -d "$SHARED_STATE" ]; then
-    printf 'session state: shared at %s\n' "$SHARED_STATE"
-    printf '               (%s project dirs — claude --resume works across profiles)\n' \
-      "$(ls "$SHARED_STATE/projects" 2>/dev/null | wc -l | tr -d ' ')"
+  local linked_profiles leftovers
+  linked_profiles="$(count_shared_linked_profiles)"
+  if share_state_enabled; then
+    if [ -d "$SHARED_STATE" ]; then
+      printf 'session state: shared at %s\n' "$SHARED_STATE"
+      printf '               %s project dirs, %s profile(s) linked — claude --resume\n' \
+        "$(ls "$SHARED_STATE/projects" 2>/dev/null | wc -l | tr -d ' ')" "$linked_profiles"
+      printf '               works across profiles\n'
+    else
+      printf 'session state: shared on next switch\n'
+    fi
+  elif [ "$linked_profiles" != "0" ]; then
+    printf 'session state: AGMAN_SHARE_STATE=0, but %s profile(s) still point at\n' "$linked_profiles"
+    printf '               %s. Existing links are left alone; run\n' "$SHARED_STATE"
+    printf "               'agman off' to hand the history back before unsharing.\n"
   else
-    printf 'session state: shared on next switch\n'
+    printf 'session state: per-profile (AGMAN_SHARE_STATE=0)\n'
+  fi
+  leftovers="$(list_conflict_leftovers)"
+  if [ -n "$leftovers" ]; then
+    printf 'kept aside:    copies a merge could not place (nothing was deleted):\n'
+    printf '%s\n' "$leftovers" | sed 's|^|               |'
   fi
 
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then

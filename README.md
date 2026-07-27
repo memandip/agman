@@ -69,7 +69,8 @@ servers.
 Upgrading from an earlier agman recovers history automatically: the next `agman use` merges
 whatever each profile is holding into shared state, file by file, and never overwrites. Since
 transcripts are UUID-named, collisions effectively don't happen; if one does, your copy is
-kept aside as `projects.agman-conflict` rather than being lost.
+kept aside as `projects.agman-conflict` rather than being lost, and both `agman doctor` and
+`agman off` list anything kept aside so it doesn't sit unnoticed.
 
 `agman off` turns the shared links back into real directories under `~/.claude`, so a restored
 config works without agman. Set `AGMAN_SHARE_STATE=0` if you would rather each profile keep
