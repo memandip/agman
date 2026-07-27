@@ -550,6 +550,63 @@ assert_lacks "no tool parses an encoded project dir as an option" "$out" "invali
 assert_exists "history intact after switching to a new profile" "$MG/.claude/projects/-root-work/deep.jsonl"
 mgrun off >/dev/null 2>&1
 
+# --- diagnostics must describe the filesystem, not the flag -------------------------------
+#
+# Disabling sharing after the fact leaves existing links in place, so reporting
+# the env var instead of the actual link state points people at the wrong thing.
+
+DG="$TMP/diag"
+mkdir -p "$DG/.claude/projects/-root-work"
+cp "$HOME/.claude.json" "$DG/.claude.json"
+printf '{"id":"d"}\n' > "$DG/.claude/projects/-root-work/d.jsonl"
+dgrun() { env HOME="$DG" AGMAN_HOME="$DG/.agman" AGMAN_TOOLS="claude" "$AGM" "$@"; }
+dgoff() { env HOME="$DG" AGMAN_HOME="$DG/.agman" AGMAN_TOOLS="claude" AGMAN_SHARE_STATE=0 "$AGM" "$@"; }
+
+dgrun create d1 >/dev/null 2>&1
+dgrun use d1 >/dev/null 2>&1
+out="$(dgrun doctor)"
+assert_contains "doctor counts profiles linked to shared state" "$out" "profile(s) linked"
+
+# Same tree, sharing now disabled: the links still exist, so saying
+# "per-profile" would be false.
+out="$(dgoff doctor)"
+assert_contains "doctor reports links that outlive the opt-out" "$out" "still point at"
+assert_lacks "doctor does not claim per-profile while links exist" "$out" "session state: per-profile"
+dgrun off >/dev/null 2>&1
+
+# --- preserved conflict copies must be discoverable ----------------------------------------
+#
+# A merge never deletes: files it cannot place are kept aside. Silently is not
+# good enough — doctor and off both have to mention them.
+
+CF="$TMP/conflict"
+mkdir -p "$CF/.agman/global/claude/projects/-root-work" \
+         "$CF/.agman/one/claude/projects/-root-work"
+printf '2\n' > "$CF/.agman/global/.agman-layout"
+printf '2\n' > "$CF/.agman/one/.agman-layout"
+cp "$HOME/.claude.json" "$CF/.agman/global/claude.json"
+cp "$HOME/.claude.json" "$CF/.agman/one/claude.json"
+# Identical relative path on both sides: a genuine conflict.
+printf '{"side":"global"}\n' > "$CF/.agman/global/claude/projects/-root-work/same.jsonl"
+printf '{"side":"one"}\n'    > "$CF/.agman/one/claude/projects/-root-work/same.jsonl"
+ln -s "$CF/.agman/one/claude" "$CF/.claude"
+ln -s "$CF/.agman/one/claude.json" "$CF/.claude.json"
+cfrun() { env HOME="$CF" AGMAN_HOME="$CF/.agman" AGMAN_TOOLS="claude" "$AGM" "$@"; }
+
+out="$(cfrun use one 2>&1)"
+assert_contains "merge warns when it keeps a copy aside" "$out" "agman-conflict"
+assert_exists "the conflicting copy is preserved, not deleted" "$CF/.agman/one/claude/projects.agman-conflict/-root-work/same.jsonl"
+assert_eq "shared state kept the other side" '{"side":"global"}' "$(cat "$CF/.agman/.state/projects/-root-work/same.jsonl")"
+assert_eq "the preserved copy is the profile's own" '{"side":"one"}' "$(cat "$CF/.agman/one/claude/projects.agman-conflict/-root-work/same.jsonl")"
+if [ -L "$CF/.agman/one/claude/projects" ]; then
+  ok "a conflict still leaves a link, never a shadowing real directory"
+else
+  bad "a conflict still leaves a link, never a shadowing real directory"
+fi
+assert_contains "doctor surfaces preserved copies" "$(cfrun doctor)" "kept aside:"
+out="$(cfrun off 2>&1)"
+assert_contains "off reports copies it did not restore" "$out" "kept aside by an earlier merge"
+
 # --- opt-out: AGMAN_SHARE_STATE=0 keeps history per-profile -------------------------------
 
 PP="$TMP/perprofile"
