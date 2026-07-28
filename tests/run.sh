@@ -550,6 +550,134 @@ assert_lacks "no tool parses an encoded project dir as an option" "$out" "invali
 assert_exists "history intact after switching to a new profile" "$MG/.claude/projects/-root-work/deep.jsonl"
 mgrun off >/dev/null 2>&1
 
+# --- identity is reachable both ways ------------------------------------------------------
+#
+# Claude Code resolves .claude.json relative to the config dir when
+# CLAUDE_CONFIG_DIR is set, and relative to $HOME otherwise. agman keeps one real
+# identity file and makes it reachable from both, so `agman run` sees the
+# profile's account and user-scope MCP servers rather than a blank config that
+# Claude Code would create itself.
+
+ID2="$TMP/ident"
+mkdir -p "$ID2/.claude"
+cp "$HOME/.claude.json" "$ID2/.claude.json"
+printf 'IDENT RULES\n' > "$ID2/.claude/CLAUDE.md"
+irun() { env HOME="$ID2" AGMAN_HOME="$ID2/.agman" AGMAN_TOOLS="claude" "$AGM" "$@"; }
+IA="$ID2/.agman"
+
+irun create p1 >/dev/null 2>&1
+assert_symlink_to "create links identity into the config dir" \
+  "$IA/p1/claude/.claude.json" "$IA/p1/claude.json"
+assert_contains "the link resolves to the profile's real identity" \
+  "$(cat "$IA/p1/claude/.claude.json")" '"oauthAccount"'
+
+# The path `agman run` exports must contain a readable identity file.
+rundir="$(irun dir p1)"
+assert_eq "run/exec point at the profile's claude tree" "$IA/p1/claude" "$rundir"
+assert_exists "identity is present where CLAUDE_CONFIG_DIR points" "$rundir/.claude.json"
+
+# Writes through the link must land in the single real file, not shadow it.
+printf '{"hasCompletedOnboarding":true,"mcpServers":{"viaLink":{}}}\n' > "$IA/p1/claude/.claude.json"
+assert_contains "a write through the link updates the real file" "$(cat "$IA/p1/claude.json")" 'viaLink'
+if [ -L "$IA/p1/claude/.claude.json" ]; then ok "the link survives a write"; else bad "the link survives a write"; fi
+
+# Drift: a real file inside the config dir, as an older `agman run` produced.
+rm -f "$IA/p1/claude/.claude.json"
+printf '{"machineID":"stray"}\n' > "$IA/p1/claude/.claude.json"
+out="$(irun doctor)"
+assert_contains "doctor reports identity drift" "$out" "IDENTITY DRIFT"
+out="$(irun use p1 2>&1)"
+assert_contains "use rescues a stray identity file" "$out" "agman-orphaned"
+assert_exists "the stray file is kept, not deleted" "$IA/p1/claude/.claude.json.agman-orphaned"
+assert_symlink_to "identity is linked again after the rescue" \
+  "$IA/p1/claude/.claude.json" "$IA/p1/claude.json"
+assert_contains "doctor reports a healthy link" "$(irun doctor)" "identity linked"
+
+# off must not leave the in-config-dir link dangling in a restored config.
+irun off >/dev/null 2>&1
+if [ -L "$ID2/.claude/.claude.json" ]; then
+  bad "off removes the in-config-dir identity link"
+else
+  ok "off removes the in-config-dir identity link"
+fi
+assert_exists "off restores the real identity file" "$ID2/.claude.json"
+
+# --- project-local .agman file ------------------------------------------------------------
+
+PJ="$TMP/project"
+mkdir -p "$PJ/.claude" "$PJ/repo/nested/deep"
+cp "$HOME/.claude.json" "$PJ/.claude.json"
+prun() { env HOME="$PJ" AGMAN_HOME="$PJ/.agman" AGMAN_TOOLS="claude" "$AGM" "$@"; }
+PA="$PJ/.agman"
+prun create acme >/dev/null 2>&1
+printf '# what this repo wants\nprofile: acme\n' > "$PJ/repo/.agman"
+# agman records canonical paths, so trust entries must use the same form.
+PJC="$(cd "$PJ" && pwd -P)"
+
+# Untrusted and non-interactive: must refuse rather than switch silently.
+out="$(cd "$PJ/repo" && env HOME="$PJ" AGMAN_HOME="$PA" AGMAN_TOOLS="claude" "$AGM" use </dev/null 2>&1 || true)"
+assert_contains "an untrusted .agman file is refused non-interactively" "$out" "not trusted yet"
+assert_missing "refusing to trust changes nothing" "$PJ/.agman/.default"
+
+# Trust it the way an interactive confirmation would, then it resolves.
+printf '%s\n' "$PJC/repo/.agman" > "$PA/.trusted"
+out="$(cd "$PJ/repo" && env HOME="$PJ" AGMAN_HOME="$PA" AGMAN_TOOLS="claude" "$AGM" use 2>&1)"
+assert_contains "a trusted .agman file selects its profile" "$out" "Using profile 'acme'"
+assert_contains "and the switch actually happens" "$out" "Switched to profile 'acme'"
+
+# Found from a subdirectory, like .nvmrc.
+got="$(cd "$PJ/repo/nested/deep" && env HOME="$PJ" AGMAN_HOME="$PA" AGMAN_TOOLS="claude" "$AGM" dir --for-cwd 2>/dev/null)"
+assert_eq "the file is found from a subdirectory" "$PA/acme/claude" "$got"
+
+# Outside the project there is nothing to resolve, and --for-cwd stays silent.
+got="$(cd "$PJ" && env HOME="$PJ" AGMAN_HOME="$PA" AGMAN_TOOLS="claude" "$AGM" dir --for-cwd 2>/dev/null || true)"
+assert_eq "outside the project it resolves to nothing" "" "$got"
+
+# A bare profile name on its own line is accepted too.
+printf 'acme\n' > "$PJ/repo/.agman"
+got="$(cd "$PJ/repo" && env HOME="$PJ" AGMAN_HOME="$PA" AGMAN_TOOLS="claude" "$AGM" dir --for-cwd 2>/dev/null)"
+assert_eq "a bare profile name is accepted" "$PA/acme/claude" "$got"
+
+# A file naming something that does not exist must say so, not fail obscurely.
+printf 'profile: nosuchprofile\n' > "$PJ/repo/.agman"
+printf '%s\n' "$PJC/repo/.agman" > "$PA/.trusted"
+out="$(cd "$PJ/repo" && env HOME="$PJ" AGMAN_HOME="$PA" AGMAN_TOOLS="claude" "$AGM" use 2>&1 || true)"
+assert_contains "an unknown profile name is reported clearly" "$out" "does not exist"
+
+# An invalid name must be rejected rather than reaching the filesystem.
+printf 'profile: ../escape\n' > "$PJ/repo/.agman"
+out="$(cd "$PJ/repo" && env HOME="$PJ" AGMAN_HOME="$PA" AGMAN_TOOLS="claude" "$AGM" use 2>&1 || true)"
+assert_lacks "a path-traversal name never resolves" "$out" "Switched to profile"
+
+printf 'profile: acme\n' > "$PJ/repo/.agman"
+assert_contains "doctor reports the project file" "$(cd "$PJ/repo" && env HOME="$PJ" AGMAN_HOME="$PA" AGMAN_TOOLS="claude" "$AGM" doctor)" "project file:"
+env HOME="$PJ" AGMAN_HOME="$PA" AGMAN_TOOLS="claude" "$AGM" off >/dev/null 2>&1
+
+# --- the shell hook switches per directory ------------------------------------------------
+
+HK="$TMP/hook"
+mkdir -p "$HK/.claude" "$HK/repo" "$HK/other"
+cp "$HOME/.claude.json" "$HK/.claude.json"
+env HOME="$HK" AGMAN_HOME="$HK/.agman" AGMAN_TOOLS="claude" "$AGM" create hooked >/dev/null 2>&1
+printf 'profile: hooked\n' > "$HK/repo/.agman"
+HKC="$(cd "$HK" && pwd -P)"
+mkdir -p "$HK/.agman" && printf '%s\n' "$HKC/repo/.agman" > "$HK/.agman/.trusted"
+
+out="$(env HOME="$HK" AGMAN_HOME="$HK/.agman" AGMAN_TOOLS="claude" bash -c '
+eval "$(agman init bash)"
+cd '"$HK"'/repo && _agman_autoswitch && printf "in-repo=%s\n" "${CLAUDE_CONFIG_DIR:-unset}"
+cd '"$HK"'/other && _agman_autoswitch && printf "outside=%s\n" "${CLAUDE_CONFIG_DIR:-unset}"
+')"
+assert_contains "the hook exports the project profile on entry" "$out" "in-repo=$HK/.agman/hooked/claude"
+assert_contains "and unsets it again on leaving" "$out" "outside=unset"
+
+# A manual export must always win over the hook.
+out="$(env HOME="$HK" AGMAN_HOME="$HK/.agman" AGMAN_TOOLS="claude" CLAUDE_CONFIG_DIR=/manual bash -c '
+eval "$(agman init bash)"
+cd '"$HK"'/repo && _agman_autoswitch && printf "manual=%s\n" "$CLAUDE_CONFIG_DIR"
+')"
+assert_contains "a manual CLAUDE_CONFIG_DIR is never overridden" "$out" "manual=/manual"
+
 # --- diagnostics must describe the filesystem, not the flag -------------------------------
 #
 # Disabling sharing after the fact leaves existing links in place, so reporting

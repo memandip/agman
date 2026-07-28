@@ -474,3 +474,53 @@ The sweep did turn up two real defects, fixed separately:
 Test matrix: 238 assertions on macOS (bash 3.2.57) and Debian stable (bash 5.2.37), plus three
 Docker scripts driving the real Claude CLI. shellcheck clean over `bin/agman`, `install.sh` and
 every script in `tests/`.
+
+
+### v0.7.0 — `agman run` uses the profile, and per-project selection
+
+**`run`/`exec`/`env` only half-worked, and the missing half was silently destructive.**
+
+Measured against Claude Code 2.1.220: with `CLAUDE_CONFIG_DIR` set, everything *inside* the
+config dir is honoured — `settings.json` (proved by planting invalid JSON and seeing
+`Invalid settings — …/settings.json: Invalid or malformed JSON`), `CLAUDE.md`, `skills/`,
+`agents/`, `plugins/`. But `.claude.json` is resolved **relative to the config dir**, whereas
+agman keeps identity as a *sibling* (`<profile>/claude.json`) so symlink mode can point
+`~/.claude.json` at it. So `agman run` lost the account, onboarding state, user-scope MCP
+servers and per-project state: `claude mcp list` reported "No MCP servers configured", seeing
+neither the global file nor the profile's.
+
+Worse, Claude Code does not merely fail to read it — **it creates one**. A single pre-fix
+`agman run` wrote a fresh `<profile>/claude/.claude.json` with a new `machineID` and no
+`oauthAccount`, leaving two identity files that disagree and drift.
+
+**Fix (option A from the plan).** `<profile>/claude/.claude.json` is maintained as a symlink to
+the profile's real identity file. One file, reachable both ways: symlink mode through
+`~/.claude.json`, env mode through the config dir. `off` removes the inner link before it can
+dangle; `create` adds it so `run` works before any `use`; `doctor` reports `identity linked`,
+`identity not linked`, or `IDENTITY DRIFT`, and a stray real file is preserved as
+`.claude.json.agman-orphaned` rather than deleted.
+
+Verified against the real CLI in `tests/docker-run-identity.sh`: plain `claude` sees the global
+server, `agman run work` sees the profile's, `claude mcp add --scope user` under `run` writes into
+the profile's single identity file, and the global config stays untouched.
+
+**Per-project selection.** A `.agman` file naming a profile is read by `use` and `run` with no
+argument, searched upward from the working directory. It is untrusted input because it arrives
+with a clone, so agman confirms once and records the decision in `$AGMAN_HOME/.trusted`;
+non-interactive shells refuse rather than switch. `agman dir --for-cwd` resolves it for scripts,
+and the shell integration adds a `chpwd`/`PROMPT_COMMAND` hook that switches per directory —
+terminal-only by nature, since IDE extensions do not inherit shell environment, and it never
+overrides a `CLAUDE_CONFIG_DIR` set by hand.
+
+Deliberately **not** built: the project-local `.agman/` *directory* (a per-repo config tree). Its
+four open questions — committed or ignored, seeded from what, where its history lives, cleanup —
+are unresolved, and much of what it would provide already exists natively as `./.claude/`. See
+`docs/plan-sessions-run-project.md`.
+
+**Path normalisation caught by a test.** Trust entries are compared as canonical paths
+(`find_project_file` resolves with `pwd -P`), which matters on macOS where `/var` is a symlink to
+`/private/var` and for any repository reached through a symlinked path. agman writes and compares
+the same form, so trust survives either route.
+
+Test matrix: 264 assertions on macOS (bash 3.2.57) and Debian stable (bash 5.2.37), plus four
+Docker scripts driving the real Claude CLI. shellcheck clean.

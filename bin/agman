@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.6.0"
+AGMAN_VERSION="0.7.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -51,6 +51,17 @@ HELPER_BASENAME="agman-apikey.sh"
 SHARED_STATE="$AGMAN_HOME/.state"
 SHARED_STATE_ENTRIES=("projects:d" "history.jsonl:f" "todos:d" "shell-snapshots:d"
   "file-history:d" "session-env:d" "sessions:d")
+# Claude Code resolves ~/.claude.json relative to the config dir when
+# CLAUDE_CONFIG_DIR is set, but relative to $HOME otherwise. agman stores
+# identity as a sibling of the claude tree so symlink mode can point
+# ~/.claude.json at it; this link makes the same file reachable the other way,
+# so `agman run/exec/env` sees the profile's account and user-scope MCP servers
+# instead of a blank config Claude Code would otherwise create itself.
+IDENTITY_LINK=".claude.json"
+# Project-local profile selection. A repository can name the profile it wants;
+# since the file arrives with a clone it is untrusted until confirmed once.
+PROJECT_FILE=".agman"
+TRUST_FILE="$AGMAN_HOME/.trusted"
 AGMAN_RAW_URL="${AGMAN_RAW_URL:-https://raw.githubusercontent.com/memandip/agman/main}"
 
 # --- adapter registry -------------------------------------------------------
@@ -626,6 +637,44 @@ refresh_api_key_helper() {
   return 0
 }
 
+# --- identity reachable from both access paths ------------------------------
+
+# Path Claude Code reads identity from when CLAUDE_CONFIG_DIR points at a
+# profile.
+profile_identity_link() { printf '%s/%s' "$(profile_claude_dir "$1")" "$IDENTITY_LINK"; }
+
+# True when a profile carries a real identity file inside its config dir. That
+# is drift: Claude Code creates one there on any run that predates this link,
+# leaving two files that disagree about the account.
+profile_has_identity_drift() {
+  local l; l="$(profile_identity_link "$1")"
+  [ -e "$l" ] && [ ! -L "$l" ]
+}
+
+# Point the in-config-dir identity path at the profile's real identity file.
+link_profile_identity() {
+  local dir="$1" link real
+  link="$(profile_identity_link "$dir")"
+  real="$(profile_identity_file "$dir")"
+  mkdir -p "$(profile_claude_dir "$dir")"
+  [ -e "$real" ] || printf '{}\n' > "$real"
+
+  if [ -L "$link" ]; then
+    case "$(readlink_once "$link")" in
+      "$real") return 0 ;;
+      *) rm -f "$link" ;;
+    esac
+  elif [ -e "$link" ]; then
+    # A real file Claude Code created before this link existed. Keep it rather
+    # than deleting someone's state, but get it out of the way.
+    rm -f "$link.agman-orphaned"
+    mv "$link" "$link.agman-orphaned" 2>/dev/null || true
+    warn "$(basename "$dir"): found an identity file Claude Code created inside the profile; kept it as $IDENTITY_LINK.agman-orphaned"
+  fi
+  ln -s "$real" "$link" 2>/dev/null || warn "could not link $IDENTITY_LINK into $(profile_claude_dir "$dir")"
+  return 0
+}
+
 # --- shared session state --------------------------------------------------
 
 share_state_enabled() { [ "${AGMAN_SHARE_STATE:-1}" != "0" ]; }
@@ -793,6 +842,95 @@ profile_auth_state() {
   printf '%s, %s' "$ident" "$creds"
 }
 
+# --- project-local profile selection ----------------------------------------
+
+# Nearest .agman file at or above a directory, so it works from subdirectories
+# the way .nvmrc and .tool-versions do.
+find_project_file() {
+  local dir="${1:-$PWD}"
+  dir="$(cd "$dir" 2>/dev/null && pwd -P)" || return 1
+  while :; do
+    [ -f "$dir/$PROJECT_FILE" ] && { printf '%s/%s' "$dir" "$PROJECT_FILE"; return 0; }
+    [ "$dir" = "/" ] && return 1
+    dir="${dir%/*}"
+    [ -n "$dir" ] || dir="/"
+  done
+}
+
+# Read the profile name from a .agman file. Unknown keys are ignored so the
+# format can grow without breaking older agman versions.
+read_project_profile() {
+  local file="$1" line key value
+  [ -f "$file" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      \#*|"") continue ;;
+    esac
+    case "$line" in
+      *:*)
+        key="${line%%:*}"; value="${line#*:}" ;;
+      *)
+        # A bare profile name on its own line is accepted too.
+        key="profile"; value="$line" ;;
+    esac
+    # Trim surrounding whitespace without invoking anything.
+    key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"; value="${value%"${value##*[![:space:]]}"}"
+    if [ "$key" = "profile" ] && [ -n "$value" ]; then
+      printf '%s' "$value"; return 0
+    fi
+  done < "$file"
+  return 1
+}
+
+project_is_trusted() {
+  local file="$1"
+  [ -f "$TRUST_FILE" ] || return 1
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ "$line" = "$file" ] && return 0
+  done < "$TRUST_FILE"
+  return 1
+}
+
+trust_project() {
+  local file="$1"
+  mkdir -p "$AGMAN_HOME"
+  project_is_trusted "$file" && return 0
+  printf '%s\n' "$file" >> "$TRUST_FILE"
+}
+
+# Resolve the profile a .agman file asks for, prompting once per file. A file
+# that arrived with a clone is untrusted input, so it must never switch anything
+# silently — the same reasoning behind Claude Code's approval dialog for
+# external imports.
+resolve_project_profile() {
+  local quiet="${1:-}" file name reply
+  file="$(find_project_file "$PWD")" || return 1
+  name="$(read_project_profile "$file")" || {
+    [ "$quiet" = "quiet" ] || warn "$file has no 'profile:' entry"
+    return 1
+  }
+  validate_name "$name" 2>/dev/null || {
+    [ "$quiet" = "quiet" ] || warn "$file names an invalid profile"
+    return 1
+  }
+  if ! project_is_trusted "$file"; then
+    if [ "$quiet" = "quiet" ]; then return 1; fi
+    if [ ! -t 0 ]; then
+      die "$file asks for profile '$name' but is not trusted yet. Run 'agman use' in an interactive terminal once to confirm."
+    fi
+    printf "%s asks agman to use profile '%s'.\n" "$file" "$name"
+    printf "This file came from the project, not from you. Trust it? [y/N] "
+    IFS= read -r reply || true
+    case "$reply" in y|Y|yes|YES) trust_project "$file" ;; *) die "not trusted; nothing changed" ;; esac
+  fi
+  [ -d "$(profile_dir "$name")" ] || {
+    [ "$quiet" = "quiet" ] && return 1
+    die "$file asks for profile '$name', which does not exist. Create it with: agman create $name"
+  }
+  printf '%s' "$name"
+}
+
 # --- link engine ------------------------------------------------------------
 
 # Make sure a profile-side path exists so the symlink never dangles.
@@ -909,6 +1047,7 @@ cmd_create() {
         fi
         i=$((i + 1))
       done
+      link_profile_identity "$dir"
       printf "Created profile '%s' at %s (empty, with a starter CLAUDE.md).\n" "$name" "$dir"
       if [ -n "$tools" ]; then
         printf "It %s, so no re-login is needed.\n" "$tools"
@@ -942,6 +1081,7 @@ cmd_create() {
         seed_identity "$src_json" "$dir/claude.json" || true
       fi
       [ -f "$dir/claude/CLAUDE.md" ] || write_starter_claude_md "$dir/claude" "$name"
+      link_profile_identity "$dir"
       printf "Created profile '%s' at %s (copied from current configs:%s).\n" "$name" "$dir" "${tools:- none}"
       ;;
     clone)
@@ -989,6 +1129,11 @@ cmd_list() {
 
 cmd_use() {
   local name="${1:-}"
+  if [ -z "$name" ]; then
+    name="$(resolve_project_profile)" || \
+      usage_die "no profile given and no usable $PROJECT_FILE found here"
+    printf "Using profile '%s' from %s.\n" "$name" "$(find_project_file "$PWD")"
+  fi
   require_profile "$name"
 
   # One-time migration of every profile to the multi-tool layout.
@@ -1031,6 +1176,7 @@ cmd_use() {
   fi
   link_shared_credentials "$dir"
   link_shared_state "$dir"
+  link_profile_identity "$dir"
   refresh_api_key_helper "$dir"
 
   mkdir -p "$AGMAN_HOME"
@@ -1066,6 +1212,9 @@ cmd_off() {
       if [ -e "$GLOBAL_BACKUP/$prof_rel" ] && [ ! -e "$tgt" ]; then
         mv "$GLOBAL_BACKUP/$prof_rel" "$tgt" || warn "could not restore $tgt"
         restored="$restored ${ADAPTER_NAMES[$i]}"
+        # The in-config-dir identity link points into the profile tree being
+        # dismantled; ~/.claude.json is restored separately.
+        if [ -L "$tgt/$IDENTITY_LINK" ]; then rm -f "$tgt/$IDENTITY_LINK"; fi
         # Leave the restored config self-contained: turn the shared credential
         # link back into a real file so it works without agman.
         if [ "$type" = "d" ] && [ -L "$tgt/$CREDS_BASENAME" ]; then
@@ -1128,6 +1277,14 @@ cmd_current() {
 
 cmd_dir() {
   local arg="${1:-}" name dir
+  if [ "$arg" = "--for-cwd" ]; then
+    name="$(resolve_project_profile quiet)" || exit 1
+    dir="$(profile_dir "$name")"
+    [ -d "$dir" ] || exit 1
+    link_profile_identity "$dir" >/dev/null 2>&1 || true
+    printf '%s\n' "$(profile_claude_dir "$dir")"
+    return 0
+  fi
   if [ "$arg" = "--active" ]; then
     name="$(default_profile)" || exit 1
     dir="$(profile_dir "$name")"
@@ -1143,6 +1300,7 @@ cmd_env() {
   local name="${1:-}"
   require_profile "$name"
   local dir; dir="$(profile_dir "$name")"
+  link_profile_identity "$dir"
   local i=0 pair prof_rel envvar emitted=0
   while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
     envvar="${ADAPTER_ENVVARS[$i]}"
@@ -1165,7 +1323,13 @@ cmd_env() {
 
 cmd_run() {
   local name="${1:-}"
+  if [ -z "$name" ] || [ "$name" = "--" ]; then
+    name="$(resolve_project_profile)" || \
+      usage_die "no profile given and no usable $PROJECT_FILE found here"
+    [ "${1:-}" = "--" ] || set -- "$name" ${1+"$@"}
+  fi
   require_profile "$name"
+  link_profile_identity "$(profile_dir "$name")"
   shift
   [ "${1:-}" = "--" ] && shift
   command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
@@ -1176,6 +1340,7 @@ cmd_run() {
 cmd_exec() {
   local name="${1:-}"
   require_profile "$name"
+  link_profile_identity "$(profile_dir "$name")"
   shift
   [ "${1:-}" = "--" ] && shift
   [ $# -gt 0 ] || usage_die "exec requires a command: agman exec <name> -- <command...>"
@@ -1341,6 +1506,13 @@ cmd_doctor() {
       [ "$any" = "0" ] && printf '\nper-profile auth:\n' && any=1
       entry="${entry%/}"
       printf '  %-20s %s' "${entry##*/}" "$(profile_auth_state "$entry")"
+      if profile_has_identity_drift "$entry"; then
+        printf ', IDENTITY DRIFT'
+      elif [ -L "$(profile_identity_link "$entry")" ]; then
+        printf ', identity linked'
+      else
+        printf ', identity not linked (run: agman use %s)' "${entry##*/}"
+      fi
       [ "$(profile_layout "$entry")" = "1" ] && printf ' [legacy layout]'
       printf '\n'
     done
@@ -1354,6 +1526,14 @@ cmd_doctor() {
     printf '\nsymlinks:      NOT supported (agman use cannot work on this filesystem)\n'
   fi
   rm -rf "$tmp"
+
+  local pf
+  if pf="$(find_project_file "$PWD" 2>/dev/null)"; then
+    printf '\nproject file:  %s\n' "$pf"
+    printf '               profile: %s, trusted: %s\n' \
+      "$(read_project_profile "$pf" 2>/dev/null || printf '(none)')" \
+      "$(project_is_trusted "$pf" && printf yes || printf 'no — agman use will ask')"
+  fi
 
   printf '\nnotes:\n'
   printf '  - Switching is symlink-based, so it applies to every new session on\n'
@@ -1553,6 +1733,33 @@ agman() {
   esac
 }
 
+# Per-directory profiles: when a trusted .agman file applies to the current
+# directory, point this shell at the profile it names. Only ever touches
+# CLAUDE_CONFIG_DIR that this hook set itself, so a manual export always wins.
+# Terminal only — IDE extensions do not inherit a shell's environment.
+_agman_autoswitch() {
+  local _agman_dir
+  _agman_dir="$(command agman dir --for-cwd 2>/dev/null || true)"
+  if [ -n "$_agman_dir" ]; then
+    if [ "${CLAUDE_CONFIG_DIR:-}" != "$_agman_dir" ] &&
+       { [ -z "${CLAUDE_CONFIG_DIR:-}" ] || [ -n "${AGMAN_AUTO_DIR:-}" ]; }; then
+      export CLAUDE_CONFIG_DIR="$_agman_dir" AGMAN_AUTO_DIR="$_agman_dir"
+    fi
+  elif [ -n "${AGMAN_AUTO_DIR:-}" ]; then
+    unset CLAUDE_CONFIG_DIR AGMAN_AUTO_DIR
+  fi
+}
+
+if [ -n "${ZSH_VERSION:-}" ]; then
+  autoload -Uz add-zsh-hook 2>/dev/null && add-zsh-hook chpwd _agman_autoswitch
+else
+  case "${PROMPT_COMMAND:-}" in
+    *_agman_autoswitch*) ;;
+    *) PROMPT_COMMAND="_agman_autoswitch${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
+  esac
+fi
+_agman_autoswitch
+
 claude() {
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     command claude "$@"
@@ -1581,13 +1788,17 @@ Commands:
                            --from <name>    clone another profile
                            --link-plugins   symlink plugins/ instead of copying
   list                   List profiles (* = default, (active: …) = live tools)
-  use <name>             Activate a profile: symlinks each tool's config at it.
-                         First use backs up your originals as 'global'.
+  use [name]             Activate a profile: symlinks each tool's config at it.
+                         First use backs up your originals as 'global'. With no
+                         name, reads the profile from the nearest .agman file.
   off                    Deactivate and restore your original configs
   current                Show the active profile and which tools it covers
-  dir <name>|--active    Print a profile's Claude config directory
+  dir <name>|--active|--for-cwd
+                         Print a profile's Claude config directory (--for-cwd
+                         resolves the nearest trusted .agman file)
   env <name>             Print export lines: eval "\$(agman env work)"
-  run <name> [-- args]   Launch claude once under a profile (per-process)
+  run [name] [-- args]   Launch claude once under a profile (per-process).
+                         With no name, uses the nearest .agman file.
   exec <name> -- <cmd>   Run a command with per-tool env vars set
   login <name>           Give a profile its own Claude account (own token)
                            --token-stdin    read the token from stdin
@@ -1600,6 +1811,16 @@ Commands:
   doctor                 Diagnose setup, tools, and per-profile auth
   init [zsh|bash]        Print optional per-shell integration snippet
   help, version
+
+Per-project profiles:
+  Put a .agman file in a repository root naming the profile it wants:
+
+      profile: acme-work
+
+  'agman use' and 'agman run' with no argument read it. Because the file arrives
+  with a clone, agman asks once before trusting it. Add the shell integration
+  and each directory switches automatically in that terminal; IDE extensions do
+  not inherit shell environment, so they follow 'agman use' instead.
 
 Supported tools:
   claude   Claude Code   ~/.claude + ~/.claude.json   (env: CLAUDE_CONFIG_DIR)
