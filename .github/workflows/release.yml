@@ -25,7 +25,7 @@ jobs:
     # Only a green CI run on a push to main. workflow_dispatch has no
     # workflow_run payload, so it passes this guard on the first clause.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
       (github.event.workflow_run.conclusion == 'success' &&
        github.event.workflow_run.head_branch == 'main' &&
        github.event.workflow_run.event == 'push')
