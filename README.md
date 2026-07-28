@@ -133,6 +133,41 @@ Limits of `setup-token` credentials, worth knowing before you rely on them:
 Cloning a profile never copies its account: the token, helper, and `apiKeyHelper` setting are
 stripped, so the clone starts on your shared login.
 
+## Per-project profiles
+
+A repository can name the profile it wants in a `.agman` file at its root:
+
+```
+profile: acme-work
+```
+
+Then `agman use` and `agman run` with no argument read it, from that directory or any
+subdirectory:
+
+```bash
+cd ~/work/acme && agman use      # activates acme-work
+```
+
+Because the file arrives with a clone, it is untrusted input: agman asks once before
+honouring it and records the decision. In a non-interactive shell it refuses rather than
+switching silently.
+
+With the shell integration installed, entering the directory switches that terminal
+automatically and leaving it switches back:
+
+```bash
+eval "$(agman init zsh)"   # or: init bash
+```
+
+That auto-switch works by exporting `CLAUDE_CONFIG_DIR`, so it is **terminal-only** — IDE
+extensions don't inherit a shell's environment and keep following `agman use`. A
+`CLAUDE_CONFIG_DIR` you set by hand always wins; the hook only manages the value it set.
+
+Note that Claude Code already scopes plenty of things per project natively — `./CLAUDE.md`,
+`./.claude/settings.json`, `./.claude/rules/`, `./.claude/skills/`, `./.claude/agents/`, and
+`./.mcp.json`. Reach for a `.agman` file when you need to change something with no project
+scope at all: the account, user-scope MCP servers, installed plugins, or the whole persona.
+
 ## Install
 
 Homebrew (macOS and Linux):
@@ -182,12 +217,12 @@ agman update
 | Command | What it does |
 |---|---|
 | `create <name>` | New **empty** profile with a starter `CLAUDE.md`, inheriting your current account. Flags: `--copy-current` (seed from current config; skips sessions/cache/history), `--from <profile>`, `--link-plugins` |
-| `use <name>` | Activate: symlink each tool's config path → profile. First use backs up your originals as the `global` profile, and migrates older profiles to the current layout |
+| `use [name]` | Activate: symlink each tool's config path → profile. With no name, reads the nearest `.agman` file. First use backs up your originals as the `global` profile, and migrates older profiles to the current layout |
 | `off` | Deactivate and physically restore your original configs |
 | `current` | Show the active profile and which tools it covers |
 | `list` | List profiles; `(active: …)` shows the live tools |
-| `dir <name>` / `env <name>` | Print a profile's Claude config dir / `export` lines for every tool that supports one |
-| `run <name> [-- args]` | Launch `claude` once under a profile without switching globally |
+| `dir <name>` / `env <name>` | Print a profile's Claude config dir / `export` lines for every tool that supports one. `dir --for-cwd` resolves the nearest trusted `.agman` file |
+| `run [name] [-- args]` | Launch `claude` once under a profile without switching globally. With no name, reads the nearest `.agman` file |
 | `exec <name> -- <cmd>` | Run any command with `CLAUDE_CONFIG_DIR` and `CODEX_HOME` set |
 | `rename <old> <new>` / `remove <name>` | Manage profiles (rename repoints active symlinks; remove refuses if active) |
 | `migrate` | Move profiles to the current layout and relink (runs automatically on `use`) |
