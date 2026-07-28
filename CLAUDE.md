@@ -67,11 +67,19 @@ changes bump MINOR, fixes bump PATCH.
 
 ### Cutting a release
 
-1. Update `AGMAN_VERSION` in [bin/agman](bin/agman) to match the new tag (without the `v`).
+1. Update `AGMAN_VERSION` in [bin/agman](bin/agman) to the new version (without the `v`).
 2. Land it via PR.
-3. Tag `vX.Y.Z` and publish a GitHub Release. Publishing triggers `homebrew.yml`, which opens a
-   PR against `memandip/homebrew-agman`; merging that PR publishes the brew formula.
-4. Keep the git tag, `AGMAN_VERSION`, and the release in agreement.
+
+Everything after that is automatic. Once CI passes on `main`,
+[`release.yml`](.github/workflows/release.yml) sees that `AGMAN_VERSION` has no matching tag,
+tags `vX.Y.Z` at the commit CI validated, publishes a release with generated notes, and
+dispatches `homebrew.yml` to open the formula PR against `memandip/homebrew-agman`. Merging
+that PR publishes the brew formula — the only remaining manual step.
+
+So the tag, `AGMAN_VERSION`, and the release stay in agreement by construction; don't tag by
+hand. A version with a pre-release suffix (`0.8.0-rc.1`) is published as a GitHub pre-release.
+Re-running the workflow on an already-tagged version does nothing, so it is safe to trigger
+manually (`gh workflow run release.yml`) if a release needs re-driving.
 
 ## Local checks before opening a PR
 
