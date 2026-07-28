@@ -15,13 +15,7 @@ printf 'GLOBAL RULES\n' > "$HOME/.claude/CLAUDE.md"
 
 "$AGMAN" create work >/dev/null 2>&1
 # Give the profile a distinct user-scope MCP server.
-python3 - <<'PY'
-import json
-p = "/root/.agman/work/claude.json"
-d = json.load(open(p))
-d["mcpServers"] = {"work-profile-server": {"command": "true"}}
-json.dump(d, open(p, "w"), indent=2)
-PY
+printf '{"hasCompletedOnboarding":true,"oauthAccount":{"accountUuid":"w"},"mcpServers":{"work-profile-server":{"command":"true"}}}\n' > /root/.agman/work/claude.json
 printf 'WORK RULES\n' > /root/.agman/work/claude/CLAUDE.md
 cd /root/work || exit 1
 
