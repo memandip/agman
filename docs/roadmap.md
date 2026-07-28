@@ -524,3 +524,33 @@ the same form, so trust survives either route.
 
 Test matrix: 264 assertions on macOS (bash 3.2.57) and Debian stable (bash 5.2.37), plus four
 Docker scripts driving the real Claude CLI. shellcheck clean.
+
+
+### Release automation
+
+`AGMAN_VERSION` landing on `main` at an untagged version is now the release trigger:
+[`release.yml`](../.github/workflows/release.yml) tags it, publishes a release with generated
+notes, and asks `homebrew.yml` to open the formula PR. The tag, `AGMAN_VERSION`, and the release
+can no longer drift apart by omission — which they had, with `main` sitting at 0.7.0 while the
+tap still served 0.6.0.
+
+Two details drove the design, both verified rather than assumed:
+
+1. **A release created with `GITHUB_TOKEN` does not start workflows.** GitHub's documentation is
+   explicit: "events triggered by the `GITHUB_TOKEN` will not create a new workflow run", and the
+   only exceptions are `workflow_dispatch` and `repository_dispatch`. So `homebrew.yml`'s
+   `on: release` would never fire for an automated release. `release.yml` therefore dispatches it
+   explicitly, which is allowed precisely because dispatch is one of those exceptions. Reaching
+   for a personal access token — the other documented workaround — would have added a secret for
+   no benefit.
+2. **Releasing must follow the tests, not the push.** The trigger is `workflow_run` on CI
+   completing successfully, and the job checks out `workflow_run.head_sha` so the release is cut
+   from the commit CI actually validated rather than whatever `main` points at by then.
+
+Idempotent by design: an already-tagged version logs a notice and exits, so re-running is safe.
+Pre-release suffixes (`0.8.0-rc.1`) publish as GitHub pre-releases. The decision logic was
+exercised against the repository's real tags for four cases — untagged version, already-released
+version, pre-release, and a non-semver value, which fails loudly.
+
+The tap bump still needs the `HOMEBREW_TAP_TOKEN` secret; without it `homebrew.yml` is dispatched
+and skips with a notice, so releases succeed and only the formula waits.
