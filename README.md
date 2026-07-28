@@ -263,8 +263,8 @@ CI runs the suite on Ubuntu + macOS and lints with shellcheck on every push.
 
 ## Roadmap
 
+- **Profile sharing over git**: `push`/`pull` to a repository you own, and a `.agman` file that fetches a profile that isn't local yet
 - **More tools**: Qwen Code and Kimi CLI adapters, once their config layouts are verified against the real CLIs
-- `.agman` file for **per-directory auto-switching** (the `.nvmrc`/direnv analog)
 - fish shell support, tab completions
 - `--fresh-auth` seeding (exclude copied credentials)
 - Profile export/import for syncing between machines
