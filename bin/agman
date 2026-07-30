@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.7.0"
+AGMAN_VERSION="0.8.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -63,6 +63,9 @@ IDENTITY_LINK=".claude.json"
 PROJECT_FILE=".agman"
 TRUST_FILE="$AGMAN_HOME/.trusted"
 AGMAN_RAW_URL="${AGMAN_RAW_URL:-https://raw.githubusercontent.com/memandip/agman/main}"
+# Cloud sync credentials (`agman cloud`): url= and key= lines, mode 600.
+# Machine-level, never part of any profile, never printed.
+CLOUD_FILE="$AGMAN_HOME/.cloud"
 
 # --- adapter registry -------------------------------------------------------
 #
@@ -1776,6 +1779,342 @@ claude() {
 AGMAN_SNIPPET
 }
 
+# ---------------------------------------------------------------------------
+# cloud sync
+#
+# `agman cloud` syncs profile config trees with an agman cloud server
+# (github.com/memandip/agman-cloud): versioned push/pull over HTTPS, with
+# content encrypted at rest server-side. Requires curl; nothing else.
+#
+# Two safety rules, both non-negotiable:
+#   - credential-bearing files (.credentials.json, .agman-token, the apiKey
+#     helper, codex auth.json, gemini oauth_creds.json / google_accounts.json)
+#     are withheld from push by default and stripped from every pull, so a
+#     synced profile is a persona, not a wallet;
+#   - pull never replaces the shared-state symlinks a profile relies on, and
+#     refuses to rewrite the active profile without --force.
+
+cloud_require_curl() {
+  command -v curl >/dev/null 2>&1 || die "curl is required for cloud sync"
+}
+
+cloud_url=""
+cloud_key=""
+cloud_load() {
+  [ -f "$CLOUD_FILE" ] || die "not logged in to agman cloud (run 'agman cloud login')"
+  cloud_url=""; cloud_key=""
+  local line
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      url=*) cloud_url="${line#url=}" ;;
+      key=*) cloud_key="${line#key=}" ;;
+    esac
+  done < "$CLOUD_FILE"
+  if [ -z "$cloud_url" ] || [ -z "$cloud_key" ]; then
+    die "cloud credentials at $CLOUD_FILE are incomplete; run 'agman cloud login' again"
+  fi
+}
+
+# cloud_http <method> <path> <body-out-file> [curl args...]; prints HTTP code.
+cloud_http() {
+  local method="$1" path="$2" out="$3" code
+  shift 3
+  code="$(curl -sS -X "$method" -H "x-api-key: $cloud_key" \
+    --connect-timeout 10 -o "$out" -w '%{http_code}' \
+    "$cloud_url$path" ${1+"$@"} 2>/dev/null)" || code="000"
+  printf '%s' "$code"
+}
+
+# Best-effort {"error":"..."} extraction from a JSON response body.
+cloud_error_from() { sed -n 's/.*"error":"\([^"]*\)".*/\1/p' "$1" 2>/dev/null | head -1; }
+
+cloud_die_http() {
+  local code="$1" msg="${2:-}"
+  case "$code" in
+    000) die "cloud: cannot reach $cloud_url" ;;
+    401) die "cloud: API key rejected; run 'agman cloud login' again" ;;
+    *)   die "cloud: HTTP $code${msg:+: $msg}" ;;
+  esac
+}
+
+# Regular files of a profile tree, minus credential-bearing names, one
+# relative path per line. -type f also skips symlinks, which keeps shared
+# session state and the identity link out of archives.
+cloud_safe_files() {
+  (cd "$1" && find . -type f \
+    ! -name "$CREDS_BASENAME" ! -name "$TOKEN_BASENAME" ! -name "$HELPER_BASENAME" \
+    ! -name auth.json ! -name oauth_creds.json ! -name google_accounts.json)
+}
+
+cloud_prune_secrets() {
+  find "$1" -type f \
+    \( -name "$CREDS_BASENAME" -o -name "$TOKEN_BASENAME" -o -name "$HELPER_BASENAME" \
+       -o -name auth.json -o -name oauth_creds.json -o -name google_accounts.json \) \
+    -exec rm -f {} + 2>/dev/null || true
+}
+
+# Install a downloaded archive into a profile directory: extract to a staging
+# dir, strip credentials and anything that would shadow shared-state links,
+# then copy only the remaining regular files over.
+cloud_install_archive() {
+  local archive="$1" dir="$2" staging pair sname
+  staging="$(mktemp -d)"
+  if ! tar -xzf "$archive" -C "$staging" 2>/dev/null; then
+    rm -rf "$staging"
+    die "cloud: server did not return a valid archive"
+  fi
+  cloud_prune_secrets "$staging"
+  for pair in "${SHARED_STATE_ENTRIES[@]}"; do
+    sname="${pair%%:*}"
+    rm -rf "${staging:?}/claude/$sname"
+  done
+  mkdir -p "$dir"
+  if ! (cd "$staging" && find . -type f | tar -cf - -T -) | (cd "$dir" && tar -xf -); then
+    rm -rf "$staging"
+    die "cloud: could not install the pulled files"
+  fi
+  [ -f "$dir/$LAYOUT_FILE" ] || printf '%s\n' "$LAYOUT_VERSION" > "$dir/$LAYOUT_FILE"
+  rm -rf "$staging"
+}
+
+cloud_login() {
+  cloud_require_curl
+  local url="" key="" key_stdin=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --url) shift; url="${1:-}"; [ -n "$url" ] || usage_die "--url needs a value" ;;
+      --key-stdin) key_stdin=1 ;;
+      *) usage_die "unknown option '$1' for cloud login" ;;
+    esac
+    shift
+  done
+  if [ -z "$url" ]; then
+    printf 'Cloud URL (e.g. https://agman-cloud.example.com): '
+    IFS= read -r url || true
+  fi
+  url="${url%/}"
+  case "$url" in
+    http://*|https://*) ;;
+    *) die "cloud URL must start with http:// or https://" ;;
+  esac
+  if [ "$key_stdin" = "1" ]; then
+    IFS= read -r key || true
+  else
+    printf 'API key (Dashboard -> API keys): '
+    if command -v stty >/dev/null 2>&1 && [ -t 0 ]; then
+      stty -echo; IFS= read -r key || true; stty echo; printf '\n'
+    else
+      IFS= read -r key || true
+    fi
+  fi
+  [ -n "$key" ] || die "no API key provided"
+
+  cloud_url="$url"; cloud_key="$key"
+  local resp code msg
+  resp="$(mktemp)"
+  code="$(cloud_http GET "/api/profiles" "$resp")"
+  msg="$(cloud_error_from "$resp")"
+  rm -f "$resp"
+  [ "$code" = "200" ] || cloud_die_http "$code" "$msg"
+
+  mkdir -p "$AGMAN_HOME"
+  printf 'url=%s\nkey=%s\n' "$url" "$key" > "$CLOUD_FILE"
+  chmod 600 "$CLOUD_FILE"
+  printf "Logged in to %s.\nCredentials stored at %s (mode 600, never synced).\n" "$url" "$CLOUD_FILE"
+}
+
+cloud_logout() {
+  if [ ! -f "$CLOUD_FILE" ]; then
+    printf 'Not logged in to agman cloud.\n'
+    return 0
+  fi
+  rm -f "$CLOUD_FILE"
+  printf 'Logged out. The API key itself stays valid; revoke it from the dashboard.\n'
+}
+
+cloud_status() {
+  if [ ! -f "$CLOUD_FILE" ]; then
+    printf 'Not logged in to agman cloud. Run: agman cloud login\n'
+    return 0
+  fi
+  cloud_load
+  printf 'agman cloud: %s\n' "$cloud_url"
+  printf '  credentials: %s (mode 600)\n' "$CLOUD_FILE"
+  cloud_require_curl
+  local resp code
+  resp="$(mktemp)"
+  code="$(cloud_http GET "/api/profiles" "$resp")"
+  rm -f "$resp"
+  case "$code" in
+    200) printf '  connection:  ok\n' ;;
+    000) printf '  connection:  unreachable\n' ;;
+    401) printf '  connection:  key rejected (run agman cloud login again)\n' ;;
+    *)   printf '  connection:  HTTP %s\n' "$code" ;;
+  esac
+}
+
+cloud_list() {
+  cloud_load
+  cloud_require_curl
+  local resp code msg out
+  resp="$(mktemp)"
+  code="$(cloud_http GET "/api/profiles" "$resp")"
+  if [ "$code" != "200" ]; then
+    msg="$(cloud_error_from "$resp")"
+    rm -f "$resp"
+    cloud_die_http "$code" "$msg"
+  fi
+  out="$(tr '{' '\n' < "$resp" |
+    sed -n 's/.*"name":"\([^"]*\)".*"latestVersion":\([0-9][0-9]*\).*/  \1 (v\2)/p')"
+  rm -f "$resp"
+  if [ -n "$out" ]; then
+    printf 'Cloud profiles on %s:\n%s\n' "$cloud_url" "$out"
+  else
+    printf 'No cloud profiles yet. Push one with: agman cloud push <name>\n'
+  fi
+}
+
+cloud_push() {
+  local name="" include_secrets=0 arg
+  for arg in ${1+"$@"}; do
+    case "$arg" in
+      --include-secrets) include_secrets=1 ;;
+      -*) usage_die "unknown option '$arg' for cloud push" ;;
+      *)
+        [ -z "$name" ] || usage_die "cloud push takes at most one profile name"
+        name="$arg" ;;
+    esac
+  done
+  if [ -z "$name" ]; then
+    name="$(active_profile 2>/dev/null || true)"
+    [ -n "$name" ] || usage_die "no active profile; run 'agman cloud push <name>'"
+  fi
+  require_profile "$name"
+  cloud_load
+  cloud_require_curl
+
+  local dir body resp code msg version
+  dir="$(profile_dir "$name")"
+  body="$(mktemp)"
+  if [ "$include_secrets" = "1" ]; then
+    warn "pushing credential files too (--include-secrets); they are shared with anyone who can pull this profile"
+    if ! (cd "$dir" && find . -type f | COPYFILE_DISABLE=1 tar -czf - -T -) > "$body"; then
+      rm -f "$body"; die "could not archive profile '$name'"
+    fi
+  else
+    if ! cloud_safe_files "$dir" | (cd "$dir" && COPYFILE_DISABLE=1 tar -czf - -T -) > "$body"; then
+      rm -f "$body"; die "could not archive profile '$name'"
+    fi
+  fi
+  [ -s "$body" ] || { rm -f "$body"; die "profile '$name' has no files to push"; }
+
+  resp="$(mktemp)"
+  code="$(cloud_http PUT "/api/profiles/$name/archive" "$resp" \
+    -H 'Content-Type: application/gzip' --data-binary "@$body")"
+  rm -f "$body"
+  if [ "$code" != "201" ] && [ "$code" != "200" ]; then
+    msg="$(cloud_error_from "$resp")"
+    rm -f "$resp"
+    cloud_die_http "$code" "$msg"
+  fi
+  version="$(sed -n 's/.*"version":\([0-9][0-9]*\).*/\1/p' "$resp" | head -1)"
+  case "$(cat "$resp")" in
+    *'"warnings":[]'*) ;;
+    *) warn "the server flagged possible secrets in this push: $(sed -n 's/.*"warnings":\(\[[^]]*\]\).*/\1/p' "$resp")" ;;
+  esac
+  rm -f "$resp"
+  printf "Pushed profile '%s' (version %s).\n" "$name" "${version:-?}"
+}
+
+cloud_pull() {
+  local name="" local_name="" force=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --as) shift; local_name="${1:-}"; [ -n "$local_name" ] || usage_die "--as needs a profile name" ;;
+      --force) force=1 ;;
+      -*) usage_die "unknown option '$1' for cloud pull" ;;
+      *)
+        [ -z "$name" ] || usage_die "cloud pull takes one profile name"
+        name="$1" ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || usage_die "usage: agman cloud pull <name> [--as <local-name>] [--force]"
+  local_name="${local_name:-$name}"
+  validate_name "$name"
+  validate_name "$local_name"
+  case "$local_name" in
+    global) die "'global' is the backup of your original config; pull into another name" ;;
+  esac
+  cloud_load
+  cloud_require_curl
+
+  local dir existed=1
+  dir="$(profile_dir "$local_name")"
+  if [ -d "$dir" ]; then
+    if [ "$(active_profile 2>/dev/null || true)" = "$local_name" ] && [ "$force" != "1" ]; then
+      die "profile '$local_name' is active; a pull would rewrite live tool config (rerun with --force)"
+    fi
+  else
+    require_creatable_name "$local_name"
+    existed=0
+  fi
+
+  local resp code msg
+  resp="$(mktemp)"
+  code="$(cloud_http GET "/api/profiles/$name/archive" "$resp")"
+  if [ "$code" != "200" ]; then
+    msg="$(cloud_error_from "$resp")"
+    rm -f "$resp"
+    cloud_die_http "$code" "$msg"
+  fi
+  cloud_install_archive "$resp" "$dir"
+  rm -f "$resp"
+  printf "Pulled cloud profile '%s' into '%s'.\n" "$name" "$local_name"
+  [ "$existed" = "1" ] || printf "Activate it with: agman use %s\n" "$local_name"
+}
+
+cloud_init() {
+  local org="${1:-}" name="${2:-}"
+  [ -n "$org" ] || usage_die "usage: agman cloud init <org-slug> [profile-name]"
+  [ $# -le 2 ] || usage_die "cloud init takes an org slug and an optional profile name"
+  validate_name "$org"
+  name="${name:-$org}"
+  require_creatable_name "$name"
+  if [ -d "$(profile_dir "$name")" ]; then
+    die "profile '$name' already exists (use 'agman cloud pull' to update it)"
+  fi
+  cloud_load
+  cloud_require_curl
+
+  local resp code msg
+  resp="$(mktemp)"
+  code="$(cloud_http GET "/api/orgs/$org/default-profile/archive" "$resp")"
+  if [ "$code" != "200" ]; then
+    msg="$(cloud_error_from "$resp")"
+    rm -f "$resp"
+    cloud_die_http "$code" "$msg"
+  fi
+  cloud_install_archive "$resp" "$(profile_dir "$name")"
+  rm -f "$resp"
+  printf "Created profile '%s' from team '%s'.\nActivate it with: agman use %s\n" "$name" "$org" "$name"
+}
+
+cmd_cloud() {
+  local sub="${1:-status}"
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    login)   cloud_login ${1+"$@"} ;;
+    logout)  cloud_logout ;;
+    status)  cloud_status ;;
+    list|ls) cloud_list ;;
+    push)    cloud_push ${1+"$@"} ;;
+    pull)    cloud_pull ${1+"$@"} ;;
+    init)    cloud_init ${1+"$@"} ;;
+    *) usage_die "unknown cloud subcommand '$sub' (login|logout|status|list|push|pull|init)" ;;
+  esac
+}
+
 cmd_help() {
   cat <<EOF
 agman $AGMAN_VERSION — agent manager: config profiles for AI coding agents
@@ -1804,6 +2143,16 @@ Commands:
                            --token-stdin    read the token from stdin
                            --no-run         don't run 'claude setup-token' first
   logout <name>          Drop that account; back to your shared login
+  cloud <subcommand>     Sync profiles with an agman cloud server:
+                           login [--url <url>] [--key-stdin]
+                           push [name] [--include-secrets]
+                           pull <name> [--as <local>] [--force]
+                           init <org-slug> [name]   profile from a team default
+                           list | status | logout
+                         Pushes are versioned server-side. Credential files
+                         (.credentials.json, tokens, codex/gemini auth) stay
+                         local unless --include-secrets, and are stripped from
+                         pulls. Pull refuses the active profile w/o --force.
   rename <old> <new>     Rename a profile (repoints active symlinks)
   remove <name> [--yes]  Delete a profile (refuses if active)
   migrate                Move profiles to the current layout, then relink
@@ -1861,6 +2210,7 @@ main() {
     remove|rm) cmd_remove ${1+"$@"} ;;
     login)   cmd_login ${1+"$@"} ;;
     logout)  cmd_logout ${1+"$@"} ;;
+    cloud)   cmd_cloud ${1+"$@"} ;;
     migrate) cmd_migrate ;;
     update)  cmd_update ;;
     doctor)  cmd_doctor ;;

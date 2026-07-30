@@ -227,6 +227,7 @@ agman update
 | `rename <old> <new>` / `remove <name>` | Manage profiles (rename repoints active symlinks; remove refuses if active) |
 | `migrate` | Move profiles to the current layout and relink (runs automatically on `use`) |
 | `login <name>` / `logout <name>` | Give a profile its own Claude account, or return it to your shared login |
+| `cloud <subcommand>` | Sync profiles with an [agman cloud](https://github.com/memandip/agman-cloud) server: `login`, `push [name]`, `pull <name> [--as <local>] [--force]`, `init <org-slug>` (new profile from a team default), `list`, `status`, `logout`. Pushes are versioned and encrypted at rest server-side. Credential files (`.credentials.json`, per-profile tokens, codex/gemini auth) are **excluded from push by default** (`--include-secrets` to override) and always stripped from pulls — a synced profile is a persona, not a login. Pull refuses to rewrite the active profile without `--force` |
 | `update` | Self-update from git or GitHub |
 | `doctor` | Diagnose setup: tool detection, per-path link state, per-profile auth, layout version |
 | `init [zsh\|bash]` | Optional per-shell integration (see below) |
@@ -263,11 +264,11 @@ CI runs the suite on Ubuntu + macOS and lints with shellcheck on every push.
 
 ## Roadmap
 
+- ~~Profile syncing between machines~~ — shipped as `agman cloud` (0.8.0), backed by the [agman cloud](https://github.com/memandip/agman-cloud) companion service
 - **Profile sharing over git**: `push`/`pull` to a repository you own, and a `.agman` file that fetches a profile that isn't local yet
 - **More tools**: Qwen Code and Kimi CLI adapters, once their config layouts are verified against the real CLIs
 - fish shell support, tab completions
 - `--fresh-auth` seeding (exclude copied credentials)
-- Profile export/import for syncing between machines
 
 ## License
 
