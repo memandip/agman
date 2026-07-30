@@ -888,6 +888,135 @@ else
   ok "update replacement check skipped (curl not installed)"
 fi
 
+# --- cloud sync ----------------------------------------------------------------------------------
+#
+# Fully offline: a curl stub routes by URL, records pushed archives, and
+# serves a fixture archive. The fixture deliberately carries a credential
+# file and a shared-state filename so the pull-side stripping is exercised.
+
+mkdir -p "$TMP/cloudbin" "$TMP/cloudlog"
+cat > "$TMP/cloudbin/curl" <<'EOF'
+#!/usr/bin/env bash
+set -u
+out="/dev/stdout"; url=""; databin=""; method="GET"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) shift; out="$1" ;;
+    -w|-X) case "$1" in -X) shift; method="$1" ;; *) shift ;; esac ;;
+    -H|--connect-timeout) shift ;;
+    --data-binary) shift; databin="$1" ;;
+    http*) url="$1" ;;
+  esac
+  shift
+done
+printf '%s %s\n' "$method" "$url" >> "${AGMAN_CURL_LOG:-/dev/null}"
+code=200
+case "$url" in
+  */api/profiles)
+    if [ -n "${AGMAN_CURL_401:-}" ]; then
+      code=401; printf '{"error":"Unauthorized"}' > "$out"
+    else
+      printf '{"profiles":[{"id":"p1","name":"work","latestVersion":3,"canPush":true}]}' > "$out"
+    fi ;;
+  */api/profiles/*/archive)
+    if [ "$method" = "PUT" ]; then
+      [ -n "$databin" ] && cp "${databin#@}" "$AGMAN_CURL_PUSHED"
+      code=201
+      printf '{"profileId":"p1","version":7,"checksum":"abc","warnings":[]}' > "$out"
+    else
+      cp "$AGMAN_CURL_ARCHIVE" "$out"
+    fi ;;
+  */api/orgs/*/default-profile/archive)
+    cp "$AGMAN_CURL_ARCHIVE" "$out" ;;
+  *)
+    code=404; printf '{"error":"not found"}' > "$out" ;;
+esac
+printf '%s' "$code"
+EOF
+chmod +x "$TMP/cloudbin/curl"
+
+mkdir -p "$TMP/cloudfix/claude"
+printf 'CLOUD RULES\n' > "$TMP/cloudfix/claude/CLAUDE.md"
+printf '{"cloud":true}\n' > "$TMP/cloudfix/claude/settings.json"
+printf 'should-never-land\n' > "$TMP/cloudfix/claude/.credentials.json"
+printf 'shadow\n' > "$TMP/cloudfix/claude/history.jsonl"
+(cd "$TMP/cloudfix" && COPYFILE_DISABLE=1 tar -czf "$TMP/cloud-archive.tar.gz" .)
+
+cloud_run() {
+  env PATH="$TMP/cloudbin:$PATH" \
+    AGMAN_CURL_LOG="$TMP/cloudlog/log" \
+    AGMAN_CURL_PUSHED="$TMP/cloudlog/pushed.tar.gz" \
+    AGMAN_CURL_ARCHIVE="$TMP/cloud-archive.tar.gz" \
+    "$AGM" "$@"
+}
+
+assert_fail "cloud push before login fails" cloud_run cloud push personal
+out="$(cloud_run cloud push personal 2>&1 || true)"
+assert_contains "unauthenticated cloud use explains login" "$out" "agman cloud login"
+assert_contains "cloud status before login is calm" "$(cloud_run cloud status)" "Not logged in"
+
+out="$(printf 'test-key-123\n' | cloud_run cloud login --url http://cloud.test/ --key-stdin 2>&1)" \
+  && ok "cloud login stores credentials" || bad "cloud login stores credentials ($out)"
+assert_exists "cloud credentials file created" "$AGMAN_HOME/.cloud"
+assert_eq "cloud credentials are private (mode 600)" "-rw-------" "$(ls -l "$AGMAN_HOME/.cloud" | cut -c1-10)"
+assert_contains "trailing slash trimmed from url" "$(cat "$AGMAN_HOME/.cloud")" "url=http://cloud.test"
+assert_lacks "login output never prints the key" "$out" "test-key-123"
+assert_fail "login rejects a non-http url" cloud_run cloud login --url ftp://x --key-stdin
+
+assert_contains "cloud status shows the server" "$(cloud_run cloud status)" "http://cloud.test"
+assert_contains "cloud status probes the connection" "$(cloud_run cloud status)" "ok"
+assert_contains "cloud list shows remote profiles" "$(cloud_run cloud list)" "work (v3)"
+out="$(AGMAN_CURL_401=1 cloud_run cloud list 2>&1 || true)"
+assert_contains "rejected key suggests re-login" "$out" "API key rejected"
+
+# push: plant credential files, then prove they stay local
+printf 'tok\n' > "$AGMAN_HOME/personal/.agman-token"
+printf '{"c":1}\n' > "$AGMAN_HOME/personal/claude/.credentials.json"
+mkdir -p "$AGMAN_HOME/personal/codex"
+printf '{"t":1}\n' > "$AGMAN_HOME/personal/codex/auth.json"
+out="$(cloud_run cloud push personal 2>&1)" \
+  && ok "cloud push succeeds" || bad "cloud push succeeds ($out)"
+assert_contains "push reports the new version" "$out" "version 7"
+listing="$(tar -tzf "$TMP/cloudlog/pushed.tar.gz")"
+assert_contains "push includes profile config" "$listing" "claude/CLAUDE.md"
+assert_lacks "push withholds claude credentials" "$listing" ".credentials.json"
+assert_lacks "push withholds the agman token" "$listing" ".agman-token"
+assert_lacks "push withholds codex auth" "$listing" "auth.json"
+assert_ok "push --include-secrets is allowed explicitly" cloud_run cloud push personal --include-secrets
+listing="$(tar -tzf "$TMP/cloudlog/pushed.tar.gz")"
+# .credentials.json may be a symlink to the shared file (earlier sections set
+# that up); symlinks are never followed, so assert on the real files planted.
+assert_contains "explicit secrets push carries the agman token" "$listing" ".agman-token"
+assert_contains "explicit secrets push carries codex auth" "$listing" "codex/auth.json"
+assert_fail "push of an unknown profile fails" cloud_run cloud push nosuchprofile
+
+# pull: new local profile, with server-side junk stripped
+assert_ok "cloud pull creates a new profile" cloud_run cloud pull work --as pulled
+assert_eq "pulled config content" "CLOUD RULES" "$(cat "$AGMAN_HOME/pulled/claude/CLAUDE.md")"
+assert_eq "pulled profile records the layout" "2" "$(cat "$AGMAN_HOME/pulled/.agman-layout")"
+assert_missing "pull strips credential files" "$AGMAN_HOME/pulled/claude/.credentials.json"
+assert_missing "pull drops shared-state shadows" "$AGMAN_HOME/pulled/claude/history.jsonl"
+assert_contains "pulled profile appears in list" "$("$AGM" list)" "pulled"
+assert_fail "pull refuses a reserved local name" cloud_run cloud pull work --as global
+
+assert_ok "activate the pulled profile" "$AGM" use pulled
+assert_fail "pull refuses the active profile" cloud_run cloud pull work --as pulled
+out="$(cloud_run cloud pull work --as pulled 2>&1 || true)"
+assert_contains "active-profile refusal explains --force" "$out" "--force"
+assert_ok "pull --force rewrites the active profile" cloud_run cloud pull work --as pulled --force
+assert_symlink_to "shared history survives a forced pull" \
+  "$AGMAN_HOME/pulled/claude/history.jsonl" "$AGMAN_HOME/.state/history.jsonl"
+assert_ok "deactivate again" "$AGM" off
+
+# init: team onboarding
+assert_ok "cloud init creates a profile from the team default" cloud_run cloud init acme
+assert_eq "init landed the team config" "CLOUD RULES" "$(cat "$AGMAN_HOME/acme/claude/CLAUDE.md")"
+assert_fail "init refuses an existing profile name" cloud_run cloud init acme
+
+assert_fail "unknown cloud subcommand fails" cloud_run cloud frobnicate
+assert_ok "cloud logout removes credentials" cloud_run cloud logout
+assert_missing "cloud credentials gone after logout" "$AGMAN_HOME/.cloud"
+
 # --- misc ------------------------------------------------------------------------------------------
 
 assert_ok "help runs" "$AGM" help
