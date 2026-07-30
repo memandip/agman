@@ -2153,13 +2153,13 @@ cloud_pull() {
   cloud_load
   cloud_require_curl
 
-  local dir existed=1
+  local dir existed=1 current_active=""
   dir="$(profile_dir "$local_name")"
-  if [ -d "$dir" ]; then
-    if [ "$(cloud_lc "$(active_profile 2>/dev/null || true)")" = "$(cloud_lc "$local_name")" ] && [ "$force" != "1" ]; then
-      die "profile '$local_name' is active; a pull would rewrite live tool config (rerun with --force)"
-    fi
-  else
+  current_active="$(active_profile 2>/dev/null || true)"
+  if [ -n "$current_active" ] && [ "$(cloud_lc "$current_active")" = "$(cloud_lc "$local_name")" ] && [ "$force" != "1" ]; then
+    die "profile '$local_name' is active; a pull would rewrite live tool config (rerun with --force)"
+  fi
+  if [ ! -d "$dir" ]; then
     require_creatable_name "$local_name"
     existed=0
   fi
