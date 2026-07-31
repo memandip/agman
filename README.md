@@ -227,6 +227,7 @@ agman update
 | `rename <old> <new>` / `remove <name>` | Manage profiles (rename repoints active symlinks; remove refuses if active) |
 | `migrate` | Move profiles to the current layout and relink (runs automatically on `use`) |
 | `login <name>` / `logout <name>` | Give a profile its own Claude account, or return it to your shared login |
+| `cloud <subcommand>` | Sync profiles with an [agman cloud](https://github.com/memandip/agman-cloud) server: `login`, `push [name]`, `pull <name> [--as <local>] [--force]`, `init <org-slug>` (new profile from a team default), `list`, `status`, `logout`. Pushes are versioned and encrypted at rest server-side. **A synced profile is a persona, not a login:** account material (the identity file, `.credentials.json`, per-profile tokens, codex/gemini auth, any `.env`) and ephemeral state (sessions, history, caches) stay local by default and are stripped on pull; a push is refused if a synced file looks like it holds a secret. `--include-secrets` (push) / `--with-secrets` (pull) opt into carrying account material for your own machine-to-machine restore. Pulls treat a downloaded profile as untrusted — they strip `hooks`/`apiKeyHelper` from `settings.json`, never touch shared-state symlinks, back up an existing profile first, and refuse the active profile without `--force`. `https` is required (override with `AGMAN_CLOUD_INSECURE=1`); the API key is passed to `curl` via a mode-600 file, never the command line |
 | `update` | Self-update from git or GitHub |
 | `doctor` | Diagnose setup: tool detection, per-path link state, per-profile auth, layout version |
 | `init [zsh\|bash]` | Optional per-shell integration (see below) |
@@ -263,11 +264,11 @@ CI runs the suite on Ubuntu + macOS and lints with shellcheck on every push.
 
 ## Roadmap
 
+- ~~Profile syncing between machines~~ — shipped as `agman cloud` (0.8.0), backed by the [agman cloud](https://github.com/memandip/agman-cloud) companion service
 - **Profile sharing over git**: `push`/`pull` to a repository you own, and a `.agman` file that fetches a profile that isn't local yet
 - **More tools**: Qwen Code and Kimi CLI adapters, once their config layouts are verified against the real CLIs
 - fish shell support, tab completions
 - `--fresh-auth` seeding (exclude copied credentials)
-- Profile export/import for syncing between machines
 
 ## License
 
