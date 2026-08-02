@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.8.0"
+AGMAN_VERSION="0.9.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -1795,6 +1795,10 @@ AGMAN_SNIPPET
 #     logs, ide locks, paste-cache, …). The same names are stripped on pull.
 #     --include-secrets (push) / --with-secrets (pull) opt into carrying the
 #     account material for your own machine-to-machine restore.
+#   - Reinstallable plugin artifacts (plugin caches, marketplace clones,
+#     catalog data) are never synced; their references are, and pull
+#     reinstalls them into the pulled tree via the claude CLI
+#     (AGMAN_CLOUD_NO_INSTALL=1 skips the reinstall).
 #   - Push refuses when a synced file contains an obvious secret (API keys,
 #     private keys) unless --force / --include-secrets — a blocklist can't see
 #     a token pasted into settings.json, so content is scanned too.
@@ -1816,6 +1820,14 @@ CLOUD_SECRET_NAMES=".credentials.json $TOKEN_BASENAME $HELPER_BASENAME auth.json
 # Content patterns that mark an obvious secret pasted into an otherwise
 # syncable file (mirrors the agman-cloud server's own scan).
 CLOUD_SECRET_RE='-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-ant-[A-Za-z0-9_-]{16,}|sk-proj-[A-Za-z0-9_-]{16,}|AIza[0-9A-Za-z_-]{35}|gh[pousr]_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|xox[baprs]-[A-Za-z0-9-]{10,}'
+# Reinstallable Claude Code plugin artifacts (marketplace clones, catalog
+# data; the cache dir is already dropped by the 'cache' state name): never
+# synced in either direction. The references that recreate them —
+# settings.json enabledPlugins, plugins/known_marketplaces.json,
+# plugins/installed_plugins.json — are synced, and pull reinstalls from them
+# (cloud_install_plugins). Mirrors the agman-cloud server's own filter and
+# the reference client's tar excludes; keep the three in sync.
+CLOUD_PLUGIN_ARTIFACT_RE='(^|/)plugins/(cache|marketplaces|repos|data)(/|$)|(^|/)plugins/plugin-catalog-cache\.json$'
 
 cloud_require_curl() {
   command -v curl >/dev/null 2>&1 || die "curl is required for cloud sync"
@@ -1897,7 +1909,7 @@ cloud_push_files() {
   names="$CLOUD_STATE_NAMES"
   [ "$keep_secrets" = "1" ] || names="$names $CLOUD_SECRET_NAMES"
   re="$(cloud_name_re "$names")"
-  ( cd "$dir" && find . -type f | grep -Ev "$re" ) || true
+  ( cd "$dir" && find . -type f | grep -Ev "$re" | grep -Ev "$CLOUD_PLUGIN_ARTIFACT_RE" ) || true
 }
 
 # Print files (relative to $dir) from $list whose content matches an obvious
@@ -1933,7 +1945,7 @@ cloud_install_archive() {
   names="$CLOUD_STATE_NAMES"
   [ "$keep_secrets" = "1" ] || names="$names $CLOUD_SECRET_NAMES"
   re="$(cloud_name_re "$names")"
-  keep="$( ( cd "$staging" && find . -type f | grep -Ev "$re" ) || true )"
+  keep="$( ( cd "$staging" && find . -type f | grep -Ev "$re" | grep -Ev "$CLOUD_PLUGIN_ARTIFACT_RE" ) || true )"
 
   if [ -d "$dir" ]; then
     stamp="$(date +%Y%m%d%H%M%S 2>/dev/null || printf 'backup')"
@@ -1952,6 +1964,50 @@ cloud_install_archive() {
   fi
   [ -f "$dir/$LAYOUT_FILE" ] || printf '%s\n' "$LAYOUT_VERSION" > "$dir/$LAYOUT_FILE"
   rm -rf "$staging"
+}
+
+# Reinstall external plugins referenced by a pulled profile: marketplaces from
+# plugins/known_marketplaces.json, enabled plugins from settings.json. This
+# restores exactly what CLOUD_PLUGIN_ARTIFACT_RE withheld from the sync; the
+# plugin code itself still only runs after 'agman use' under Claude Code's own
+# marketplace trust flow. CLAUDE_CONFIG_DIR pins the installs to the pulled
+# tree so the active profile is never touched; stdin is closed so an
+# interactive claude cannot hang or eat the read loop's input. Best effort —
+# failures warn, never die. AGMAN_CLOUD_NO_INSTALL=1 skips entirely.
+cloud_install_plugins() {
+  local dir="$1" config_dir marketplaces settings repo plugin
+  [ "${AGMAN_CLOUD_NO_INSTALL:-}" = "1" ] && return 0
+  config_dir="$dir/claude"
+  [ -d "$config_dir" ] || return 0
+  if ! command -v claude >/dev/null 2>&1; then
+    warn "claude CLI not found; pulled plugin references were kept but nothing was reinstalled"
+    return 0
+  fi
+  marketplaces="$config_dir/plugins/known_marketplaces.json"
+  if [ -f "$marketplaces" ]; then
+    tr ',{}' '\n\n\n' < "$marketplaces" \
+      | sed -n 's/.*"repo"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+      | sort -u | while IFS= read -r repo; do
+        [ -n "$repo" ] || continue
+        printf "  adding plugin marketplace %s\n" "$repo"
+        CLAUDE_CONFIG_DIR="$config_dir" claude plugin marketplace add "$repo" </dev/null >/dev/null 2>&1 \
+          || warn "could not add plugin marketplace $repo"
+      done
+  fi
+  settings="$config_dir/settings.json"
+  if [ -f "$settings" ]; then
+    # "name@marketplace": true keys, scoped to the enabledPlugins block (the
+    # scope degrades to the whole line on single-line JSON — best effort).
+    sed -n '/"enabledPlugins"/,/}/p' "$settings" \
+      | tr ',{}' '\n\n\n' \
+      | sed -n 's/.*"\([^"]*@[^"]*\)"[[:space:]]*:[[:space:]]*true.*/\1/p' \
+      | sort -u | while IFS= read -r plugin; do
+        [ -n "$plugin" ] || continue
+        printf "  installing plugin %s\n" "$plugin"
+        CLAUDE_CONFIG_DIR="$config_dir" claude plugin install "$plugin" </dev/null >/dev/null 2>&1 \
+          || warn "could not install plugin $plugin"
+      done
+  fi
 }
 
 cloud_login() {
@@ -2124,6 +2180,12 @@ cloud_push() {
     *) warn "the server flagged possible secrets in this push: $warnings" ;;
   esac
   printf "Pushed profile '%s' (version %s).\n" "$name" "${version:-?}"
+  local omitted
+  omitted="$(sed -n 's/.*"omitted":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$resp" | head -1)"
+  case "$omitted" in
+    ""|0) ;;
+    *) printf "  %s reinstallable plugin file(s) omitted server-side; pull reinstalls them.\n" "$omitted" ;;
+  esac
 }
 
 cloud_pull() {
@@ -2172,6 +2234,7 @@ cloud_pull() {
     cloud_die_http "$code" "$msg"
   fi
   cloud_install_archive "$resp" "$dir" "$keep_secrets"
+  cloud_install_plugins "$dir"
   printf "Pulled cloud profile '%s' into '%s'.\n" "$name" "$local_name"
   [ "$existed" = "1" ] || printf "Activate it with: agman use %s\n" "$local_name"
 }
@@ -2207,6 +2270,7 @@ cloud_init() {
     cloud_die_http "$code" "$msg"
   fi
   cloud_install_archive "$resp" "$(profile_dir "$name")" "$keep_secrets"
+  cloud_install_plugins "$(profile_dir "$name")"
   printf "Created profile '%s' from team '%s'.\nActivate it with: agman use %s\n" "$name" "$org" "$name"
 }
 
@@ -2269,8 +2333,11 @@ Commands:
                          for your own machine-to-machine restore. Pulls strip
                          hooks/apiKeyHelper from an untrusted settings.json, back
                          up an existing profile first, and refuse the active
-                         profile without --force. https required (override with
-                         AGMAN_CLOUD_INSECURE=1).
+                         profile without --force. Plugin caches and marketplace
+                         clones are never synced; pull reinstalls them from the
+                         profile's references via the claude CLI
+                         (AGMAN_CLOUD_NO_INSTALL=1 skips). https required
+                         (override with AGMAN_CLOUD_INSECURE=1).
   rename <old> <new>     Rename a profile (repoints active symlinks)
   remove <name> [--yes]  Delete a profile (refuses if active)
   migrate                Move profiles to the current layout, then relink
