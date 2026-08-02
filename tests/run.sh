@@ -928,7 +928,7 @@ case "$url" in
     if [ "$method" = "PUT" ]; then
       [ -n "$databin" ] && cp "${databin#@}" "$AGMAN_CURL_PUSHED"
       code=201
-      printf '{"profileId":"p1","version":7,"checksum":"abc","warnings":[]}' > "$out"
+      printf '{"profileId":"p1","version":7,"checksum":"abc","warnings":[],"omitted":3}' > "$out"
     elif [ -n "${AGMAN_CURL_BADARCHIVE:-}" ]; then
       printf 'this is not a gzip archive' > "$out"
     else
@@ -943,14 +943,28 @@ printf '%s' "$code"
 EOF
 chmod +x "$TMP/cloudbin/curl"
 
-mkdir -p "$TMP/cloudfix/claude/team skills" "$TMP/cloudfix/gemini"
+# claude stub: records CLAUDE_CONFIG_DIR + argv for plugin reinstall checks.
+# It reads a line of stdin like an interactive CLI would — proving the
+# reinstall loop protects its own stdin (</dev/null) from being consumed.
+cat > "$TMP/cloudbin/claude" <<'EOF'
+#!/usr/bin/env bash
+read -r _ 2>/dev/null
+printf '%s %s\n' "${CLAUDE_CONFIG_DIR:-none}" "$*" >> "${AGMAN_CLAUDE_LOG:-/dev/null}"
+EOF
+chmod +x "$TMP/cloudbin/claude"
+
+mkdir -p "$TMP/cloudfix/claude/team skills" "$TMP/cloudfix/gemini" \
+  "$TMP/cloudfix/claude/plugins/marketplaces/mkt"
 printf 'CLOUD RULES\n' > "$TMP/cloudfix/claude/CLAUDE.md"
-printf '{"cloud":true,"hooks":{"SessionStart":[{"command":"./evil.sh"}]},"apiKeyHelper":"/x/agman-apikey.sh"}\n' > "$TMP/cloudfix/claude/settings.json"
+printf '{"cloud":true,"hooks":{"SessionStart":[{"command":"./evil.sh"}]},"apiKeyHelper":"/x/agman-apikey.sh","enabledPlugins":{"acme-tools@mkt":true,"acme-extras@mkt":true}}\n' > "$TMP/cloudfix/claude/settings.json"
 printf 'spaced\n' > "$TMP/cloudfix/claude/team skills/best skill.md"
 printf 'should-never-land\n' > "$TMP/cloudfix/claude/.credentials.json"
 printf '{"oauthAccount":{"emailAddress":"pusher@corp"},"userID":"u1"}\n' > "$TMP/cloudfix/claude.json"
 printf 'GEMINI_API_KEY=AIzaSyFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE123\n' > "$TMP/cloudfix/gemini/.env"
 printf 'shadow\n' > "$TMP/cloudfix/claude/history.jsonl"
+printf '{}\n' > "$TMP/cloudfix/claude/plugins/marketplaces/mkt/marketplace.json"
+printf '{"mkt":{"source":{"source":"github","repo":"acme/mkt"}}}\n' > "$TMP/cloudfix/claude/plugins/known_marketplaces.json"
+printf '{"catalog":true}\n' > "$TMP/cloudfix/claude/plugins/plugin-catalog-cache.json"
 (cd "$TMP/cloudfix" && COPYFILE_DISABLE=1 tar -czf "$TMP/cloud-archive.tar.gz" .)
 
 cloud_run() {
@@ -960,6 +974,7 @@ cloud_run() {
     AGMAN_CURL_ARGS="$TMP/cloudlog/args" \
     AGMAN_CURL_PUSHED="$TMP/cloudlog/pushed.tar.gz" \
     AGMAN_CURL_ARCHIVE="$TMP/cloud-archive.tar.gz" \
+    AGMAN_CLAUDE_LOG="$TMP/cloudlog/claude" \
     "$AGM" "$@"
 }
 
@@ -996,9 +1011,18 @@ assert_contains "rejected key suggests re-login" "$out" "API key rejected"
 cloud_run cloud list >/dev/null 2>&1 || true
 assert_lacks "api key never appears on the curl command line" "$(cat "$TMP/cloudlog/args")" "test-key-123"
 
-# push: plant account material, then prove it stays local
-mkdir -p "$AGMAN_HOME/personal/claude/my skills" "$AGMAN_HOME/personal/gemini" "$AGMAN_HOME/personal/codex"
+# push: plant account material and plugin artifacts, then prove they stay local
+mkdir -p "$AGMAN_HOME/personal/claude/my skills" "$AGMAN_HOME/personal/gemini" "$AGMAN_HOME/personal/codex" \
+  "$AGMAN_HOME/personal/claude/plugins/cache/mkt/tool/1.0.0" \
+  "$AGMAN_HOME/personal/claude/plugins/marketplaces/mkt" \
+  "$AGMAN_HOME/personal/claude/plugins/data"
 printf 'skillful\n' > "$AGMAN_HOME/personal/claude/my skills/space case.md"
+printf 'cached artifact\n' > "$AGMAN_HOME/personal/claude/plugins/cache/mkt/tool/1.0.0/README.md"
+printf '{}\n' > "$AGMAN_HOME/personal/claude/plugins/marketplaces/mkt/marketplace.json"
+printf '{"usage":1}\n' > "$AGMAN_HOME/personal/claude/plugins/data/usage.json"
+printf '{"catalog":true}\n' > "$AGMAN_HOME/personal/claude/plugins/plugin-catalog-cache.json"
+printf '{"version":2,"plugins":{"acme-tools@mkt":[{"version":"1.0.0"}]}}\n' > "$AGMAN_HOME/personal/claude/plugins/installed_plugins.json"
+printf '{"mkt":{"source":{"source":"github","repo":"acme/mkt"}}}\n' > "$AGMAN_HOME/personal/claude/plugins/known_marketplaces.json"
 printf 'tok\n' > "$AGMAN_HOME/personal/.agman-token"
 printf '{"c":1}\n' > "$AGMAN_HOME/personal/claude/.credentials.json"
 printf '{"oauthAccount":{"emailAddress":"me@corp"},"userID":"u9"}\n' > "$AGMAN_HOME/personal/claude.json"
@@ -1015,6 +1039,13 @@ assert_lacks "push withholds the agman token" "$listing" ".agman-token"
 assert_lacks "push withholds codex auth" "$listing" "auth.json"
 assert_lacks "push withholds the identity file (account PII)" "$listing" "claude.json"
 assert_lacks "push withholds gemini/.env (api key)" "$listing" ".env"
+assert_lacks "push withholds plugin caches" "$listing" "plugins/cache"
+assert_lacks "push withholds marketplace clones" "$listing" "plugins/marketplaces"
+assert_lacks "push withholds plugin catalog data" "$listing" "plugins/data"
+assert_lacks "push withholds the plugin catalog cache" "$listing" "plugin-catalog-cache.json"
+assert_contains "push carries installed-plugin references" "$listing" "plugins/installed_plugins.json"
+assert_contains "push carries marketplace references" "$listing" "plugins/known_marketplaces.json"
+assert_contains "push surfaces server-omitted plugin files" "$out" "3 reinstallable plugin file"
 
 # content scan: a secret pasted into an otherwise-syncable file blocks the push
 mkdir -p "$AGMAN_HOME/leaky/claude"
@@ -1061,6 +1092,24 @@ assert_ok "cloud pull --with-secrets" cloud_run cloud pull work --as trusted --w
 assert_exists "with-secrets keeps the identity file" "$AGMAN_HOME/trusted/claude.json"
 assert_exists "with-secrets keeps gemini/.env" "$AGMAN_HOME/trusted/gemini/.env"
 assert_contains "with-secrets keeps hooks in settings.json" "$(cat "$AGMAN_HOME/trusted/claude/settings.json")" "hooks"
+
+# pull strips reinstallable plugin artifacts and reinstalls from references,
+# pinned to the pulled tree (never the active profile)
+: > "$TMP/cloudlog/claude"
+assert_ok "pull reinstalls external plugins" cloud_run cloud pull work --as plugged
+assert_missing "pull strips marketplace clones" "$AGMAN_HOME/plugged/claude/plugins/marketplaces/mkt/marketplace.json"
+assert_missing "pull strips the plugin catalog cache" "$AGMAN_HOME/plugged/claude/plugins/plugin-catalog-cache.json"
+assert_exists "pull keeps marketplace references" "$AGMAN_HOME/plugged/claude/plugins/known_marketplaces.json"
+claude_log="$(cat "$TMP/cloudlog/claude")"
+assert_contains "reinstall adds the referenced marketplace" "$claude_log" "plugin marketplace add acme/mkt"
+assert_contains "reinstall installs the first enabled plugin" "$claude_log" "plugin install acme-tools@mkt"
+assert_contains "reinstall installs the second enabled plugin (stdin survives)" "$claude_log" "plugin install acme-extras@mkt"
+assert_contains "reinstall targets the pulled profile via CLAUDE_CONFIG_DIR" "$claude_log" "$AGMAN_HOME/plugged/claude plugin install"
+assert_lacks "reinstall never touches the live config" "$claude_log" "none plugin"
+: > "$TMP/cloudlog/claude"
+AGMAN_CLOUD_NO_INSTALL=1 cloud_run cloud pull work --as noinstall >/dev/null 2>&1 \
+  && ok "AGMAN_CLOUD_NO_INSTALL pull succeeds" || bad "AGMAN_CLOUD_NO_INSTALL pull succeeds"
+assert_eq "no-install leaves the claude CLI untouched" "0" "$(wc -l < "$TMP/cloudlog/claude" | tr -d ' ')"
 
 assert_ok "activate the pulled profile" "$AGM" use pulled
 assert_fail "pull refuses the active profile" cloud_run cloud pull work --as pulled
