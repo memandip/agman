@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.9.0"
+AGMAN_VERSION="0.10.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -1842,6 +1842,14 @@ cloud_cleanup() { local f; for f in $AGMAN_CLOUD_TMP; do rm -rf "$f"; done; retu
 
 cloud_lc() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
+# Verbose diagnostics (`agman cloud --verbose …` or AGMAN_VERBOSE=1): a few
+# high-signal lines on stderr — the request line, the push payload size, the
+# response code. Deliberately terse; this is not a debug trace.
+cloud_log() {
+  [ "${AGMAN_VERBOSE:-0}" = "1" ] && printf 'cloud: %s\n' "$1" >&2
+  return 0
+}
+
 # Build (^|/)(a|b|c)(/|$) matching any listed name as a full path component.
 # Dots are escaped so 'history.jsonl' can't match 'historyXjsonl'.
 cloud_name_re() {
@@ -1876,6 +1884,7 @@ cloud_load() {
 cloud_http() {
   local method="$1" path="$2" out="$3" code cfg
   shift 3
+  cloud_log "$method $cloud_url$path"
   cfg="$(mktemp)"; cloud_track "$cfg"
   printf 'header = "x-api-key: %s"\n' "$cloud_key" > "$cfg"
   # curl prints '000' itself when it never got a response; keep any real code
@@ -1884,6 +1893,7 @@ cloud_http() {
     -o "$out" -w '%{http_code}' "$cloud_url$path" ${1+"$@"} 2>/dev/null)" || true
   rm -f "$cfg"
   [ -n "$code" ] || code="000"
+  cloud_log "HTTP $code"
   printf '%s' "$code"
 }
 
@@ -2165,6 +2175,7 @@ cloud_push() {
     die "could not archive profile '$name'"
   fi
   [ -s "$body" ] || die "profile '$name' produced an empty archive"
+  cloud_log "archive: $(printf '%s\n' "$files" | grep -c .) file(s), $(wc -c < "$body" | tr -d ' ') bytes"
 
   code="$(cloud_http PUT "/api/profiles/$name/archive" "$resp" \
     -H 'Content-Type: application/gzip' --data-binary "@$body")"
@@ -2276,6 +2287,9 @@ cloud_init() {
 
 cmd_cloud() {
   trap cloud_cleanup EXIT INT TERM
+  case "${1:-}" in
+    -v|--verbose) AGMAN_VERBOSE=1; shift ;;
+  esac
   local sub="${1:-status}"
   [ $# -gt 0 ] && shift
   case "$sub" in
@@ -2324,6 +2338,8 @@ Commands:
                            pull <name> [--as <local>] [--force] [--with-secrets]
                            init <org-slug> [name] [--with-secrets]
                            list | status | logout
+                         --verbose (or AGMAN_VERBOSE=1) logs the request
+                         line, push payload size, and response code.
                          Pushes are versioned server-side. A synced profile is
                          a persona, not a login: account material (the identity
                          file, tokens, codex/gemini auth, .env) and ephemeral

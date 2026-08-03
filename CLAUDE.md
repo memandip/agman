@@ -65,6 +65,14 @@ Given `MAJOR.MINOR.PATCH`:
 Pre-1.0.0 (current): the API is not yet stable, but keep the same discipline — breaking
 changes bump MINOR, fixes bump PATCH.
 
+Concrete examples — "small diff" does not mean "third digit":
+
+- A new flag, env var, or output mode (e.g. `agman cloud --verbose`) is new
+  functionality → **MINOR** (0.9.0 → 0.10.0), however small the change.
+- Bug fixes and doc corrections → **PATCH** (0.9.0 → 0.9.1).
+- A feature landing on a branch whose bumped `AGMAN_VERSION` has not been
+  released yet needs no further bump — it ships inside that release.
+
 ### Cutting a release
 
 1. Update `AGMAN_VERSION` in [bin/agman](bin/agman) to the new version (without the `v`).
