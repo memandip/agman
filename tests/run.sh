@@ -1047,6 +1047,15 @@ assert_contains "push carries installed-plugin references" "$listing" "plugins/i
 assert_contains "push carries marketplace references" "$listing" "plugins/known_marketplaces.json"
 assert_contains "push surfaces server-omitted plugin files" "$out" "3 reinstallable plugin file"
 
+# verbose mode: request line + payload size on stderr, quiet by default
+vout="$(cloud_run cloud --verbose push personal 2>&1)"
+assert_contains "verbose push logs the request" "$vout" "PUT http://cloud.test/api/profiles/personal/archive"
+assert_contains "verbose push logs the payload size" "$vout" "bytes"
+assert_contains "verbose push logs the response code" "$vout" "HTTP 201"
+assert_lacks "default push stays quiet" "$out" "PUT http"
+vout="$(AGMAN_VERBOSE=1 cloud_run cloud list 2>&1)"
+assert_contains "AGMAN_VERBOSE=1 enables verbose too" "$vout" "GET http://cloud.test/api/profiles"
+
 # content scan: a secret pasted into an otherwise-syncable file blocks the push
 mkdir -p "$AGMAN_HOME/leaky/claude"
 printf 'CLAUDE\n' > "$AGMAN_HOME/leaky/claude/CLAUDE.md"
