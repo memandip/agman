@@ -21,6 +21,8 @@ printf '{}\n' > "$HOME/.claude/settings.json"
 printf 'ephemeral\n' > "$HOME/.claude/sessions/s1.jsonl"
 printf 'a skill\n' > "$HOME/.claude/skills/foo.md"
 printf 'plugin data\n' > "$HOME/.claude/plugins/p.json"
+mkdir -p "$HOME/.claude/tmp"
+printf 'scratch\n' > "$HOME/.claude/tmp/scratch.txt"
 
 # Realistic identity state: the keys Claude Code checks for onboarding/auth,
 # plus noise that a clean seed must leave behind.
@@ -133,6 +135,7 @@ assert_exists  "seeded settings.json" "$AGMAN_HOME/work/claude/settings.json"
 assert_exists  "seeded skills" "$AGMAN_HOME/work/claude/skills/foo.md"
 assert_exists  "seeded identity file as claude.json" "$AGMAN_HOME/work/claude.json"
 assert_missing "sessions excluded from seed" "$AGMAN_HOME/work/claude/sessions"
+assert_missing "tmp excluded from seed" "$AGMAN_HOME/work/claude/tmp"
 assert_missing "credentials never copied into a profile (would go stale)" "$AGMAN_HOME/work/claude/.credentials.json"
 assert_fail "duplicate create rejected" "$AGM" create work
 
@@ -965,6 +968,8 @@ printf 'shadow\n' > "$TMP/cloudfix/claude/history.jsonl"
 printf '{}\n' > "$TMP/cloudfix/claude/plugins/marketplaces/mkt/marketplace.json"
 printf '{"mkt":{"source":{"source":"github","repo":"acme/mkt"}}}\n' > "$TMP/cloudfix/claude/plugins/known_marketplaces.json"
 printf '{"catalog":true}\n' > "$TMP/cloudfix/claude/plugins/plugin-catalog-cache.json"
+mkdir -p "$TMP/cloudfix/gemini/antigravity"
+printf 'foreign product state\n' > "$TMP/cloudfix/gemini/antigravity/state.db"
 (cd "$TMP/cloudfix" && COPYFILE_DISABLE=1 tar -czf "$TMP/cloud-archive.tar.gz" .)
 
 cloud_run() {
@@ -1073,6 +1078,52 @@ assert_contains "explicit secrets push carries codex auth" "$listing" "codex/aut
 assert_contains "explicit secrets push carries the identity file" "$listing" "claude.json"
 assert_fail "push of an unknown profile fails" cloud_run cloud push nosuchprofile
 
+# ephemeral tool state and foreign products that squat in the managed trees
+# (Antigravity inside ~/.gemini, codex .tmp plugin clones, codex log/) stay
+# local, along with machine-local identity files that mean nothing elsewhere
+mkdir -p "$AGMAN_HOME/personal/gemini/antigravity-browser-profile/Default/Cache" \
+  "$AGMAN_HOME/personal/gemini/antigravity/brain" \
+  "$AGMAN_HOME/personal/gemini/tmp/project-hash" \
+  "$AGMAN_HOME/personal/gemini/history/proj" \
+  "$AGMAN_HOME/personal/codex/.tmp/plugins" \
+  "$AGMAN_HOME/personal/codex/log"
+printf 'browser cache\n' > "$AGMAN_HOME/personal/gemini/antigravity-browser-profile/Default/Cache/data_0"
+printf 'recording\n'    > "$AGMAN_HOME/personal/gemini/antigravity/brain/shot.webp"
+printf 'scratch\n'      > "$AGMAN_HOME/personal/gemini/tmp/project-hash/chat.json"
+printf 'hist\n'         > "$AGMAN_HOME/personal/gemini/history/proj/.project_root"
+printf 'plugin clone\n' > "$AGMAN_HOME/personal/codex/.tmp/plugins/README.md"
+printf 'log line\n'     > "$AGMAN_HOME/personal/codex/log/codex-tui.log"
+printf 'machine-id\n'   > "$AGMAN_HOME/personal/gemini/installation_id"
+printf '{}\n'           > "$AGMAN_HOME/personal/gemini/trustedFolders.json"
+printf 'done\n'         > "$AGMAN_HOME/personal/codex/.personality_migration"
+assert_ok "push with ephemeral junk planted succeeds" cloud_run cloud push personal
+listing="$(tar -tzf "$TMP/cloudlog/pushed.tar.gz")"
+assert_lacks "push withholds antigravity state" "$listing" "antigravity"
+assert_lacks "push withholds gemini tmp" "$listing" "gemini/tmp"
+assert_lacks "push withholds gemini history" "$listing" "gemini/history"
+assert_lacks "push withholds codex plugin clones (.tmp)" "$listing" "codex/.tmp"
+assert_lacks "push withholds codex logs (log/)" "$listing" "codex/log"
+assert_lacks "push withholds the gemini installation id" "$listing" "installation_id"
+assert_lacks "push withholds machine-local folder trust" "$listing" "trustedFolders.json"
+assert_lacks "push withholds the codex personality marker" "$listing" ".personality_migration"
+
+# --dry-run: list what a push would carry without contacting the server
+: > "$TMP/cloudlog/log"
+out="$(cloud_run cloud push personal --dry-run 2>&1)" \
+  && ok "cloud push --dry-run succeeds" || bad "cloud push --dry-run succeeds ($out)"
+assert_contains "dry-run reports the file count" "$out" "file(s)"
+assert_contains "dry-run lists the files it would push" "$out" "claude/CLAUDE.md"
+assert_lacks "dry-run lists no excluded junk" "$out" "antigravity"
+assert_eq "dry-run makes no network request" "0" "$(wc -l < "$TMP/cloudlog/log" | tr -d ' ')"
+
+# preflight: an oversized payload is refused before any bytes leave the machine
+: > "$TMP/cloudlog/log"
+out="$(AGMAN_CLOUD_MAX_PUSH_BYTES=10 cloud_run cloud push personal 2>&1 || true)"
+assert_contains "oversized push is refused client-side" "$out" "server limit"
+assert_contains "oversized refusal names the largest files" "$out" "claude/CLAUDE.md"
+assert_contains "oversized refusal points at --dry-run" "$out" "--dry-run"
+assert_lacks "oversized push never reaches the server" "$(cat "$TMP/cloudlog/log" 2>/dev/null)" "PUT"
+
 # pull: new local profile, with account material and state stripped/sanitized
 assert_ok "cloud pull creates a new profile" cloud_run cloud pull work --as pulled
 assert_eq "pulled config content" "CLOUD RULES" "$(cat "$AGMAN_HOME/pulled/claude/CLAUDE.md")"
@@ -1082,6 +1133,7 @@ assert_missing "pull strips credential files" "$AGMAN_HOME/pulled/claude/.creden
 assert_missing "pull strips the identity file" "$AGMAN_HOME/pulled/claude.json"
 assert_missing "pull strips gemini/.env" "$AGMAN_HOME/pulled/gemini/.env"
 assert_missing "pull drops shared-state shadows" "$AGMAN_HOME/pulled/claude/history.jsonl"
+assert_missing "pull strips foreign-product state (antigravity)" "$AGMAN_HOME/pulled/gemini/antigravity"
 assert_lacks "pull sanitizes hooks from settings.json" "$(cat "$AGMAN_HOME/pulled/claude/settings.json")" "hooks"
 assert_lacks "pull sanitizes apiKeyHelper from settings.json" "$(cat "$AGMAN_HOME/pulled/claude/settings.json")" "apiKeyHelper"
 assert_contains "pulled profile appears in list" "$("$AGM" list)" "pulled"
@@ -1144,11 +1196,13 @@ assert_fail "init refuses an existing profile name" cloud_run cloud init acme
 assert_fail "unknown cloud subcommand fails" cloud_run cloud frobnicate
 assert_ok "cloud logout removes credentials" cloud_run cloud logout
 assert_missing "cloud credentials gone after logout" "$AGMAN_HOME/.cloud"
+assert_ok "push --dry-run needs no login" cloud_run cloud push personal --dry-run
 
 # --- misc ------------------------------------------------------------------------------------------
 
 assert_ok "help runs" "$AGM" help
 assert_contains "help documents the supported tools" "$("$AGM" help)" "Gemini CLI"
+assert_contains "help documents push --dry-run" "$("$AGM" help)" "--dry-run"
 assert_contains "version prints" "$("$AGM" version)" "agman"
 assert_fail "unknown command fails" "$AGM" frobnicate
 assert_ok "remove an inactive profile with --yes" "$AGM" remove staging --yes

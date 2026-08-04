@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.10.0"
+AGMAN_VERSION="0.11.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -85,8 +85,11 @@ ADAPTER_LINKS=(
 ADAPTER_ENVVARS=(CLAUDE_CONFIG_DIR CODEX_HOME -)
 
 # Ephemeral or machine-local state that should not be cloned into a profile.
-SEED_EXCLUDES=(backups cache downloads file-history ide locks logs paste-cache
-  projects session-env sessions shell-snapshots statsig tasks telemetry todos
+# Includes state other products drop into the managed trees (Antigravity keeps
+# a full browser profile and recordings inside ~/.gemini).
+SEED_EXCLUDES=(antigravity antigravity-browser-profile backups cache downloads
+  file-history history ide locks log logs paste-cache projects session-env
+  sessions shell-snapshots statsig tasks telemetry tmp .tmp todos
   history.jsonl mcp-needs-auth-cache.json .last-cleanup .DS_Store
   .credentials.json .agman-token agman-apikey.sh)
 
@@ -1813,8 +1816,10 @@ AGMAN_SNIPPET
 # Ephemeral / machine-local names never synced in either direction. Built from
 # SEED_EXCLUDES (the vetted "don't clone this between profiles" set) minus the
 # credential names, which are handled separately so --include-secrets can opt
-# them back in.
-CLOUD_STATE_NAMES="backups cache downloads file-history ide locks logs paste-cache projects session-env sessions shell-snapshots statsig tasks telemetry todos history.jsonl mcp-needs-auth-cache.json .last-cleanup .DS_Store"
+# them back in, plus machine-local identity files that mean nothing on another
+# machine (gemini installation_id / trustedFolders.json, the codex
+# personality-migration marker) but are fine to clone locally.
+CLOUD_STATE_NAMES="antigravity antigravity-browser-profile backups cache downloads file-history history ide locks log logs paste-cache projects session-env sessions shell-snapshots statsig tasks telemetry tmp .tmp todos history.jsonl mcp-needs-auth-cache.json .last-cleanup .DS_Store installation_id trustedFolders.json .personality_migration"
 # Account material: excluded by default, opt-in via --include-secrets/--with-secrets.
 CLOUD_SECRET_NAMES=".credentials.json $TOKEN_BASENAME $HELPER_BASENAME auth.json oauth_creds.json google_accounts.json .env claude.json $IDENTITY_LINK"
 # Content patterns that mark an obvious secret pasted into an otherwise
@@ -1828,6 +1833,10 @@ CLOUD_SECRET_RE='-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-ant-[A-Za-z0-9_-]{16,}|sk
 # (cloud_install_plugins). Mirrors the agman-cloud server's own filter and
 # the reference client's tar excludes; keep the three in sync.
 CLOUD_PLUGIN_ARTIFACT_RE='(^|/)plugins/(cache|marketplaces|repos|data)(/|$)|(^|/)plugins/plugin-catalog-cache\.json$'
+# The agman-cloud server rejects archives over 25 MB; checking client-side
+# before the PUT turns an opaque HTTP failure into a diagnosis. Override with
+# AGMAN_CLOUD_MAX_PUSH_BYTES when a server accepts more.
+CLOUD_MAX_PUSH_BYTES_DEFAULT=26214400
 
 cloud_require_curl() {
   command -v curl >/dev/null 2>&1 || die "curl is required for cloud sync"
@@ -1920,6 +1929,19 @@ cloud_push_files() {
   [ "$keep_secrets" = "1" ] || names="$names $CLOUD_SECRET_NAMES"
   re="$(cloud_name_re "$names")"
   ( cd "$dir" && find . -type f | grep -Ev "$re" | grep -Ev "$CLOUD_PLUGIN_ARTIFACT_RE" ) || true
+}
+
+# Whole MB with one decimal place, integer arithmetic only (no bc/awk).
+cloud_mb() { printf '%d.%d' "$(($1 / 1048576))" "$((($1 % 1048576) * 10 / 1048576))"; }
+
+# "<bytes> <path>" per file in $list (relative to $dir), largest first — the
+# diagnostic listing behind push --dry-run and the oversize refusal.
+cloud_sized_listing() {
+  local dir="$1" list="$2" f
+  ( cd "$dir" && printf '%s\n' "$list" | while IFS= read -r f; do
+      [ -n "$f" ] && [ -f "$f" ] || continue
+      printf '%s %s\n' "$(wc -c < "$f" | tr -d ' ')" "${f#./}"
+    done ) | sort -rn
 }
 
 # Print files (relative to $dir) from $list whose content matches an obvious
@@ -2132,11 +2154,12 @@ except Exception:
 }
 
 cloud_push() {
-  local name="" include_secrets=0 force=0 arg
+  local name="" include_secrets=0 force=0 dry_run=0 arg
   for arg in ${1+"$@"}; do
     case "$arg" in
       --include-secrets) include_secrets=1 ;;
       --force) force=1 ;;
+      --dry-run) dry_run=1 ;;
       -*) usage_die "unknown option '$arg' for cloud push" ;;
       *)
         [ -z "$name" ] || usage_die "cloud push takes at most one profile name"
@@ -2148,13 +2171,29 @@ cloud_push() {
     [ -n "$name" ] || usage_die "no active profile; run 'agman cloud push <name>'"
   fi
   require_profile "$name"
-  cloud_load
-  cloud_require_curl
 
-  local dir files hits body resp code msg version
+  local dir files hits body resp code msg version size max
   dir="$(profile_dir "$name")"
   files="$(cloud_push_files "$dir" "$include_secrets")"
   [ -n "$files" ] || die "profile '$name' has no syncable files to push"
+  max="${AGMAN_CLOUD_MAX_PUSH_BYTES:-$CLOUD_MAX_PUSH_BYTES_DEFAULT}"
+
+  # Nothing leaves the machine on a dry run, so no login is needed either.
+  if [ "$dry_run" = "1" ]; then
+    local sizes total=0 count=0 sz _rest
+    sizes="$(mktemp)"; cloud_track "$sizes"
+    cloud_sized_listing "$dir" "$files" > "$sizes"
+    while read -r sz _rest; do
+      total=$((total + sz)); count=$((count + 1))
+    done < "$sizes"
+    printf "Would push profile '%s': %s file(s), %s bytes (%s MB) uncompressed. Server limit: %s bytes (%s MB) compressed.\n" \
+      "$name" "$count" "$total" "$(cloud_mb "$total")" "$max" "$(cloud_mb "$max")"
+    sed 's/^/  /' "$sizes"
+    return 0
+  fi
+
+  cloud_load
+  cloud_require_curl
 
   if [ "$include_secrets" = "1" ]; then
     warn "including account material in this push (--include-secrets):"
@@ -2175,7 +2214,17 @@ cloud_push() {
     die "could not archive profile '$name'"
   fi
   [ -s "$body" ] || die "profile '$name' produced an empty archive"
-  cloud_log "archive: $(printf '%s\n' "$files" | grep -c .) file(s), $(wc -c < "$body" | tr -d ' ') bytes"
+  size="$(wc -c < "$body" | tr -d ' ')"
+  cloud_log "archive: $(printf '%s\n' "$files" | grep -c .) file(s), $size bytes"
+
+  # The server would reject an oversized payload anyway; refusing before the
+  # PUT and naming the heaviest files makes the fix obvious.
+  if [ "$size" -gt "$max" ]; then
+    printf "agman: refusing to push '%s': the compressed payload is %s bytes (%s MB), over the server limit of %s bytes (%s MB). Largest files:\n" \
+      "$name" "$size" "$(cloud_mb "$size")" "$max" "$(cloud_mb "$max")" >&2
+    cloud_sized_listing "$dir" "$files" | head -10 | sed 's/^/    /' >&2
+    die "trim the profile ('agman cloud push $name --dry-run' lists everything a push would carry), or set AGMAN_CLOUD_MAX_PUSH_BYTES if your server accepts more"
+  fi
 
   code="$(cloud_http PUT "/api/profiles/$name/archive" "$resp" \
     -H 'Content-Type: application/gzip' --data-binary "@$body")"
@@ -2334,7 +2383,7 @@ Commands:
   logout <name>          Drop that account; back to your shared login
   cloud <subcommand>     Sync profiles with an agman cloud server:
                            login [--url <url>] [--key-stdin]
-                           push [name] [--include-secrets] [--force]
+                           push [name] [--include-secrets] [--force] [--dry-run]
                            pull <name> [--as <local>] [--force] [--with-secrets]
                            init <org-slug> [name] [--with-secrets]
                            list | status | logout
@@ -2344,7 +2393,11 @@ Commands:
                          a persona, not a login: account material (the identity
                          file, tokens, codex/gemini auth, .env) and ephemeral
                          state stay local, and a push is refused if a file looks
-                         like it holds a secret. --include-secrets (push) /
+                         like it holds a secret. push --dry-run lists what a
+                         push would carry; a payload over the server limit is
+                         refused before upload with the largest files named
+                         (AGMAN_CLOUD_MAX_PUSH_BYTES overrides the 25 MB
+                         default). --include-secrets (push) /
                          --with-secrets (pull) opt into carrying account material
                          for your own machine-to-machine restore. Pulls strip
                          hooks/apiKeyHelper from an untrusted settings.json, back
