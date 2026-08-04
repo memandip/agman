@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.11.1"
+AGMAN_VERSION="0.12.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -1848,9 +1848,11 @@ CLOUD_PLUGIN_ARTIFACT_RE='(^|/)plugins/(cache|marketplaces|repos|data)(/|$)|(^|/
 # transcripts and history, never synced in either direction. A suffix can't be
 # expressed in the component-name lists above, hence the regex.
 CLOUD_LEFTOVER_RE='(^|/)[^/]+\.agman-(conflict|orphaned)(/|$)'
-# The agman-cloud server rejects archives over 25 MB; checking client-side
-# before the PUT turns an opaque HTTP failure into a diagnosis. Override with
-# AGMAN_CLOUD_MAX_PUSH_BYTES when a server accepts more.
+# Fallback cap on a compressed push payload, used when the server does not
+# advertise its own (maxPushBytes in GET /api/profiles; older agman-cloud
+# releases don't send it). Checking client-side before the PUT turns an
+# opaque HTTP failure into a diagnosis. AGMAN_CLOUD_MAX_PUSH_BYTES overrides
+# both this default and an advertised limit.
 CLOUD_MAX_PUSH_BYTES_DEFAULT=26214400
 
 cloud_require_curl() {
@@ -1929,6 +1931,7 @@ cloud_die_http() {
   case "$code" in
     000) die "cloud: cannot reach $cloud_url" ;;
     401) die "cloud: API key rejected; run 'agman cloud login' again" ;;
+    413) die "cloud: the server rejected the payload as too large${msg:+: $msg}. Without a server message, its hosting platform refused the request before the app ran. Run 'agman cloud push --dry-run' to see what a push carries, and trim the profile" ;;
     *)   die "cloud: HTTP $code${msg:+: $msg}" ;;
   esac
 }
@@ -2212,6 +2215,22 @@ cloud_push() {
   cloud_load
   cloud_require_curl
 
+  # A deployment's platform may cap payloads below the app's own limit
+  # (Vercel functions cut off just under 4.5 MB), so ask the server what it
+  # actually accepts. Explicit AGMAN_CLOUD_MAX_PUSH_BYTES always wins; an
+  # older server that advertises nothing keeps the default.
+  local advertised
+  if [ -z "${AGMAN_CLOUD_MAX_PUSH_BYTES:-}" ]; then
+    resp="$(mktemp)"; cloud_track "$resp"
+    if [ "$(cloud_http GET "/api/profiles" "$resp")" = "200" ]; then
+      advertised="$(sed -n 's/.*"maxPushBytes":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$resp" | head -1)"
+      if [ -n "$advertised" ]; then
+        max="$advertised"
+        cloud_log "server max push size: $advertised bytes"
+      fi
+    fi
+  fi
+
   if [ "$include_secrets" = "1" ]; then
     warn "including account material in this push (--include-secrets):"
     printf '%s\n' "$files" | grep -E "$(cloud_name_re "$CLOUD_SECRET_NAMES")" | sed 's/^/    /' >&2 || true
@@ -2412,9 +2431,10 @@ Commands:
                          state stay local, and a push is refused if a file looks
                          like it holds a secret. push --dry-run lists what a
                          push would carry; a payload over the server limit is
-                         refused before upload with the largest files named
-                         (AGMAN_CLOUD_MAX_PUSH_BYTES overrides the 25 MB
-                         default). --include-secrets (push) /
+                         refused before upload with the largest files named.
+                         The limit comes from the server when it advertises
+                         one (AGMAN_CLOUD_MAX_PUSH_BYTES overrides).
+                         --include-secrets (push) /
                          --with-secrets (pull) opt into carrying account material
                          for your own machine-to-machine restore. Pulls strip
                          hooks/apiKeyHelper from an untrusted settings.json, back
