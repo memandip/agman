@@ -23,6 +23,10 @@ printf 'a skill\n' > "$HOME/.claude/skills/foo.md"
 printf 'plugin data\n' > "$HOME/.claude/plugins/p.json"
 mkdir -p "$HOME/.claude/tmp"
 printf 'scratch\n' > "$HOME/.claude/tmp/scratch.txt"
+mkdir -p "$HOME/.claude/projects.agman-conflict/old" "$HOME/.claude/mcp-servers/srv/.venv/bin"
+printf 'transcript\n' > "$HOME/.claude/projects.agman-conflict/old/t.jsonl"
+printf 'venv binary\n' > "$HOME/.claude/mcp-servers/srv/.venv/bin/tool"
+printf 'code\n' > "$HOME/.claude/mcp-servers/srv/server.py"
 
 # Realistic identity state: the keys Claude Code checks for onboarding/auth,
 # plus noise that a clean seed must leave behind.
@@ -136,6 +140,8 @@ assert_exists  "seeded skills" "$AGMAN_HOME/work/claude/skills/foo.md"
 assert_exists  "seeded identity file as claude.json" "$AGMAN_HOME/work/claude.json"
 assert_missing "sessions excluded from seed" "$AGMAN_HOME/work/claude/sessions"
 assert_missing "tmp excluded from seed" "$AGMAN_HOME/work/claude/tmp"
+assert_missing "merge leftovers excluded from seed" "$AGMAN_HOME/work/claude/projects.agman-conflict"
+assert_exists  "mcp server venvs still seed (cloud-only exclusion)" "$AGMAN_HOME/work/claude/mcp-servers/srv/.venv/bin/tool"
 assert_missing "credentials never copied into a profile (would go stale)" "$AGMAN_HOME/work/claude/.credentials.json"
 assert_fail "duplicate create rejected" "$AGM" create work
 
@@ -970,6 +976,10 @@ printf '{"mkt":{"source":{"source":"github","repo":"acme/mkt"}}}\n' > "$TMP/clou
 printf '{"catalog":true}\n' > "$TMP/cloudfix/claude/plugins/plugin-catalog-cache.json"
 mkdir -p "$TMP/cloudfix/gemini/antigravity"
 printf 'foreign product state\n' > "$TMP/cloudfix/gemini/antigravity/state.db"
+mkdir -p "$TMP/cloudfix/claude/mcp-servers/srv/.venv/bin" "$TMP/cloudfix/claude/projects.agman-conflict"
+printf 'venv binary\n' > "$TMP/cloudfix/claude/mcp-servers/srv/.venv/bin/ruff"
+printf 'code\n' > "$TMP/cloudfix/claude/mcp-servers/srv/server.py"
+printf 'transcript\n' > "$TMP/cloudfix/claude/projects.agman-conflict/t.jsonl"
 (cd "$TMP/cloudfix" && COPYFILE_DISABLE=1 tar -czf "$TMP/cloud-archive.tar.gz" .)
 
 cloud_run() {
@@ -1107,6 +1117,33 @@ assert_lacks "push withholds the gemini installation id" "$listing" "installatio
 assert_lacks "push withholds machine-local folder trust" "$listing" "trustedFolders.json"
 assert_lacks "push withholds the codex personality marker" "$listing" ".personality_migration"
 
+# reinstallable dependency artifacts (virtualenvs, node_modules, bytecode
+# caches, .git of a cloned server) and agman's own shared-state merge
+# leftovers stay local; the sources next to them still sync
+mkdir -p "$AGMAN_HOME/personal/claude/mcp-servers/srv/.venv/bin" \
+  "$AGMAN_HOME/personal/claude/mcp-servers/srv/.git/objects" \
+  "$AGMAN_HOME/personal/claude/mcp-servers/srv/node_modules/dep" \
+  "$AGMAN_HOME/personal/claude/mcp-servers/srv/__pycache__" \
+  "$AGMAN_HOME/personal/claude/mcp-servers/srv2/venv/bin" \
+  "$AGMAN_HOME/personal/claude/projects.agman-conflict/proj"
+printf 'venv binary\n' > "$AGMAN_HOME/personal/claude/mcp-servers/srv/.venv/bin/ruff"
+printf 'pack\n'        > "$AGMAN_HOME/personal/claude/mcp-servers/srv/.git/objects/p.pack"
+printf 'dep\n'         > "$AGMAN_HOME/personal/claude/mcp-servers/srv/node_modules/dep/index.js"
+printf 'pyc\n'         > "$AGMAN_HOME/personal/claude/mcp-servers/srv/__pycache__/m.pyc"
+printf 'venv binary\n' > "$AGMAN_HOME/personal/claude/mcp-servers/srv2/venv/bin/tool"
+printf 'code\n'        > "$AGMAN_HOME/personal/claude/mcp-servers/srv/server.py"
+printf 'transcript\n'  > "$AGMAN_HOME/personal/claude/projects.agman-conflict/proj/t.jsonl"
+printf 'orphan\n'      > "$AGMAN_HOME/personal/claude/history.jsonl.agman-orphaned"
+assert_ok "push with dependency artifacts planted succeeds" cloud_run cloud push personal
+listing="$(tar -tzf "$TMP/cloudlog/pushed.tar.gz")"
+assert_contains "push keeps mcp server sources" "$listing" "mcp-servers/srv/server.py"
+assert_lacks "push withholds virtualenvs (venv, .venv)" "$listing" "venv"
+assert_lacks "push withholds git dirs (.git)" "$listing" ".git"
+assert_lacks "push withholds node_modules" "$listing" "node_modules"
+assert_lacks "push withholds bytecode caches (__pycache__)" "$listing" "__pycache__"
+assert_lacks "push withholds merge-conflict leftovers" "$listing" "agman-conflict"
+assert_lacks "push withholds orphaned-state leftovers" "$listing" "agman-orphaned"
+
 # --dry-run: list what a push would carry without contacting the server
 : > "$TMP/cloudlog/log"
 out="$(cloud_run cloud push personal --dry-run 2>&1)" \
@@ -1134,6 +1171,9 @@ assert_missing "pull strips the identity file" "$AGMAN_HOME/pulled/claude.json"
 assert_missing "pull strips gemini/.env" "$AGMAN_HOME/pulled/gemini/.env"
 assert_missing "pull drops shared-state shadows" "$AGMAN_HOME/pulled/claude/history.jsonl"
 assert_missing "pull strips foreign-product state (antigravity)" "$AGMAN_HOME/pulled/gemini/antigravity"
+assert_missing "pull strips virtualenvs" "$AGMAN_HOME/pulled/claude/mcp-servers/srv/.venv"
+assert_exists  "pull keeps mcp server sources" "$AGMAN_HOME/pulled/claude/mcp-servers/srv/server.py"
+assert_missing "pull strips merge leftovers" "$AGMAN_HOME/pulled/claude/projects.agman-conflict"
 assert_lacks "pull sanitizes hooks from settings.json" "$(cat "$AGMAN_HOME/pulled/claude/settings.json")" "hooks"
 assert_lacks "pull sanitizes apiKeyHelper from settings.json" "$(cat "$AGMAN_HOME/pulled/claude/settings.json")" "apiKeyHelper"
 assert_contains "pulled profile appears in list" "$("$AGM" list)" "pulled"
