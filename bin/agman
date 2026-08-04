@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.11.0"
+AGMAN_VERSION="0.11.1"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -339,6 +339,9 @@ active_tools() {
 
 is_seed_excluded() {
   local base="$1" x
+  # Shared-state merge leftovers are per-machine copies of state; cloning them
+  # would duplicate junk into every new profile.
+  case "$base" in *.agman-conflict|*.agman-orphaned) return 0 ;; esac
   for x in "${SEED_EXCLUDES[@]}"; do
     if [ "$base" = "$x" ]; then return 0; fi
   done
@@ -1801,7 +1804,10 @@ AGMAN_SNIPPET
 #   - Reinstallable plugin artifacts (plugin caches, marketplace clones,
 #     catalog data) are never synced; their references are, and pull
 #     reinstalls them into the pulled tree via the claude CLI
-#     (AGMAN_CLOUD_NO_INSTALL=1 skips the reinstall).
+#     (AGMAN_CLOUD_NO_INSTALL=1 skips the reinstall). Dependency artifacts
+#     (.venv/venv, node_modules, __pycache__, .git) are likewise never synced:
+#     sources next to them are, and the artifacts are rebuilt on the target
+#     machine (pip install / npm install / git clone).
 #   - Push refuses when a synced file contains an obvious secret (API keys,
 #     private keys) unless --force / --include-secrets — a blocklist can't see
 #     a token pasted into settings.json, so content is scanned too.
@@ -1818,8 +1824,12 @@ AGMAN_SNIPPET
 # credential names, which are handled separately so --include-secrets can opt
 # them back in, plus machine-local identity files that mean nothing on another
 # machine (gemini installation_id / trustedFolders.json, the codex
-# personality-migration marker) but are fine to clone locally.
-CLOUD_STATE_NAMES="antigravity antigravity-browser-profile backups cache downloads file-history history ide locks log logs paste-cache projects session-env sessions shell-snapshots statsig tasks telemetry tmp .tmp todos history.jsonl mcp-needs-auth-cache.json .last-cleanup .DS_Store installation_id trustedFolders.json .personality_migration"
+# personality-migration marker) but are fine to clone locally, plus
+# reinstallable dependency artifacts (virtualenvs, node_modules, bytecode
+# caches, the .git of a cloned MCP server). Those artifacts are cloud-only
+# exclusions: local clones keep them because the active profile is always
+# symlinked at the tool's real config path, so copied venvs still run.
+CLOUD_STATE_NAMES="antigravity antigravity-browser-profile backups cache downloads file-history history ide locks log logs paste-cache projects session-env sessions shell-snapshots statsig tasks telemetry tmp .tmp todos history.jsonl mcp-needs-auth-cache.json .last-cleanup .DS_Store installation_id trustedFolders.json .personality_migration .git .venv venv node_modules __pycache__"
 # Account material: excluded by default, opt-in via --include-secrets/--with-secrets.
 CLOUD_SECRET_NAMES=".credentials.json $TOKEN_BASENAME $HELPER_BASENAME auth.json oauth_creds.json google_accounts.json .env claude.json $IDENTITY_LINK"
 # Content patterns that mark an obvious secret pasted into an otherwise
@@ -1833,6 +1843,11 @@ CLOUD_SECRET_RE='-----BEGIN [A-Z ]*PRIVATE KEY-----|sk-ant-[A-Za-z0-9_-]{16,}|sk
 # (cloud_install_plugins). Mirrors the agman-cloud server's own filter and
 # the reference client's tar excludes; keep the three in sync.
 CLOUD_PLUGIN_ARTIFACT_RE='(^|/)plugins/(cache|marketplaces|repos|data)(/|$)|(^|/)plugins/plugin-catalog-cache\.json$'
+# agman's own shared-state merge leftovers (adopt_shared_state parks colliding
+# copies as <name>.agman-conflict / <name>.agman-orphaned): machine-local
+# transcripts and history, never synced in either direction. A suffix can't be
+# expressed in the component-name lists above, hence the regex.
+CLOUD_LEFTOVER_RE='(^|/)[^/]+\.agman-(conflict|orphaned)(/|$)'
 # The agman-cloud server rejects archives over 25 MB; checking client-side
 # before the PUT turns an opaque HTTP failure into a diagnosis. Override with
 # AGMAN_CLOUD_MAX_PUSH_BYTES when a server accepts more.
@@ -1928,7 +1943,8 @@ cloud_push_files() {
   names="$CLOUD_STATE_NAMES"
   [ "$keep_secrets" = "1" ] || names="$names $CLOUD_SECRET_NAMES"
   re="$(cloud_name_re "$names")"
-  ( cd "$dir" && find . -type f | grep -Ev "$re" | grep -Ev "$CLOUD_PLUGIN_ARTIFACT_RE" ) || true
+  ( cd "$dir" && find . -type f | grep -Ev "$re" | grep -Ev "$CLOUD_PLUGIN_ARTIFACT_RE" \
+    | grep -Ev "$CLOUD_LEFTOVER_RE" ) || true
 }
 
 # Whole MB with one decimal place, integer arithmetic only (no bc/awk).
@@ -1977,7 +1993,8 @@ cloud_install_archive() {
   names="$CLOUD_STATE_NAMES"
   [ "$keep_secrets" = "1" ] || names="$names $CLOUD_SECRET_NAMES"
   re="$(cloud_name_re "$names")"
-  keep="$( ( cd "$staging" && find . -type f | grep -Ev "$re" | grep -Ev "$CLOUD_PLUGIN_ARTIFACT_RE" ) || true )"
+  keep="$( ( cd "$staging" && find . -type f | grep -Ev "$re" | grep -Ev "$CLOUD_PLUGIN_ARTIFACT_RE" \
+    | grep -Ev "$CLOUD_LEFTOVER_RE" ) || true )"
 
   if [ -d "$dir" ]; then
     stamp="$(date +%Y%m%d%H%M%S 2>/dev/null || printf 'backup')"
