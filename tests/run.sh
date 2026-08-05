@@ -930,14 +930,23 @@ case "$url" in
     elif [ -n "${AGMAN_CURL_LIST_REORDER:-}" ]; then
       # keys reordered + spaced, and a nested object sharing the "name" key
       printf '{ "profiles": [ { "latestVersion": 3, "owner": {"name":"someone"}, "name": "work" } ] }' > "$out"
-    else
+    elif [ -n "${AGMAN_CURL_NO_LIMIT:-}" ]; then
+      # an older server that does not advertise maxPushBytes
       printf '{"profiles":[{"id":"p1","name":"work","latestVersion":3,"canPush":true}]}' > "$out"
+    else
+      printf '{"profiles":[{"id":"p1","name":"work","latestVersion":3,"canPush":true}],"maxPushBytes":%s}' \
+        "${AGMAN_CURL_LIMIT:-26214400}" > "$out"
     fi ;;
   */api/profiles/*/archive)
     if [ "$method" = "PUT" ]; then
+      if [ -n "${AGMAN_CURL_413:-}" ]; then
+        # a platform-level rejection: 413 with a non-JSON body
+        code=413; printf 'Request Entity Too Large' > "$out"
+      else
       [ -n "$databin" ] && cp "${databin#@}" "$AGMAN_CURL_PUSHED"
       code=201
       printf '{"profileId":"p1","version":7,"checksum":"abc","warnings":[],"omitted":3}' > "$out"
+      fi
     elif [ -n "${AGMAN_CURL_BADARCHIVE:-}" ]; then
       printf 'this is not a gzip archive' > "$out"
     else
@@ -1160,6 +1169,25 @@ assert_contains "oversized push is refused client-side" "$out" "server limit"
 assert_contains "oversized refusal names the largest files" "$out" "claude/CLAUDE.md"
 assert_contains "oversized refusal points at --dry-run" "$out" "--dry-run"
 assert_lacks "oversized push never reaches the server" "$(cat "$TMP/cloudlog/log" 2>/dev/null)" "PUT"
+
+# the server advertises its own limit (maxPushBytes); the preflight uses it
+# so a platform-capped deployment refuses client-side instead of a bare 413
+: > "$TMP/cloudlog/log"
+out="$(AGMAN_CURL_LIMIT=600 cloud_run cloud push personal 2>&1 || true)"
+assert_contains "push preflights at the server-advertised limit" "$out" "server limit"
+assert_lacks "advertised-limit refusal sends no archive" "$(cat "$TMP/cloudlog/log" 2>/dev/null)" "PUT"
+AGMAN_CURL_LIMIT=600 AGMAN_CLOUD_MAX_PUSH_BYTES=99999999 cloud_run cloud push personal >/dev/null 2>&1 \
+  && ok "AGMAN_CLOUD_MAX_PUSH_BYTES overrides the advertised limit" \
+  || bad "AGMAN_CLOUD_MAX_PUSH_BYTES overrides the advertised limit"
+AGMAN_CURL_NO_LIMIT=1 cloud_run cloud push personal >/dev/null 2>&1 \
+  && ok "an older server without maxPushBytes keeps the default limit" \
+  || bad "an older server without maxPushBytes keeps the default limit"
+
+# a 413 that slips past the preflight (platform edge, no app JSON) gets a
+# diagnosis instead of a bare HTTP code
+out="$(AGMAN_CURL_413=1 cloud_run cloud push personal 2>&1 || true)"
+assert_contains "bare 413 explains the platform rejection" "$out" "hosting platform"
+assert_contains "bare 413 suggests dry-run" "$out" "--dry-run"
 
 # pull: new local profile, with account material and state stripped/sanitized
 assert_ok "cloud pull creates a new profile" cloud_run cloud pull work --as pulled
