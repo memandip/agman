@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.12.0"
+AGMAN_VERSION="0.13.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -2217,18 +2217,26 @@ cloud_push() {
 
   # A deployment's platform may cap payloads below the app's own limit
   # (Vercel functions cut off just under 4.5 MB), so ask the server what it
-  # actually accepts. Explicit AGMAN_CLOUD_MAX_PUSH_BYTES always wins; an
+  # actually accepts: maxPushBytes is the direct-PUT ceiling, blobPushBytes
+  # (when the server offers presigned blob uploads) the overall one. Explicit
+  # AGMAN_CLOUD_MAX_PUSH_BYTES always wins and forces the direct path; an
   # older server that advertises nothing keeps the default.
-  local advertised
+  local advertised blob_max="" direct
   if [ -z "${AGMAN_CLOUD_MAX_PUSH_BYTES:-}" ]; then
     resp="$(mktemp)"; cloud_track "$resp"
     if [ "$(cloud_http GET "/api/profiles" "$resp")" = "200" ]; then
       advertised="$(sed -n 's/.*"maxPushBytes":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$resp" | head -1)"
       if [ -n "$advertised" ]; then
         max="$advertised"
-        cloud_log "server max push size: $advertised bytes"
+        cloud_log "server max direct push size: $advertised bytes"
       fi
+      blob_max="$(sed -n 's/.*"blobPushBytes":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$resp" | head -1)"
     fi
+  fi
+  direct="$max"
+  if [ -n "$blob_max" ] && [ "$blob_max" -gt "$direct" ]; then
+    max="$blob_max"
+    cloud_log "server blob push size: $max bytes"
   fi
 
   if [ "$include_secrets" = "1" ]; then
@@ -2262,8 +2270,34 @@ cloud_push() {
     die "trim the profile ('agman cloud push $name --dry-run' lists everything a push would carry), or set AGMAN_CLOUD_MAX_PUSH_BYTES if your server accepts more"
   fi
 
-  code="$(cloud_http PUT "/api/profiles/$name/archive" "$resp" \
-    -H 'Content-Type: application/gzip' --data-binary "@$body")"
+  if [ "$size" -gt "$direct" ]; then
+    # Too big for a function body: presigned blob upload, then commit. The
+    # bytes go straight to blob storage; only small control requests touch
+    # the server.
+    local upresp upurl uppath upcode
+    cloud_log "archive exceeds the direct limit ($direct bytes); using blob upload"
+    upresp="$(mktemp)"; cloud_track "$upresp"
+    code="$(cloud_http POST "/api/profiles/$name/archive/upload" "$upresp")"
+    [ "$code" = "200" ] || cloud_die_http "$code" "$(cloud_error_from "$upresp")"
+    upurl="$(sed -n 's/.*"uploadUrl":"\([^"]*\)".*/\1/p' "$upresp" | head -1)"
+    uppath="$(sed -n 's/.*"pathname":"\([^"]*\)".*/\1/p' "$upresp" | head -1)"
+    if [ -z "$upurl" ] || [ -z "$uppath" ]; then
+      die "cloud: the server's upload endpoint returned no upload URL"
+    fi
+    # The presigned URL is a foreign host: plain curl, the API key stays home.
+    upcode="$(curl -sS -X PUT --connect-timeout 10 -o /dev/null -w '%{http_code}' \
+      -H 'Content-Type: application/gzip' --data-binary "@$body" "$upurl" 2>/dev/null)" || true
+    cloud_log "blob PUT: HTTP ${upcode:-000}"
+    case "$upcode" in
+      2*) ;;
+      *) die "cloud: uploading the archive to blob storage failed (HTTP ${upcode:-000})" ;;
+    esac
+    code="$(cloud_http POST "/api/profiles/$name/archive/commit" "$resp" \
+      -H 'Content-Type: application/json' --data-binary "{\"pathname\":\"$uppath\"}")"
+  else
+    code="$(cloud_http PUT "/api/profiles/$name/archive" "$resp" \
+      -H 'Content-Type: application/gzip' --data-binary "@$body")"
+  fi
   if [ "$code" != "201" ] && [ "$code" != "200" ]; then
     msg="$(cloud_error_from "$resp")"
     cloud_die_http "$code" "$msg"
@@ -2433,7 +2467,9 @@ Commands:
                          push would carry; a payload over the server limit is
                          refused before upload with the largest files named.
                          The limit comes from the server when it advertises
-                         one (AGMAN_CLOUD_MAX_PUSH_BYTES overrides).
+                         one (AGMAN_CLOUD_MAX_PUSH_BYTES overrides). Archives
+                         too big for a direct request travel via the server's
+                         presigned blob-upload flow automatically.
                          --include-secrets (push) /
                          --with-secrets (pull) opt into carrying account material
                          for your own machine-to-machine restore. Pulls strip
