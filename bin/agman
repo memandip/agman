@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.12.0"
+AGMAN_VERSION="0.12.1"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -956,30 +956,42 @@ ensure_profile_path() {
 # so a tool is never left half-activated: one refused path must not strand the
 # others in the backup profile.
 adapter_can_link() {
-  local idx="$1" pair prof_rel home_rel tgt kind tool="${ADAPTER_NAMES[$1]}"
+  local idx="$1" pair home_rel tgt tool="${ADAPTER_NAMES[$1]}"
   for pair in ${ADAPTER_LINKS[$idx]}; do
-    prof_rel="${pair%%:*}"
     home_rel="${pair#*:}"; home_rel="${home_rel%:*}"
     tgt="$(target_path "$home_rel")"
-    kind="$(target_kind "$tgt")"
-    case "$kind" in
-      foreign)
-        warn "$tool: $tgt is a symlink not managed by agman; leaving this tool alone"
-        return 1 ;;
-      real)
-        if [ -e "$GLOBAL_BACKUP/$prof_rel" ]; then
-          warn "$tool: $tgt is a real path but the global backup already has $prof_rel; leaving this tool alone"
-          return 1
-        fi ;;
-    esac
+    # A real path is always linkable: the first switch backs the original
+    # up, and when the backup already holds it link_one absorbs the stray
+    # copy instead of wedging the tool (see link_one's real case).
+    if [ "$(target_kind "$tgt")" = "foreign" ]; then
+      warn "$tool: $tgt is a symlink not managed by agman; leaving this tool alone"
+      return 1
+    fi
   done
   return 0
 }
 
+# The profile a tool's links currently point at, from whichever of its
+# managed paths is still an agman symlink. Empty when none survives.
+adapter_active_profile() {
+  local idx="$1" pair home_rel t name
+  for pair in ${ADAPTER_LINKS[$idx]}; do
+    home_rel="${pair#*:}"; home_rel="${home_rel%:*}"
+    t="$(target_path "$home_rel")"
+    if [ -L "$t" ] && name="$(profile_name_from_target "$(readlink_once "$t")")"; then
+      printf '%s' "$name"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Point one target path at a profile, backing a real target up into the global
 # profile first. Only call after adapter_can_link has approved the tool.
+# $6 (optional): the profile this tool's links pointed at before the switch —
+# the owner of any stray runtime state found at a managed path.
 link_one() {
-  local dir="$1" prof_rel="$2" home_rel="$3" type="$4" tool="$5"
+  local dir="$1" prof_rel="$2" home_rel="$3" type="$4" tool="$5" owner="${6:-}"
   local src="$dir/$prof_rel" tgt kind
   tgt="$(target_path "$home_rel")"
   kind="$(target_kind "$tgt")"
@@ -990,13 +1002,39 @@ link_one() {
       return 1 ;;
     real)
       local gdest="$GLOBAL_BACKUP/$prof_rel"
-      mkdir -p "$GLOBAL_BACKUP"
       if [ -e "$gdest" ]; then
-        warn "$tool: $tgt is a real path but the global backup already has $prof_rel; leaving it alone"
-        return 1
+        # The original is already backed up, so this real path is later
+        # state, not the original — typically a tool that rewrote a managed
+        # file in place (Claude Code replaces ~/.claude.json wholesale via
+        # temp file + rename, which destroys the symlink). Absorb it rather
+        # than wedging the tool forever: a single file goes to the profile a
+        # sibling link still names (the freshest account state belongs to
+        # it); anything else is kept aside untouched under $BACKUP_DIR. The
+        # pristine global backup is never overwritten.
+        if [ "$type" = "f" ] && [ -n "$owner" ] && [ -d "$(profile_dir "$owner")" ]; then
+          if mv -f "$tgt" "$(profile_dir "$owner")/$prof_rel"; then
+            warn "$tool: $tgt had become a real file (a tool rewrote it in place); moved the freshest copy into profile '$owner' and relinked"
+          else
+            warn "$tool: could not absorb $tgt into profile '$owner'"
+            return 1
+          fi
+        else
+          local stamp stray
+          stamp="$(date +%Y%m%d%H%M%S 2>/dev/null || printf 'stray')"
+          stray="$BACKUP_DIR/$prof_rel-stray-$stamp"
+          mkdir -p "$BACKUP_DIR"
+          if mv "$tgt" "$stray"; then
+            warn "$tool: $tgt was a real path but the original is already backed up; kept this copy at $stray"
+          else
+            warn "$tool: could not move $tgt aside"
+            return 1
+          fi
+        fi
+      else
+        mkdir -p "$GLOBAL_BACKUP"
+        mv "$tgt" "$gdest" || { warn "$tool: could not back up $tgt"; return 1; }
+        printf '%s\n' "$LAYOUT_VERSION" > "$GLOBAL_BACKUP/$LAYOUT_FILE"
       fi
-      mv "$tgt" "$gdest" || { warn "$tool: could not back up $tgt"; return 1; }
-      printf '%s\n' "$LAYOUT_VERSION" > "$GLOBAL_BACKUP/$LAYOUT_FILE"
       ;;
     agman)
       rm -f "$tgt" ;;
@@ -1156,11 +1194,14 @@ cmd_use() {
   while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
     if adapter_in_scope "$i" "$dir"; then
       if adapter_can_link "$i"; then
-        local ok=1
+        local ok=1 owner
+        # Resolved before any relinking: the outgoing profile, which owns any
+        # stray runtime state link_one finds at a managed path.
+        owner="$(adapter_active_profile "$i")" || owner=""
         for pair in ${ADAPTER_LINKS[$i]}; do
           prof_rel="${pair%%:*}"
           home_rel="${pair#*:}"; type="${home_rel##*:}"; home_rel="${home_rel%:*}"
-          link_one "$dir" "$prof_rel" "$home_rel" "$type" "${ADAPTER_NAMES[$i]}" || ok=0
+          link_one "$dir" "$prof_rel" "$home_rel" "$type" "${ADAPTER_NAMES[$i]}" "$owner" || ok=0
         done
         if [ "$ok" = "1" ]; then linked="$linked ${ADAPTER_NAMES[$i]}"
         else skipped="$skipped ${ADAPTER_NAMES[$i]}"; fi
