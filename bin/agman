@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.12.1"
+AGMAN_VERSION="0.12.2"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -66,6 +66,8 @@ AGMAN_RAW_URL="${AGMAN_RAW_URL:-https://raw.githubusercontent.com/memandip/agman
 # Cloud sync credentials (`agman cloud`): url= and key= lines, mode 600.
 # Machine-level, never part of any profile, never printed.
 CLOUD_FILE="$AGMAN_HOME/.cloud"
+# The public agman cloud server; `cloud login` offers it when no URL is given.
+CLOUD_DEFAULT_URL="https://agman.vercel.app"
 
 # --- adapter registry -------------------------------------------------------
 #
@@ -2115,8 +2117,9 @@ cloud_login() {
     shift
   done
   if [ -z "$url" ]; then
-    printf 'Cloud URL (e.g. https://agman-cloud.example.com): '
+    printf 'Cloud URL [%s]: ' "$CLOUD_DEFAULT_URL"
     IFS= read -r url || true
+    [ -n "$url" ] || url="$CLOUD_DEFAULT_URL"
   fi
   url="${url%/}"
   case "$url" in
@@ -2460,6 +2463,7 @@ Commands:
   logout <name>          Drop that account; back to your shared login
   cloud <subcommand>     Sync profiles with an agman cloud server:
                            login [--url <url>] [--key-stdin]
+                             (URL defaults to https://agman.vercel.app)
                            push [name] [--include-secrets] [--force] [--dry-run]
                            pull <name> [--as <local>] [--force] [--with-secrets]
                            init <org-slug> [name] [--with-secrets]
