@@ -1059,6 +1059,16 @@ assert_contains "trailing slash trimmed from url" "$(cat "$AGMAN_HOME/.cloud")" 
 assert_lacks "login output never prints the key" "$out" "test-key-123"
 assert_fail "login rejects a non-http url" cloud_run cloud login --url ftp://x --key-stdin
 
+# an empty URL at the prompt falls back to the public server
+out="$(printf '\ndefault-key-1\n' | cloud_run cloud login --key-stdin 2>&1)" \
+  && ok "login accepts an empty URL and uses the default" \
+  || bad "login accepts an empty URL and uses the default ($out)"
+assert_contains "empty URL stores the default server" "$(cat "$AGMAN_HOME/.cloud")" "url=https://agman.vercel.app"
+assert_contains "help documents the default cloud URL" "$("$AGM" help)" "agman.vercel.app"
+# back to the stubbed test server for everything below
+printf 'test-key-123\n' | cloud_run cloud login --url http://cloud.test --key-stdin >/dev/null 2>&1 \
+  || bad "re-login to the stub server"
+
 assert_contains "cloud status shows the server" "$(cloud_run cloud status)" "http://cloud.test"
 assert_contains "cloud status probes the connection" "$(cloud_run cloud status)" "ok"
 assert_contains "cloud list shows remote profiles" "$(cloud_run cloud list)" "work (v3)"
