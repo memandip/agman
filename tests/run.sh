@@ -942,8 +942,17 @@ case "$url" in
         "${AGMAN_CURL_LIMIT:-26214400}" > "$out"
     fi ;;
   */api/profiles/*/archive/upload)
+    body=""
+    case "$databin" in
+      "") ;;
+      @*) body="$(cat "${databin#@}" 2>/dev/null)" ;;
+      *)  body="$databin" ;;
+    esac
     if [ -n "${AGMAN_CURL_BLOBFAIL:-}" ]; then
       code=500; printf '{"error":"blob storage unavailable"}' > "$out"
+    elif ! printf '%s' "$body" | grep -q '"size":[0-9]'; then
+      # the server requires the declared archive size (mirrors agman-cloud)
+      code=400; printf '{"error":"A JSON body with the archive size in bytes is required"}' > "$out"
     else
       code=200
       printf '{"uploadUrl":"http://cloud.test/blob-put/xyz","pathname":"uploads/p1/e2e.tar.gz","maxPushBytes":26214400}' > "$out"

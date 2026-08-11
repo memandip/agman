@@ -2277,7 +2277,10 @@ cloud_push() {
     local upresp upurl uppath upcode
     cloud_log "archive exceeds the direct limit ($direct bytes); using blob upload"
     upresp="$(mktemp)"; cloud_track "$upresp"
-    code="$(cloud_http POST "/api/profiles/$name/archive/upload" "$upresp")"
+    # The server only grants blob uploads for payloads a direct push cannot
+    # carry, and caps the presigned URL at the declared size.
+    code="$(cloud_http POST "/api/profiles/$name/archive/upload" "$upresp" \
+      -H 'Content-Type: application/json' --data-binary "{\"size\":$size}")"
     [ "$code" = "200" ] || cloud_die_http "$code" "$(cloud_error_from "$upresp")"
     upurl="$(sed -n 's/.*"uploadUrl":"\([^"]*\)".*/\1/p' "$upresp" | head -1)"
     uppath="$(sed -n 's/.*"pathname":"\([^"]*\)".*/\1/p' "$upresp" | head -1)"
