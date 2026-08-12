@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.13.0"
+AGMAN_VERSION="0.14.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -2356,6 +2356,11 @@ cloud_push() {
     ""|"[]") ;;
     *) warn "the server flagged possible secrets in this push: $warnings" ;;
   esac
+  if grep -q '"unchanged":[[:space:]]*true' "$resp" 2>/dev/null; then
+    # The server deduplicated identical content — no new version was minted.
+    printf "Profile '%s' is already up to date (version %s); nothing pushed.\n" "$name" "${version:-?}"
+    return 0
+  fi
   printf "Pushed profile '%s' (version %s).\n" "$name" "${version:-?}"
   local omitted
   omitted="$(sed -n 's/.*"omitted":[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$resp" | head -1)"
