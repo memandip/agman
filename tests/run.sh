@@ -1007,6 +1007,10 @@ case "$url" in
       if [ -n "${AGMAN_CURL_413:-}" ]; then
         # a platform-level rejection: 413 with a non-JSON body
         code=413; printf 'Request Entity Too Large' > "$out"
+      elif [ -n "${AGMAN_CURL_UNCHANGED:-}" ]; then
+        # the server deduplicates identical content: 200, no new version
+        code=200
+        printf '{"profileId":"p1","version":7,"checksum":"abc","warnings":[],"omitted":0,"unchanged":true}' > "$out"
       else
       [ -n "$databin" ] && cp "${databin#@}" "$AGMAN_CURL_PUSHED"
       code=201
@@ -1286,6 +1290,12 @@ assert_lacks "direct-path push never touches blob storage" "$(cat "$TMP/cloudlog
 # a broken upload endpoint surfaces the server's error
 out="$(AGMAN_CURL_LIMIT=600 AGMAN_CURL_BLOBMAX=26214400 AGMAN_CURL_BLOBFAIL=1 cloud_run cloud push personal 2>&1 || true)"
 assert_contains "failed blob handshake surfaces the server error" "$out" "blob storage unavailable"
+
+# the server deduplicates identical content: report it, don't claim a push
+out="$(AGMAN_CURL_UNCHANGED=1 cloud_run cloud push personal 2>&1)" \
+  && ok "unchanged push succeeds" || bad "unchanged push succeeds ($out)"
+assert_contains "unchanged push says already up to date" "$out" "already up to date (version 7)"
+assert_lacks "unchanged push does not claim a new push" "$out" "Pushed profile"
 
 # pull: new local profile, with account material and state stripped/sanitized
 assert_ok "cloud pull creates a new profile" cloud_run cloud pull work --as pulled
