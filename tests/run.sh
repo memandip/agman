@@ -971,10 +971,37 @@ case "$url" in
     elif [ -n "${AGMAN_CURL_NO_LIMIT:-}" ]; then
       # an older server that does not advertise maxPushBytes
       printf '{"profiles":[{"id":"p1","name":"work","latestVersion":3,"canPush":true}]}' > "$out"
+    elif [ -n "${AGMAN_CURL_BLOBMAX:-}" ]; then
+      # a server with the presigned blob-upload flow configured
+      printf '{"profiles":[{"id":"p1","name":"work","latestVersion":3,"canPush":true}],"maxPushBytes":%s,"blobPushBytes":%s}' \
+        "${AGMAN_CURL_LIMIT:-26214400}" "$AGMAN_CURL_BLOBMAX" > "$out"
     else
       printf '{"profiles":[{"id":"p1","name":"work","latestVersion":3,"canPush":true}],"maxPushBytes":%s}' \
         "${AGMAN_CURL_LIMIT:-26214400}" > "$out"
     fi ;;
+  */api/profiles/*/archive/upload)
+    body=""
+    case "$databin" in
+      "") ;;
+      @*) body="$(cat "${databin#@}" 2>/dev/null)" ;;
+      *)  body="$databin" ;;
+    esac
+    if [ -n "${AGMAN_CURL_BLOBFAIL:-}" ]; then
+      code=500; printf '{"error":"blob storage unavailable"}' > "$out"
+    elif ! printf '%s' "$body" | grep -q '"size":[0-9]'; then
+      # the server requires the declared archive size (mirrors agman-cloud)
+      code=400; printf '{"error":"A JSON body with the archive size in bytes is required"}' > "$out"
+    else
+      code=200
+      printf '{"uploadUrl":"http://cloud.test/blob-put/xyz","pathname":"uploads/p1/e2e.tar.gz","maxPushBytes":26214400}' > "$out"
+    fi ;;
+  */blob-put/*)
+    # the presigned URL: a foreign host that receives the raw archive
+    [ -n "$databin" ] && cp "${databin#@}" "${AGMAN_CURL_BLOB_PUT:-/dev/null}"
+    code=200; printf '{}' > "$out" ;;
+  */api/profiles/*/archive/commit)
+    code=201
+    printf '{"profileId":"p1","version":9,"checksum":"abc","warnings":[],"omitted":0}' > "$out" ;;
   */api/profiles/*/archive)
     if [ "$method" = "PUT" ]; then
       if [ -n "${AGMAN_CURL_413:-}" ]; then
@@ -1035,6 +1062,7 @@ cloud_run() {
     AGMAN_CURL_LOG="$TMP/cloudlog/log" \
     AGMAN_CURL_ARGS="$TMP/cloudlog/args" \
     AGMAN_CURL_PUSHED="$TMP/cloudlog/pushed.tar.gz" \
+    AGMAN_CURL_BLOB_PUT="$TMP/cloudlog/blobput.tar.gz" \
     AGMAN_CURL_ARCHIVE="$TMP/cloud-archive.tar.gz" \
     AGMAN_CLAUDE_LOG="$TMP/cloudlog/claude" \
     "$AGM" "$@"
@@ -1236,6 +1264,28 @@ AGMAN_CURL_NO_LIMIT=1 cloud_run cloud push personal >/dev/null 2>&1 \
 out="$(AGMAN_CURL_413=1 cloud_run cloud push personal 2>&1 || true)"
 assert_contains "bare 413 explains the platform rejection" "$out" "hosting platform"
 assert_contains "bare 413 suggests dry-run" "$out" "--dry-run"
+
+# archives above the direct limit travel via the presigned blob-upload flow:
+# upload URL from the server, raw PUT to blob storage, commit lands the version
+: > "$TMP/cloudlog/log"; rm -f "$TMP/cloudlog/blobput.tar.gz"
+out="$(AGMAN_CURL_LIMIT=600 AGMAN_CURL_BLOBMAX=26214400 cloud_run cloud push personal 2>&1)" \
+  && ok "blob-flow push succeeds above the direct limit" \
+  || bad "blob-flow push succeeds above the direct limit ($out)"
+assert_contains "blob-flow push reports the committed version" "$out" "version 9"
+assert_exists "archive travelled via the presigned URL" "$TMP/cloudlog/blobput.tar.gz"
+listing="$(tar -tzf "$TMP/cloudlog/blobput.tar.gz")"
+assert_contains "blob-uploaded archive carries the profile" "$listing" "claude/CLAUDE.md"
+assert_lacks "no direct archive PUT was attempted" "$(cat "$TMP/cloudlog/log")" "PUT http://cloud.test/api"
+
+# a small archive still takes the direct path even when blob is available
+: > "$TMP/cloudlog/log"
+AGMAN_CURL_BLOBMAX=26214400 cloud_run cloud push personal >/dev/null 2>&1 \
+  && ok "small pushes stay on the direct path" || bad "small pushes stay on the direct path"
+assert_lacks "direct-path push never touches blob storage" "$(cat "$TMP/cloudlog/log")" "blob-put"
+
+# a broken upload endpoint surfaces the server's error
+out="$(AGMAN_CURL_LIMIT=600 AGMAN_CURL_BLOBMAX=26214400 AGMAN_CURL_BLOBFAIL=1 cloud_run cloud push personal 2>&1 || true)"
+assert_contains "failed blob handshake surfaces the server error" "$out" "blob storage unavailable"
 
 # pull: new local profile, with account material and state stripped/sanitized
 assert_ok "cloud pull creates a new profile" cloud_run cloud pull work --as pulled
