@@ -202,6 +202,44 @@ assert_symlink_to "~/.claude points at global" "$HOME/.claude" "$AGMAN_HOME/glob
 assert_contains "current reports global" "$("$AGM" current)" "global  (active"
 assert_ok  "switch back to personal" "$AGM" use personal
 
+# --- use: a tool rewriting its config in place must not wedge the switch ---------
+# Claude Code replaces ~/.claude.json wholesale (write temp + rename), which
+# destroys agman's symlink and leaves a real file while the global backup
+# already holds the original. The next use must absorb the stray file into
+# the profile that was active — the freshest account state belongs to it —
+# and relink, not leave claude unmanaged forever.
+rm -f "$HOME/.claude.json"
+printf '{"stray":true,"oauthAccount":{"emailAddress":"fresh@corp"}}\n' > "$HOME/.claude.json.tmp"
+mv "$HOME/.claude.json.tmp" "$HOME/.claude.json"
+out="$("$AGM" use work 2>&1)" && ok "use absorbs a stray identity file" || bad "use absorbs a stray identity file ($out)"
+assert_lacks "stray identity does not sideline the tool" "$out" "left alone"
+assert_symlink_to "~/.claude.json is a managed link again" "$HOME/.claude.json" "$AGMAN_HOME/work/claude.json"
+assert_contains "freshest identity went to the outgoing profile" "$(cat "$AGMAN_HOME/personal/claude.json")" "fresh@corp"
+assert_contains "global backup identity untouched by the absorb" "$(cat "$AGMAN_HOME/global/claude.json")" "mcpServers"
+
+# same wedge, but with no surviving link to name an owner: the stray copies
+# are kept aside under .backups (never deleted, never over the pristine
+# backup) and the switch still proceeds
+rm -f "$HOME/.claude" "$HOME/.claude.json"
+mkdir -p "$HOME/.claude"
+printf 'stray dir\n' > "$HOME/.claude/STRAY.md"
+printf '{"stray":"two"}\n' > "$HOME/.claude.json"
+out="$("$AGM" use personal 2>&1)" && ok "use proceeds when no owner link survives" || bad "use proceeds when no owner link survives ($out)"
+assert_symlink_to "~/.claude relinked over a stray real dir" "$HOME/.claude" "$AGMAN_HOME/personal/claude"
+assert_symlink_to "~/.claude.json relinked alongside" "$HOME/.claude.json" "$AGMAN_HOME/personal/claude.json"
+if ls -d "$AGMAN_HOME/.backups/claude-stray-"* >/dev/null 2>&1; then
+  ok "stray config dir kept aside under .backups"
+else
+  bad "stray config dir kept aside under .backups"
+fi
+assert_eq "stray dir content preserved" "stray dir" "$(cat "$AGMAN_HOME"/.backups/claude-stray-*/STRAY.md)"
+if ls "$AGMAN_HOME/.backups/claude.json-stray-"* >/dev/null 2>&1; then
+  ok "ownerless stray identity kept aside under .backups"
+else
+  bad "ownerless stray identity kept aside under .backups"
+fi
+assert_eq   "global backup still carries the original CLAUDE.md" "GLOBAL RULES" "$(cat "$AGMAN_HOME/global/claude/CLAUDE.md")"
+
 # --- rename while active -----------------------------------------------------------
 
 assert_ok "rename the active profile" "$AGM" rename personal personal2
@@ -1048,6 +1086,16 @@ assert_eq "cloud credentials are private (mode 600)" "-rw-------" "$(ls -l "$AGM
 assert_contains "trailing slash trimmed from url" "$(cat "$AGMAN_HOME/.cloud")" "url=http://cloud.test"
 assert_lacks "login output never prints the key" "$out" "test-key-123"
 assert_fail "login rejects a non-http url" cloud_run cloud login --url ftp://x --key-stdin
+
+# an empty URL at the prompt falls back to the public server
+out="$(printf '\ndefault-key-1\n' | cloud_run cloud login --key-stdin 2>&1)" \
+  && ok "login accepts an empty URL and uses the default" \
+  || bad "login accepts an empty URL and uses the default ($out)"
+assert_contains "empty URL stores the default server" "$(cat "$AGMAN_HOME/.cloud")" "url=https://agman.vercel.app"
+assert_contains "help documents the default cloud URL" "$("$AGM" help)" "agman.vercel.app"
+# back to the stubbed test server for everything below
+printf 'test-key-123\n' | cloud_run cloud login --url http://cloud.test --key-stdin >/dev/null 2>&1 \
+  || bad "re-login to the stub server"
 
 assert_contains "cloud status shows the server" "$(cloud_run cloud status)" "http://cloud.test"
 assert_contains "cloud status probes the connection" "$(cloud_run cloud status)" "ok"
