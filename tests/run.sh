@@ -1297,6 +1297,46 @@ out="$(AGMAN_CURL_UNCHANGED=1 cloud_run cloud push personal 2>&1)" \
 assert_contains "unchanged push says already up to date" "$out" "already up to date (version 7)"
 assert_lacks "unchanged push does not claim a new push" "$out" "Pushed profile"
 
+# transfer progress: curl's bar on stderr for byte-heavy requests. Interactive
+# auto-detection can't run under the suite, so AGMAN_PROGRESS forces it.
+: > "$TMP/cloudlog/args"
+out="$(AGMAN_PROGRESS=1 cloud_run cloud push personal 2>&1)" \
+  && ok "push succeeds with progress forced on" || bad "push succeeds with progress forced on ($out)"
+assert_contains "progress mode announces the upload" "$out" "Uploading"
+if grep -- "--progress-bar" "$TMP/cloudlog/args" | grep -q "api/profiles/personal/archive"; then
+  ok "direct push transfer shows curl's bar"
+else
+  bad "direct push transfer shows curl's bar"
+fi
+: > "$TMP/cloudlog/args"
+cloud_run cloud push personal >/dev/null 2>&1 || true
+assert_lacks "no bar when not interactive" "$(cat "$TMP/cloudlog/args")" "--progress-bar"
+: > "$TMP/cloudlog/args"
+AGMAN_PROGRESS=1 AGMAN_CURL_LIMIT=600 AGMAN_CURL_BLOBMAX=26214400 cloud_run cloud push personal >/dev/null 2>&1 \
+  && ok "blob push succeeds with progress on" || bad "blob push succeeds with progress on"
+if grep -- "--progress-bar" "$TMP/cloudlog/args" | grep -q "blob-put"; then
+  ok "blob transfer shows curl's bar"
+else
+  bad "blob transfer shows curl's bar"
+fi
+# the blob transfer also stays bar-free when not interactive
+: > "$TMP/cloudlog/args"
+AGMAN_CURL_LIMIT=600 AGMAN_CURL_BLOBMAX=26214400 cloud_run cloud push personal >/dev/null 2>&1 || true
+if grep "blob-put" "$TMP/cloudlog/args" | grep -q -- "--progress-bar"; then
+  bad "non-interactive blob transfer stays bar-free"
+else
+  ok "non-interactive blob transfer stays bar-free"
+fi
+# progress rides stderr only; stdout stays machine-clean for scripts
+out="$(AGMAN_PROGRESS=1 cloud_run cloud push personal 2>/dev/null)"
+assert_lacks "announcement never lands on stdout" "$out" "Uploading"
+err="$(AGMAN_PROGRESS=1 cloud_run cloud push personal 2>&1 >/dev/null)"
+assert_contains "announcement rides stderr" "$err" "Uploading"
+# The =0 OFF effect needs a pty ([ -t 2 ] is already false here), so only an
+# inverted override could trip this; the docker tty E2E covers the real case.
+out="$(AGMAN_PROGRESS=0 cloud_run cloud push personal 2>&1)" || true
+assert_lacks "AGMAN_PROGRESS=0 silences the announcement" "$out" "Uploading"
+
 # pull: new local profile, with account material and state stripped/sanitized
 assert_ok "cloud pull creates a new profile" cloud_run cloud pull work --as pulled
 assert_eq "pulled config content" "CLOUD RULES" "$(cat "$AGMAN_HOME/pulled/claude/CLAUDE.md")"
