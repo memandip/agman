@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.14.0"
+AGMAN_VERSION="0.15.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -1919,6 +1919,17 @@ cloud_log() {
   return 0
 }
 
+# Transfer progress for byte-heavy requests: curl's compact bar on stderr.
+# Auto-detected — on only when stderr is a terminal, so scripts, CI, and
+# captured output stay clean. AGMAN_PROGRESS=1 forces it on, =0 off.
+cloud_progress_enabled() {
+  case "${AGMAN_PROGRESS:-}" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  [ -t 2 ]
+}
+
 # Build (^|/)(a|b|c)(/|$) matching any listed name as a full path component.
 # Dots are escaped so 'history.jsonl' can't match 'historyXjsonl'.
 cloud_name_re() {
@@ -1947,10 +1958,14 @@ cloud_load() {
   fi
 }
 
-# cloud_http <method> <path> <body-out-file> [curl args...]; prints HTTP code.
+# cloud_http [--progress] <method> <path> <body-out-file> [curl args...];
+# prints HTTP code. With --progress, curl draws its transfer bar on stderr
+# (which stays live for that call) — for byte-heavy requests only.
 # The API key goes in a mode-600 curl config file (-K), never on the command
 # line where `ps` could read it. mktemp creates the file 0600 already.
 cloud_http() {
+  local progress=0
+  if [ "${1:-}" = "--progress" ]; then progress=1; shift; fi
   local method="$1" path="$2" out="$3" code cfg
   shift 3
   cloud_log "$method $cloud_url$path"
@@ -1958,8 +1973,13 @@ cloud_http() {
   printf 'header = "x-api-key: %s"\n' "$cloud_key" > "$cfg"
   # curl prints '000' itself when it never got a response; keep any real code
   # it did receive before a mid-transfer failure instead of masking it.
-  code="$(curl -sS -K "$cfg" -X "$method" --connect-timeout 10 \
-    -o "$out" -w '%{http_code}' "$cloud_url$path" ${1+"$@"} 2>/dev/null)" || true
+  if [ "$progress" = "1" ]; then
+    code="$(curl --progress-bar -K "$cfg" -X "$method" --connect-timeout 10 \
+      -o "$out" -w '%{http_code}' "$cloud_url$path" ${1+"$@"})" || true
+  else
+    code="$(curl -sS -K "$cfg" -X "$method" --connect-timeout 10 \
+      -o "$out" -w '%{http_code}' "$cloud_url$path" ${1+"$@"} 2>/dev/null)" || true
+  fi
   rm -f "$cfg"
   [ -n "$code" ] || code="000"
   cloud_log "HTTP $code"
@@ -2314,6 +2334,14 @@ cloud_push() {
     die "trim the profile ('agman cloud push $name --dry-run' lists everything a push would carry), or set AGMAN_CLOUD_MAX_PUSH_BYTES if your server accepts more"
   fi
 
+  # Interactive pushes get a heads-up plus curl's transfer bar; scripts and
+  # captured output see neither (cloud_progress_enabled checks stderr).
+  local pflag=""
+  if cloud_progress_enabled; then
+    pflag=1
+    printf "Uploading '%s' (%s MB)...\n" "$name" "$(cloud_mb "$size")" >&2
+  fi
+
   if [ "$size" -gt "$direct" ]; then
     # Too big for a function body: presigned blob upload, then commit. The
     # bytes go straight to blob storage; only small control requests touch
@@ -2332,8 +2360,13 @@ cloud_push() {
       die "cloud: the server's upload endpoint returned no upload URL"
     fi
     # The presigned URL is a foreign host: plain curl, the API key stays home.
-    upcode="$(curl -sS -X PUT --connect-timeout 10 -o /dev/null -w '%{http_code}' \
-      -H 'Content-Type: application/gzip' --data-binary "@$body" "$upurl" 2>/dev/null)" || true
+    if [ -n "$pflag" ]; then
+      upcode="$(curl --progress-bar -X PUT --connect-timeout 10 -o /dev/null -w '%{http_code}' \
+        -H 'Content-Type: application/gzip' --data-binary "@$body" "$upurl")" || true
+    else
+      upcode="$(curl -sS -X PUT --connect-timeout 10 -o /dev/null -w '%{http_code}' \
+        -H 'Content-Type: application/gzip' --data-binary "@$body" "$upurl" 2>/dev/null)" || true
+    fi
     cloud_log "blob PUT: HTTP ${upcode:-000}"
     case "$upcode" in
       2*) ;;
@@ -2342,7 +2375,7 @@ cloud_push() {
     code="$(cloud_http POST "/api/profiles/$name/archive/commit" "$resp" \
       -H 'Content-Type: application/json' --data-binary "{\"pathname\":\"$uppath\"}")"
   else
-    code="$(cloud_http PUT "/api/profiles/$name/archive" "$resp" \
+    code="$(cloud_http ${pflag:+--progress} PUT "/api/profiles/$name/archive" "$resp" \
       -H 'Content-Type: application/gzip' --data-binary "@$body")"
   fi
   if [ "$code" != "201" ] && [ "$code" != "200" ]; then
@@ -2566,6 +2599,8 @@ Environment:
                          Unset means every supported tool you have.
   AGMAN_SHARE_STATE      1 (default) shares session history across profiles so
                          'claude --resume' keeps working. 0 keeps it per-profile.
+  AGMAN_PROGRESS         Transfer progress for cloud push uploads. Auto: shown
+                         only when stderr is a terminal. 1 forces on, 0 off.
   AGMAN_RAW_URL          Update source (default: GitHub main branch)
 EOF
 }
