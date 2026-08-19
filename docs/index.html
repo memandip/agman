@@ -220,10 +220,10 @@
     agents, MCP servers, and settings across Claude Code, Codex, and Gemini.
   </p>
   <div class="badges">
-    <span class="badge ok">v0.5.0</span>
+    <span class="badge ok">v0.13.0</span>
     <span class="badge">pure bash, zero dependencies</span>
-    <span class="badge">macOS · Linux · WSL</span>
-    <span class="badge">204 tests, CI on two platforms</span>
+    <span class="badge">macOS · Linux · WSL · Git Bash</span>
+    <span class="badge">extensive test suite, CI on two platforms</span>
     <span class="badge">MIT</span>
   </div>
   <div class="cta">
@@ -479,13 +479,39 @@ agman logout work    # back to your shared account</pre>
           a profile's account holds up in editors as well as the terminal.</p>
         </div>
       </li>
+      <li class="done">
+        <span class="mark">✓</span>
+        <div>
+          <h3>Sessions survive profile switches <span class="ver">v0.6.0</span></h3>
+          <p><code>claude --resume</code> keeps working no matter which profile is active — session
+          history pools centrally instead of being stranded inside whichever profile was live when
+          it was written.</p>
+        </div>
+      </li>
+      <li class="done">
+        <span class="mark">✓</span>
+        <div>
+          <h3><code>agman run</code> and per-project profiles <span class="ver">v0.7.0</span></h3>
+          <p>One-shot runs now carry the account and MCP servers correctly. A <code>.agman</code>
+          file in a project root lets <code>agman use</code>/<code>run</code> pick the right
+          profile automatically, with a trust prompt since it arrives with a clone.</p>
+        </div>
+      </li>
+      <li class="done">
+        <span class="mark">✓</span>
+        <div>
+          <h3><code>agman cloud</code> <span class="ver">v0.8.0</span></h3>
+          <p>Push and pull profiles through a hosted sync server. Account material, credentials,
+          and sessions stay local by default; a push is refused outright if a synced file looks
+          like it holds a secret.</p>
+        </div>
+      </li>
       <li class="next">
         <span class="mark">→</span>
         <div>
-          <h3>Shareable profiles <span class="ver">next</span></h3>
-          <p>Push and pull profiles through a git remote you own, plus an <code>.agman</code> file
-          in a project root so <code>agman use</code> fetches the right profile for that repo.
-          Credentials stay excluded by design.</p>
+          <h3>Profile sharing over git <span class="ver">next</span></h3>
+          <p>Push and pull profiles through a git remote you already own, as an alternative to the
+          hosted service — no account or infrastructure required.</p>
         </div>
       </li>
       <li class="later">
@@ -494,14 +520,6 @@ agman logout work    # back to your shared account</pre>
           <h3>More tools and shells <span class="ver">later</span></h3>
           <p>Qwen Code and Kimi CLI adapters once their layouts are verified, fish support, and
           shell completions.</p>
-        </div>
-      </li>
-      <li class="later">
-        <span class="mark">·</span>
-        <div>
-          <h3>Hosted profile sync <span class="ver">exploring</span></h3>
-          <p>Optional cloud storage with end-to-end encryption and company sign-in, only if there
-          is real demand for it. Git remotes cover most of the need without a service.</p>
         </div>
       </li>
     </ul>
@@ -514,7 +532,7 @@ agman logout work    # back to your shared account</pre>
     <h2>What "verified" means here</h2>
     <div class="grid g3">
       <div class="card">
-        <h3>204 assertions, two platforms</h3>
+        <h3>Extensive test suite, two platforms</h3>
         <p>Every release runs the suite on macOS bash 3.2 and Linux bash 5.2 — one of them
         without <code>jq</code>, <code>python3</code>, or <code>curl</code>, so the fallback paths
         are exercised too. shellcheck runs on every commit.</p>
