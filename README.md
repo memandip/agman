@@ -66,14 +66,25 @@ active, and a session started under one profile is resumable under another. What
 per-profile is the persona — `CLAUDE.md`, settings, rules, skills, agents, plugins, MCP
 servers.
 
+Codex CLI and Gemini CLI get the same treatment, one level down:
+
+```
+~/.agman/.state/codex/    <- sessions (rollouts), history.jsonl, log, tmp, .tmp (plugin cache)
+~/.agman/.state/gemini/   <- antigravity, antigravity-browser-profile, tmp, history
+```
+
+Codex rollouts stay resumable across profiles, and the multi-GB browser profile Antigravity
+keeps inside `~/.gemini` is stored once instead of once per profile. A profile holds
+configuration, never that bulk, so `agman remove` cannot take it down with it.
+
 Upgrading from an earlier agman recovers history automatically: the next `agman use` merges
 whatever each profile is holding into shared state, file by file, and never overwrites. Since
 transcripts are UUID-named, collisions effectively don't happen; if one does, your copy is
 kept aside as `projects.agman-conflict` rather than being lost, and both `agman doctor` and
 `agman off` list anything kept aside so it doesn't sit unnoticed.
 
-`agman off` turns the shared links back into real directories under `~/.claude`, so a restored
-config works without agman. Set `AGMAN_SHARE_STATE=0` if you would rather each profile keep
+`agman off` turns the shared links back into real directories under `~/.claude`, `~/.codex` and
+`~/.gemini`, so a restored config works without agman. Set `AGMAN_SHARE_STATE=0` if you would rather each profile keep
 its own history — for example to keep client work strictly separate — at the cost of
 cross-profile resuming.
 

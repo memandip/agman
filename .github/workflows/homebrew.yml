@@ -1,12 +1,14 @@
 name: Bump Homebrew formula
 
-# Keeps memandip/homebrew-agman in step with releases by opening a pull request
-# against the tap, so brew test-bot validates the formula on Linux and two
-# macOS runners before it lands. Merge the PR to publish.
-#
-# Requires a repository secret named HOMEBREW_TAP_TOKEN: a personal access
-# token with 'repo' and 'workflow' scopes. Without that secret this workflow
-# reports a notice and exits cleanly rather than failing every release.
+# Asks memandip/homebrew-agman to bump its formula to a release. The bump
+# itself — download, sha256, formula rewrite, `brew install` + `brew test`,
+# push to the tap's main — is the tap's own bump.yml, running under the tap's
+# GITHUB_TOKEN. Only the cross-repository trigger needs a secret here:
+# HOMEBREW_TAP_TOKEN, a personal access token allowed to dispatch workflows on
+# memandip/homebrew-agman (fine-grained: repository access to homebrew-agman
+# with Actions "read and write"; classic: the `repo` scope). Without the secret
+# this reports a notice and exits cleanly. The tap also polls for new releases
+# hourly, so a missing or under-scoped token delays a bump rather than losing it.
 
 on:
   release:
@@ -14,7 +16,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to bump the formula to (e.g. v0.3.0)"
+        description: "Tag to bump the formula to (e.g. v0.16.0)"
         required: true
 
 permissions:
@@ -22,7 +24,7 @@ permissions:
 
 jobs:
   bump:
-    name: Bump formula
+    name: Dispatch the tap bump
     runs-on: ubuntu-latest
     steps:
       - name: Resolve tag
@@ -44,30 +46,28 @@ jobs:
           TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
           if [ -z "$TOKEN" ]; then
-            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the formula bump. Add the secret to enable it."
+            echo "::notice::HOMEBREW_TAP_TOKEN is not set; skipping the dispatch. The tap's hourly poll will pick the release up."
             echo "ready=false" >> "$GITHUB_OUTPUT"
           else
             echo "ready=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Bump agman formula in the tap
+      - name: Dispatch bump.yml in memandip/homebrew-agman
         if: steps.guard.outputs.ready == 'true'
-        uses: mislav/bump-homebrew-formula-action@v4
-        with:
-          formula-name: agman
-          formula-path: Formula/agman.rb
-          homebrew-tap: memandip/homebrew-agman
-          base-branch: main
-          tag-name: ${{ steps.tag.outputs.name }}
-          download-url: https://github.com/memandip/agman/archive/refs/tags/${{ steps.tag.outputs.name }}.tar.gz
-          # Open a pull request rather than committing to the tap directly.
-          # `brew test-bot --only-formulae`, which installs the formula and runs
-          # its test block on Linux and two macOS runners, only runs on pull
-          # requests — a direct push would land an unverified formula.
-          create-pullrequest: true
-          commit-message: |
-            agman {{version}}
-
-            Bumped by the release workflow in memandip/agman.
         env:
-          COMMITTER_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          set -uo pipefail
+          if out="$(gh workflow run bump.yml -R memandip/homebrew-agman --ref main -f tag="$TAG" 2>&1)"; then
+            echo "::notice::dispatched homebrew-agman's bump.yml for $TAG"
+          else
+            printf '%s\n' "$out"
+            case "$out" in
+              *"not found on the default branch"*)
+                echo "::error::bump.yml is not on memandip/homebrew-agman's main yet; the tap's hourly poll will pick up $TAG once it is." ;;
+              *)
+                echo "::error::HOMEBREW_TAP_TOKEN cannot dispatch workflows on memandip/homebrew-agman. Regenerate it with Actions read/write on that repository (or the classic 'repo' scope). The tap's hourly poll will still pick up $TAG." ;;
+            esac
+            exit 1
+          fi

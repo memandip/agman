@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.15.0"
+AGMAN_VERSION="0.16.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -41,16 +41,10 @@ CREDS_BASENAME=".credentials.json"
 # calls to read it. Never synced, never printed.
 TOKEN_BASENAME=".agman-token"
 HELPER_BASENAME="agman-apikey.sh"
-# Session transcripts and history are your work, not a profile's persona, and
-# Claude Code keeps them inside the config dir: a resumable session lives at
-# <config dir>/projects/<encoded-cwd>/<session-id>.jsonl. Swapping the config
-# dir per profile would therefore strand every earlier session and break
-# `claude --resume`. These entries are kept in one shared directory that every
-# profile symlinks, so session history survives switching. Set
-# AGMAN_SHARE_STATE=0 to keep it per-profile instead.
+# Machine-local state the tools keep inside their config dirs lives here and
+# is shared by every profile (see ADAPTER_STATE). Set AGMAN_SHARE_STATE=0 to
+# keep it per-profile instead.
 SHARED_STATE="$AGMAN_HOME/.state"
-SHARED_STATE_ENTRIES=("projects:d" "history.jsonl:f" "todos:d" "shell-snapshots:d"
-  "file-history:d" "session-env:d" "sessions:d")
 # Claude Code resolves ~/.claude.json relative to the config dir when
 # CLAUDE_CONFIG_DIR is set, but relative to $HOME otherwise. agman stores
 # identity as a sibling of the claude tree so symlink mode can point
@@ -85,6 +79,22 @@ ADAPTER_LINKS=(
 # Env var that redirects a tool's config dir, or "-" when the tool has none.
 # Used by `agman env`/`run`/`exec` for per-shell overrides.
 ADAPTER_ENVVARS=(CLAUDE_CONFIG_DIR CODEX_HOME -)
+# State that is your work, or another product's, rather than a profile's
+# persona, yet lives inside the managed config dir. Claude Code keeps a
+# resumable session at <config dir>/projects/<encoded-cwd>/<session-id>.jsonl,
+# Codex keeps its rollouts under sessions/ and a plugin cache under .tmp/, and
+# Antigravity parks a multi-GB browser profile inside ~/.gemini. Swapping the
+# whole dir per profile would strand every session, hand each profile its own
+# copy of that bulk, and let `agman remove` delete it. So every profile
+# symlinks these entries at one shared location. One `name:type` list per
+# adapter (d directory, f file). Claude's entries sit directly under
+# $SHARED_STATE, the layout that predates multi-tool sharing; other tools nest
+# under $SHARED_STATE/<tool>.
+ADAPTER_STATE=(
+  "projects:d history.jsonl:f todos:d shell-snapshots:d file-history:d session-env:d sessions:d"
+  "sessions:d history.jsonl:f log:d tmp:d .tmp:d"
+  "antigravity:d antigravity-browser-profile:d tmp:d history:d"
+)
 
 # Ephemeral or machine-local state that should not be cloned into a profile.
 # Includes state other products drop into the managed trees (Antigravity keeps
@@ -722,26 +732,45 @@ merge_tree() {
   return 1
 }
 
-# How many profiles currently point their session paths at shared state. The
-# env var alone is not the truth: disabling sharing later leaves existing links
-# in place, and a diagnostic that reports the flag instead of the filesystem
+# Where an adapter's shared state lives. Claude's predates multi-tool sharing
+# and stays flat so links made by earlier releases keep resolving.
+state_root() {
+  if [ "${ADAPTER_NAMES[$1]}" = "claude" ]; then printf '%s' "$SHARED_STATE"
+  else printf '%s/%s' "$SHARED_STATE" "${ADAPTER_NAMES[$1]}"; fi
+}
+
+# A tool's config tree inside a profile: its directory link, layout-aware for
+# Claude.
+profile_tool_dir() {
+  local dir="$1" idx="$2" pair
+  if [ "${ADAPTER_NAMES[$idx]}" = "claude" ]; then profile_claude_dir "$dir"; return 0; fi
+  for pair in ${ADAPTER_LINKS[$idx]}; do
+    case "$pair" in *:d) printf '%s/%s' "$dir" "${pair%%:*}"; return 0 ;; esac
+  done
+  return 1
+}
+
+# How many profiles currently point state paths at shared state. The env var
+# alone is not the truth: disabling sharing later leaves existing links in
+# place, and a diagnostic that reports the flag instead of the filesystem
 # sends people looking in the wrong place.
 count_shared_linked_profiles() {
-  local n=0 entry cdir pair name target
+  local n=0 entry i hit tdir pair target
   [ -d "$AGMAN_HOME" ] || { printf '0'; return 0; }
   for entry in "$AGMAN_HOME"/*/; do
     [ -d "$entry" ] || continue
     entry="${entry%/}"
-    cdir="$(profile_claude_dir "$entry")"
-    for pair in "${SHARED_STATE_ENTRIES[@]}"; do
-      name="${pair%%:*}"
-      target="$cdir/$name"
-      if [ -L "$target" ]; then
-        case "$(readlink_once "$target")" in
-          "$SHARED_STATE"/*) n=$((n + 1)); break ;;
-        esac
-      fi
+    hit=0; i=0
+    while [ "$hit" = "0" ] && [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+      tdir="$(profile_tool_dir "$entry" "$i")"
+      for pair in ${ADAPTER_STATE[$i]}; do
+        target="$tdir/${pair%%:*}"
+        [ -L "$target" ] || continue
+        case "$(readlink_once "$target")" in "$SHARED_STATE"/*) hit=1; break ;; esac
+      done
+      i=$((i + 1))
     done
+    n=$((n + hit))
   done
   printf '%s' "$n"
 }
@@ -754,17 +783,18 @@ list_conflict_leftovers() {
     \( -name '*.agman-conflict' -o -name '*.agman-orphaned' \) 2>/dev/null | sort
 }
 
-# Move a config dir's real session/history entries into the shared directory.
-# Merges directory contents when both sides exist rather than overwriting, and
-# never deletes anything it could not place.
+# Move a tool tree's real state entries into the shared directory. Merges
+# directory contents when both sides exist rather than overwriting, and never
+# deletes anything it could not place.
 adopt_shared_state() {
-  local cdir="$1" pair name type src dst
+  local idx="$1" tdir="$2" root pair name type src dst
   share_state_enabled || return 0
-  [ -d "$cdir" ] || return 0
-  mkdir -p "$SHARED_STATE"
-  for pair in "${SHARED_STATE_ENTRIES[@]}"; do
+  [ -d "$tdir" ] || return 0
+  root="$(state_root "$idx")"
+  mkdir -p "$root"
+  for pair in ${ADAPTER_STATE[$idx]}; do
     name="${pair%%:*}"; type="${pair##*:}"
-    src="$cdir/$name"; dst="$SHARED_STATE/$name"
+    src="$tdir/$name"; dst="$root/$name"
     [ -L "$src" ] && continue
     [ -e "$src" ] || continue
     if [ ! -e "$dst" ]; then
@@ -786,39 +816,50 @@ adopt_shared_state() {
   return 0
 }
 
-# Point a profile's session/history paths at the shared directory.
+# Point a profile's state paths at the shared directory, for every enabled
+# tool whose tree the profile carries (Claude's is always created).
 link_shared_state() {
-  local dir="$1" cdir pair name type target
+  local dir="$1" i=0 tdir root pair name type target
   share_state_enabled || return 0
-  cdir="$(profile_claude_dir "$dir")"
-  mkdir -p "$cdir" "$SHARED_STATE"
-  adopt_shared_state "$cdir"
-  for pair in "${SHARED_STATE_ENTRIES[@]}"; do
-    name="${pair%%:*}"; type="${pair##*:}"
-    target="$cdir/$name"
-    # Drop a link left dangling by a previous 'off'.
-    if [ -L "$target" ] && [ ! -e "$target" ]; then rm -f "$target"; fi
-    [ -L "$target" ] && continue
-    [ -e "$target" ] && continue
-    if [ "$type" = "d" ]; then
-      mkdir -p "$SHARED_STATE/$name"
-    else
-      [ -e "$SHARED_STATE/$name" ] || : > "$SHARED_STATE/$name"
+  while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+    if adapter_enabled "${ADAPTER_NAMES[$i]}"; then
+      tdir="$(profile_tool_dir "$dir" "$i")"
+      [ "${ADAPTER_NAMES[$i]}" = "claude" ] && mkdir -p "$tdir"
+      if [ -d "$tdir" ]; then
+        root="$(state_root "$i")"
+        mkdir -p "$root"
+        adopt_shared_state "$i" "$tdir"
+        for pair in ${ADAPTER_STATE[$i]}; do
+          name="${pair%%:*}"; type="${pair##*:}"
+          target="$tdir/$name"
+          # Drop a link left dangling by a previous 'off'.
+          if [ -L "$target" ] && [ ! -e "$target" ]; then rm -f "$target"; fi
+          [ -L "$target" ] && continue
+          [ -e "$target" ] && continue
+          if [ "$type" = "d" ]; then
+            mkdir -p "$root/$name"
+          else
+            [ -e "$root/$name" ] || : > "$root/$name"
+          fi
+          ln -s "$root/$name" "$target" 2>/dev/null || \
+            warn "could not link $name into $tdir"
+        done
+      fi
     fi
-    ln -s "$SHARED_STATE/$name" "$target" 2>/dev/null || \
-      warn "could not link $name into $cdir"
+    i=$((i + 1))
   done
   return 0
 }
 
-# Turn the shared links back into real paths so a restored config works without
-# agman, mirroring what 'off' does for credentials.
+# Turn one tool's shared links back into real paths so a restored config works
+# without agman, mirroring what 'off' does for credentials.
 restore_shared_state() {
-  local cdir="$1" pair name target
-  [ -d "$SHARED_STATE" ] || return 0
-  for pair in "${SHARED_STATE_ENTRIES[@]}"; do
+  local idx="$1" tdir="$2" root pair name target
+  root="$(state_root "$idx")"
+  [ -d "$root" ] || return 0
+  for pair in ${ADAPTER_STATE[$idx]}; do
     name="${pair%%:*}"
-    target="$cdir/$name"
+    target="$tdir/$name"
     # Clear our own link so the real thing can take its place. A link somebody
     # else made is left alone.
     if [ -L "$target" ]; then
@@ -827,14 +868,30 @@ restore_shared_state() {
         *) continue ;;
       esac
     fi
-    # The backup profile has no link at all: its history was moved into shared
+    # The backup profile has no link at all: its state was moved into shared
     # state on the first switch, so hand it back whether or not a link existed.
     [ -e "$target" ] && continue
-    [ -e "$SHARED_STATE/$name" ] || continue
-    mv "$SHARED_STATE/$name" "$target" || warn "could not restore $name"
+    [ -e "$root/$name" ] || continue
+    mv "$root/$name" "$target" || warn "could not restore $name"
   done
-  rmdir "$SHARED_STATE" 2>/dev/null || true
   return 0
+}
+
+# Drop the empty placeholders link_shared_state created for a tool, never
+# anything with content in it.
+prune_empty_state() {
+  local root pair name type
+  root="$(state_root "$1")"
+  [ -d "$root" ] || return 0
+  for pair in ${ADAPTER_STATE[$1]}; do
+    name="${pair%%:*}"; type="${pair##*:}"
+    if [ "$type" = "d" ]; then
+      rmdir "$root/$name" 2>/dev/null || true
+    elif [ -f "$root/$name" ] && [ ! -s "$root/$name" ]; then
+      rm -f "$root/$name"
+    fi
+  done
+  rmdir "$root" 2>/dev/null || true
 }
 
 # Never prints token material.
@@ -1220,7 +1277,13 @@ cmd_use() {
   # profile carries identity so switching never forces a re-login.
   if [ -d "$GLOBAL_BACKUP" ]; then
     adopt_shared_credentials "$GLOBAL_BACKUP"
-    adopt_shared_state "$(profile_claude_dir "$GLOBAL_BACKUP")"
+    i=0
+    while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+      if adapter_enabled "${ADAPTER_NAMES[$i]}"; then
+        adopt_shared_state "$i" "$(profile_tool_dir "$GLOBAL_BACKUP" "$i")"
+      fi
+      i=$((i + 1))
+    done
   fi
   local seeded=0 src_json=""
   if ! profile_has_own_account "$dir" && ! has_identity "$dir" && src_json="$(identity_source)"; then
@@ -1282,11 +1345,19 @@ cmd_off() {
     i=$((i + 1))
   done
 
-  # Give the restored config its session history back as real paths.
-  local claude_tgt; claude_tgt="$(target_path .claude)"
-  if [ -d "$claude_tgt" ] && [ ! -L "$claude_tgt" ]; then
-    restore_shared_state "$claude_tgt"
-  fi
+  # Give each restored config its shared state back as real paths.
+  i=0
+  while [ "$i" -lt "${#ADAPTER_NAMES[@]}" ]; do
+    for pair in ${ADAPTER_LINKS[$i]}; do
+      case "$pair" in *:d) ;; *) continue ;; esac
+      home_rel="${pair#*:}"; home_rel="${home_rel%:*}"
+      tgt="$(target_path "$home_rel")"
+      if [ -d "$tgt" ] && [ ! -L "$tgt" ]; then restore_shared_state "$i" "$tgt"; fi
+    done
+    prune_empty_state "$i"
+    i=$((i + 1))
+  done
+  rmdir "$SHARED_STATE" 2>/dev/null || true
 
   # An emptied backup profile is just noise.
   if [ -d "$GLOBAL_BACKUP" ]; then
@@ -2597,8 +2668,10 @@ Environment:
   AGMAN_TARGET_HOME      Where tool config paths live (default: \$HOME)
   AGMAN_TOOLS            Space-separated allowlist, e.g. "claude codex".
                          Unset means every supported tool you have.
-  AGMAN_SHARE_STATE      1 (default) shares session history across profiles so
-                         'claude --resume' keeps working. 0 keeps it per-profile.
+  AGMAN_SHARE_STATE      1 (default) shares session history and other machine-
+                         local state (Codex rollouts, Antigravity's browser
+                         profile) across profiles so 'claude --resume' keeps
+                         working. 0 keeps it per-profile.
   AGMAN_PROGRESS         Transfer progress for cloud push uploads. Auto: shown
                          only when stderr is a terminal. 1 forces on, 0 off.
   AGMAN_RAW_URL          Update source (default: GitHub main branch)
