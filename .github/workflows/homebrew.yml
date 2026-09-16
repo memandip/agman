@@ -63,6 +63,11 @@ jobs:
             echo "::notice::dispatched homebrew-agman's bump.yml for $TAG"
           else
             printf '%s\n' "$out"
-            echo "::error::HOMEBREW_TAP_TOKEN cannot dispatch workflows on memandip/homebrew-agman. Regenerate it with Actions read/write on that repository (or the classic 'repo' scope). The tap's hourly poll will still pick up $TAG."
+            case "$out" in
+              *"not found on the default branch"*)
+                echo "::error::bump.yml is not on memandip/homebrew-agman's main yet; the tap's hourly poll will pick up $TAG once it is." ;;
+              *)
+                echo "::error::HOMEBREW_TAP_TOKEN cannot dispatch workflows on memandip/homebrew-agman. Regenerate it with Actions read/write on that repository (or the classic 'repo' scope). The tap's hourly poll will still pick up $TAG." ;;
+            esac
             exit 1
           fi
