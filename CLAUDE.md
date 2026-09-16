@@ -25,7 +25,7 @@ only the persona is per-profile.
 - **`install.sh`** — curl-pipe installer.
 - **`tests/run.sh`** — the test suite. `tests/docker-session-*.sh` — containerized upgrade/resume tests.
 - **`docs/`** — `design.md`, `roadmap.md`, `index.html` (landing page).
-- **`.github/workflows/`** — `ci.yml` (tests + shellcheck), `homebrew.yml` (release → tap PR).
+- **`.github/workflows/`** — `ci.yml` (tests + shellcheck), `homebrew.yml` (release → dispatches the tap's `bump.yml`).
 
 ### Hard constraints (do not break these)
 
@@ -81,8 +81,10 @@ Concrete examples — "small diff" does not mean "third digit":
 Everything after that is automatic. Once CI passes on `main`,
 [`release.yml`](.github/workflows/release.yml) sees that `AGMAN_VERSION` has no matching tag,
 tags `vX.Y.Z` at the commit CI validated, publishes a release with generated notes, and
-dispatches `homebrew.yml` to open the formula PR against `memandip/homebrew-agman`. Merging
-that PR publishes the brew formula — the only remaining manual step.
+dispatches `homebrew.yml`, which asks the tap's own `bump.yml` (in `memandip/homebrew-agman`)
+to rewrite `Formula/agman.rb`, `brew install` + `brew test` it on the runner, and push it to the
+tap's `main`. The tap also polls for new releases hourly, so the formula follows a release even
+when the `HOMEBREW_TAP_TOKEN` dispatch secret is missing or under-scoped. No manual step remains.
 
 So the tag, `AGMAN_VERSION`, and the release stay in agreement by construction; don't tag by
 hand. A version with a pre-release suffix (`0.8.0-rc.1`) is published as a GitHub pre-release.

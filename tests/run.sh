@@ -360,6 +360,74 @@ mrun off >/dev/null
 assert_real_dir "multi-tool: off restores ~/.codex" "$M/.codex"
 assert_eq "multi-tool: restored codex content" "M CODEX" "$(cat "$M/.codex/AGENTS.md")"
 
+# --- per-tool shared state: bulky non-config state never lives in a profile ---------------
+#
+# Antigravity keeps a multi-GB browser profile inside ~/.gemini and Codex keeps
+# its rollouts and plugin cache under ~/.codex. None of it is configuration: a
+# switch must not hand each profile its own copy, and `agman remove` must never
+# delete it. It follows the same shared-state path as Claude's sessions.
+
+TS="$TMP/toolstate"
+mkdir -p "$TS/.claude" "$TS/.codex/sessions" "$TS/.codex/.tmp" \
+  "$TS/.gemini/antigravity/browser" "$TS/.gemini/tmp/proj"
+cp "$HOME/.claude.json" "$TS/.claude.json"
+printf 'TS RULES\n' > "$TS/.claude/CLAUDE.md"
+printf '{"m":1}\n' > "$TS/.codex/config.toml"
+printf 'rollout\n' > "$TS/.codex/sessions/r1.jsonl"
+printf 'plugin blob\n' > "$TS/.codex/.tmp/p.bin"
+printf 'G RULES\n' > "$TS/.gemini/GEMINI.md"
+printf 'browser profile\n' > "$TS/.gemini/antigravity/browser/data.bin"
+printf 'chat log\n' > "$TS/.gemini/tmp/proj/logs.json"
+tsrun() { env HOME="$TS" AGMAN_HOME="$TS/.agman" AGMAN_TOOLS="claude codex gemini" "$AGM" "$@"; }
+TSA="$TS/.agman"
+
+tsrun create one >/dev/null 2>&1
+tsrun create two >/dev/null 2>&1
+tsrun use one >/dev/null 2>&1
+assert_exists "tool state: antigravity moved into shared gemini state" "$TSA/.state/gemini/antigravity/browser/data.bin"
+assert_missing "tool state: antigravity not left in the backup profile" "$TSA/global/gemini/antigravity"
+assert_symlink_to "tool state: active profile links antigravity at shared state" "$TSA/one/gemini/antigravity" "$TSA/.state/gemini/antigravity"
+assert_exists "tool state: antigravity reachable through ~/.gemini" "$TS/.gemini/antigravity/browser/data.bin"
+assert_exists "tool state: gemini tmp moved into shared state" "$TSA/.state/gemini/tmp/proj/logs.json"
+assert_exists "tool state: codex rollouts moved into shared codex state" "$TSA/.state/codex/sessions/r1.jsonl"
+assert_exists "tool state: codex plugin cache moved into shared codex state" "$TSA/.state/codex/.tmp/p.bin"
+assert_symlink_to "tool state: active profile links codex sessions at shared state" "$TSA/one/codex/sessions" "$TSA/.state/codex/sessions"
+assert_eq "tool state: gemini config stays in the backup profile" "G RULES" "$(cat "$TSA/global/gemini/GEMINI.md")"
+assert_eq "tool state: codex config stays in the backup profile" '{"m":1}' "$(cat "$TSA/global/codex/config.toml")"
+assert_missing "tool state: claude entries keep the flat layout" "$TSA/.state/claude"
+
+# Written under one profile, visible from the other, never duplicated.
+printf 'new rollout\n' > "$TS/.codex/sessions/r2.jsonl"
+tsrun use two >/dev/null 2>&1
+assert_exists "tool state: codex session written under one profile is visible from the other" "$TS/.codex/sessions/r2.jsonl"
+assert_exists "tool state: antigravity follows the switch" "$TS/.gemini/antigravity/browser/data.bin"
+assert_symlink_to "tool state: second profile links antigravity at shared state" "$TSA/two/gemini/antigravity" "$TSA/.state/gemini/antigravity"
+assert_contains "tool state: doctor counts profiles linked through tool state" "$(tsrun doctor)" "2 profile(s) linked"
+
+# remove deletes the profile's links, never the data behind them.
+assert_ok "tool state: remove a profile that links shared tool state" tsrun remove -y one
+assert_exists "tool state: removing a profile keeps antigravity" "$TSA/.state/gemini/antigravity/browser/data.bin"
+assert_exists "tool state: removing a profile keeps codex rollouts" "$TSA/.state/codex/sessions/r1.jsonl"
+
+# Seeding a profile from the current configs must not clone the bulk either.
+printf 'TWO RULES\n' > "$TS/.gemini/GEMINI.md"
+tsrun create three --copy-current >/dev/null 2>&1
+assert_missing "tool state: copy-current skips antigravity" "$TSA/three/gemini/antigravity"
+assert_missing "tool state: copy-current skips codex sessions" "$TSA/three/codex/sessions"
+assert_eq "tool state: copy-current still copies gemini config" "TWO RULES" "$(cat "$TSA/three/gemini/GEMINI.md")"
+
+# off hands everything back as real paths under the tools' own dirs.
+tsrun off >/dev/null 2>&1
+assert_real_dir "tool state: off restores ~/.gemini" "$TS/.gemini"
+if [ -L "$TS/.gemini/antigravity" ]; then
+  bad "tool state: off restores antigravity as a real directory"
+else
+  assert_exists "tool state: off restores antigravity as a real directory" "$TS/.gemini/antigravity/browser/data.bin"
+fi
+assert_exists "tool state: off restores codex rollouts written under a profile" "$TS/.codex/sessions/r2.jsonl"
+assert_exists "tool state: off restores the codex plugin cache" "$TS/.codex/.tmp/p.bin"
+assert_missing "tool state: shared state directory cleaned up by off" "$TSA/.state"
+
 # --- migration from the legacy (layout 1) profile shape ------------------------------------
 
 G="$TMP/legacy"

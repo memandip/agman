@@ -554,3 +554,30 @@ version, pre-release, and a non-semver value, which fails loudly.
 
 The tap bump still needs the `HOMEBREW_TAP_TOKEN` secret; without it `homebrew.yml` is dispatched
 and skips with a notice, so releases succeed and only the formula waits.
+
+### v0.16.0 — the tap bumps itself, and non-config state leaves the profiles
+
+**[Certain]** Every `homebrew.yml` run from 0.11.0 through 0.15.0 failed at
+`POST /repos/memandip/homebrew-agman/git/refs` with `403 Resource not accessible by personal
+access token`: the `HOMEBREW_TAP_TOKEN` secret exists but cannot write to the tap, so the formula
+sat at 0.6.0 through nine releases. Rather than depend on that token for the write, the bump now
+lives in the tap ([`bump.yml`](https://github.com/memandip/homebrew-agman/blob/main/.github/workflows/bump.yml))
+under the tap's own `GITHUB_TOKEN`: rewrite `url`/`sha256`, `brew tap` the checkout, `brew install`
++ `brew test` + `brew audit --strict` on the runner, then push to `main`. `homebrew.yml` here only
+dispatches it (so the secret needs just Actions write on the tap), and the tap polls the latest
+release hourly as a fallback — a missing or under-scoped secret can delay a bump, not lose it.
+
+**[Certain]** `brew install agman` with a bare name is a homebrew-core question, not a code one:
+the repository is past the 30-day age gate but not the notability bar (75 stars / 30 forks /
+30 watchers; it has 4 stars). `brew install memandip/agman/agman` is the one-liner until then; it
+taps and trusts the tap on the way, after which the bare name works.
+
+Profiles also stopped absorbing state other products park in the managed trees. `agman use`
+moved the whole real `~/.gemini` into the profile, Antigravity's multi-GB browser profile
+included; likewise Codex rollouts and its plugin cache under `~/.codex`. These were already
+excluded from seeding and cloud sync but still lived inside profile trees — duplicated per
+profile and deleted by `agman remove`. They now follow Claude's sessions into
+`~/.agman/.state/<tool>/`, symlinked from every profile (`ADAPTER_STATE`), and come back as real
+directories on `agman off`. Claude's `plugins/` (1.1 GB on the reference machine, mostly
+`plugins/cache` and `plugins/marketplaces`) was left per-profile on purpose: which plugins a
+profile has is persona, and `create --from --link-plugins` already shares the tree when wanted.
