@@ -241,6 +241,7 @@ agman update
 | `cloud <subcommand>` | Sync profiles with an [agman cloud](https://github.com/memandip/agman-cloud) server: `login` (URL defaults to the public server at `https://agman.vercel.app`), `push [name] [--dry-run]`, `pull <name> [--as <local>] [--force]`, `init <org-slug>` (new profile from a team default), `list`, `status`, `logout`. Pushes are versioned and encrypted at rest server-side. **A synced profile is a persona, not a login:** account material (the identity file, `.credentials.json`, per-profile tokens, codex/gemini auth, any `.env`) and ephemeral state (sessions, history, caches, `tmp`, logs — including state other products drop into the managed trees, like Antigravity's browser profile inside `~/.gemini`) stay local by default and are stripped on pull; a push is refused if a synced file looks like it holds a secret. `push --dry-run` lists every file a push would carry with its size, without contacting the server; a payload over the server limit is refused before upload with the largest files named. The limit is read from the server when it advertises one (`maxPushBytes` for direct requests — hosting platforms like Vercel cap function bodies at ~4.5 MB — and `blobPushBytes` for the presigned blob-upload flow, which carries archives up to agman-cloud's 25 MB maximum straight to blob storage, bypassing the function body limit); pushes pick the right path automatically. `AGMAN_CLOUD_MAX_PUSH_BYTES` overrides and forces the direct path. Interactive pushes show curl's transfer bar during the upload (auto-detected on a terminal; `AGMAN_PROGRESS=1/0` forces/suppresses it). `--include-secrets` (push) / `--with-secrets` (pull) opt into carrying account material for your own machine-to-machine restore. Pulls treat a downloaded profile as untrusted — they strip `hooks`/`apiKeyHelper` from `settings.json`, never touch shared-state symlinks, back up an existing profile first, and refuse the active profile without `--force`. Reinstallable plugin artifacts (plugin caches, marketplace clones, catalog data) are never synced in either direction; pull reinstalls them into the pulled profile from its own references (`settings.json` enabledPlugins + `plugins/known_marketplaces.json`) via the `claude` CLI — set `AGMAN_CLOUD_NO_INSTALL=1` to skip. Dependency artifacts (`.venv`/`venv`, `node_modules`, `__pycache__`, `.git` — e.g. under a cloned MCP server in `~/.claude/mcp-servers`) and agman's shared-state merge leftovers (`*.agman-conflict`, `*.agman-orphaned`) are never synced either: the sources next to them sync, and the artifacts are rebuilt on the target machine (`pip install` / `npm install` / `git clone`). Locally cloned profiles keep them — the exclusion is cloud-only. `https` is required (override with `AGMAN_CLOUD_INSECURE=1`); the API key is passed to `curl` via a mode-600 file, never the command line. `agman cloud --verbose <sub>` (or `AGMAN_VERBOSE=1`) logs the request line, push payload size, and response code |
 | `update` | Self-update from git or GitHub |
 | `doctor` | Diagnose setup: tool detection, per-path link state, per-profile auth, layout version |
+| `stealth <subcommand>` | Block a forced OTEL exporter from leaving this machine (see [Stealth](#stealth-block-a-forced-otel-exporter)): `claude --otel <endpoint> [--profile <name>] [-- args]` launches Claude through a local mitmproxy that answers `<endpoint>`'s host with 403, dropping telemetry while everything else still works; `stop` / `status` manage the daemon. Needs mitmproxy (`mitmdump`) + `lsof` + `curl`. |
 | `init [zsh\|bash]` | Optional per-shell integration (see below) |
 
 ## Per-shell profiles (optional)
@@ -264,6 +265,35 @@ eval "$(agman init zsh)"   # or: init bash
 - **Profiles share one account by default** — see [Accounts](#accounts-switching-profiles-does-not-log-you-out). Per-profile accounts are Phase 4 on the roadmap. Treat profile dirs as sensitive: they can hold credentials and MCP tokens.
 - **`agman update` and the curl installer need `curl`.** Everything else is bash plus standard tools; `jq` or `python3` improves profile creation but is not required.
 - `CLAUDE_CONFIG_DIR` (used by the per-shell layer) is honored by the Claude Code CLI but not officially documented ([anthropics/claude-code#33430](https://github.com/anthropics/claude-code/issues/33430)). The global symlink switch does not depend on it.
+
+## Stealth: block a forced OTEL exporter
+
+Some Claude Code team accounts inject an OpenTelemetry exporter (`OTEL_EXPORTER_OTLP_ENDPOINT`)
+that cannot be switched off by hand. `agman stealth` blocks it at the network layer, so the
+telemetry never leaves your machine:
+
+```bash
+agman stealth claude --otel https://otel.acme-corp.example/v1/traces
+```
+
+`stealth claude` launches your regular `claude` through a local [mitmproxy](https://mitmproxy.org)
+daemon that answers every request to `<endpoint>`'s host with `403`, drops the OTEL POSTs, and
+passes everything else through — so `api.anthropic.com` and the rest keep working. `--otel` is
+required. Add `--` to forward extra args (e.g. `-- --resume`), and `--profile <name>` to also set
+`CLAUDE_CONFIG_DIR` to that profile's config.
+
+```bash
+agman stealth claude --otel https://otel.acme-corp.example/v1/traces --profile work -- --resume
+agman stealth status     # is the proxy daemon running, and blocking which host?
+agman stealth stop       # stop the daemon
+```
+
+The daemon persists across sessions until you `stealth stop` it. Its state — including the small
+generated mitmproxy addon (`block_otel.py`) — lives under `~/.agman/.stealth`, so it is never
+synced or cloned with a profile. This command needs mitmproxy (`mitmdump`), `lsof`, and `curl`,
+checked only when you run it (like `cloud` needs `curl`/`tar`); the rest of agman stays
+dependency-free. The port defaults to `8080` (override with `AGMAN_STEALTH_PORT`); the
+mitmproxy CA is read from `~/.mitmproxy/mitmproxy-ca-cert.pem` (override with `AGMAN_STEALTH_CA`).
 
 ## Development
 
