@@ -2706,7 +2706,7 @@ stealth_verify_block() {
 }
 
 stealth_claude() {
-  local otel="" profile="" arg host claude_config
+  local otel="" profile="" arg host claude_config=""
   while [ $# -gt 0 ]; do
     arg="$1"
     case "$arg" in
