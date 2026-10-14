@@ -1493,13 +1493,22 @@ exec sleep 300
 EOF
 chmod +x "$TMP/stealthbin/mitmdump"
 
-# Reports no listener on the `-F p` form (used by stealth_port_owner's pre-check
-# so ensure_daemon reaches start_daemon) and a fake listener otherwise (so the
-# startup wait loop succeeds) — no real socket needed.
+# Reports no listener on the `-F p` form (used by stealth_port_owner) so
+# ensure_daemon reaches start_daemon, and a fake listener otherwise. With
+# STEALTH_LSOF_COUNT set, the first two `-F p` calls instead report a "foreign"
+# listener — exercising the replace-untracked-daemon path.
 cat > "$TMP/stealthbin/lsof" <<'EOF'
 #!/usr/bin/env bash
 case " $* " in
-  *" -F "*) : ;;
+  *" -F "*)
+    if [ -n "${STEALTH_LSOF_COUNT:-}" ]; then
+      n="$(cat "$STEALTH_LSOF_COUNT" 2>/dev/null || true)"
+      n="${n:-0}"
+      n=$((n + 1))
+      printf '%s' "$n" > "$STEALTH_LSOF_COUNT"
+      [ "$n" -le 2 ] && printf 'p424242\n'
+    fi
+    ;;
   *) printf 'p424242\n' ;;
 esac
 exit 0
@@ -1575,6 +1584,27 @@ assert_eq "host change restarts the daemon" "2" "$(wc -l < "$TMP/stealthlog/mitm
 assert_ok "stealth stop" stealth_run stealth stop
 assert_missing "stop removes the pid file" "$AGMAN_HOME/.stealth/mitmdump.pid"
 assert_contains "status is calm after stop" "$(stealth_run stealth status)" "No stealth daemon"
+
+# an untracked mitmdump already on the port must be replaced with our own, not
+# silently adopted — the adopt path both leaked (it never verified the blocked
+# host) and crashed (it wrote to a state dir it had never created).
+cat > "$TMP/stealthbin/ps" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+  *" -o comm="*) printf 'mitmdump\n' ;;
+esac
+exit 0
+EOF
+chmod +x "$TMP/stealthbin/ps"
+
+rm -rf "$AGMAN_HOME/.stealth"          # recreate the crash precondition
+STEALTH_LSOF_COUNT="$TMP/stealthlog/lsof.count" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example" >/dev/null 2>&1 \
+  && ok "stealth replaces an untracked daemon without crashing" \
+  || bad "stealth replaces an untracked daemon without crashing"
+assert_contains "replacement blocks the requested host" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"otel.acme-corp.example"'
+assert_ok "stealth stop after replacement" stealth_run stealth stop
 
 # --- misc ------------------------------------------------------------------------------------------
 
