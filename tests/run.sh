@@ -1414,6 +1414,100 @@ assert_ok "cloud logout removes credentials" cloud_run cloud logout
 assert_missing "cloud credentials gone after logout" "$AGMAN_HOME/.cloud"
 assert_ok "push --dry-run needs no login" cloud_run cloud push personal --dry-run
 
+# --- stealth -----------------------------------------------------------------------------------------
+
+mkdir -p "$TMP/stealthbin" "$TMP/stealthlog"
+
+cat > "$TMP/stealthbin/mitmdump" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STEALTH_MITM_ARGS:-/dev/null}"
+exec sleep 300
+EOF
+chmod +x "$TMP/stealthbin/mitmdump"
+
+# Reports no listener on the `-F p` form (used by stealth_port_owner's pre-check
+# so ensure_daemon reaches start_daemon) and a fake listener otherwise (so the
+# startup wait loop succeeds) — no real socket needed.
+cat > "$TMP/stealthbin/lsof" <<'EOF'
+#!/usr/bin/env bash
+case " $* " in
+  *" -F "*) : ;;
+  *) printf 'p424242\n' ;;
+esac
+exit 0
+EOF
+chmod +x "$TMP/stealthbin/lsof"
+
+cat > "$TMP/stealthbin/curl" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${STEALTH_CURL_ARGS:-/dev/null}"
+printf '403'
+EOF
+chmod +x "$TMP/stealthbin/curl"
+
+cat > "$TMP/stealthbin/claude" <<'EOF'
+#!/usr/bin/env bash
+printf 'HTTPS_PROXY=%s HTTP_PROXY=%s NO_PROXY=%s NODE_EXTRA_CA_CERTS=%s CLAUDE_CONFIG_DIR=%s ARGS=%s\n' \
+  "${HTTPS_PROXY:-}" "${HTTP_PROXY:-}" "${NO_PROXY:-}" "${NODE_EXTRA_CA_CERTS:-}" "${CLAUDE_CONFIG_DIR:-}" "$*" \
+  >> "${STEALTH_CLAUDE_LOG:-/dev/null}"
+EOF
+chmod +x "$TMP/stealthbin/claude"
+
+stealth_run() {
+  env PATH="$TMP/stealthbin:$PATH" \
+    STEALTH_MITM_ARGS="$TMP/stealthlog/mitm.args" \
+    STEALTH_CURL_ARGS="$TMP/stealthlog/curl.args" \
+    STEALTH_CLAUDE_LOG="$TMP/stealthlog/claude" \
+    "$AGM" "$@"
+}
+
+# --otel is required — fails before any daemon, proxy, or dependency work.
+assert_fail "stealth claude requires --otel" stealth_run stealth claude
+out="$(stealth_run stealth claude 2>&1 || true)"
+assert_contains "missing --otel says it is required" "$out" "requires --otel"
+assert_fail "unknown stealth subcommand fails" stealth_run stealth frobnicate
+assert_contains "help documents stealth" "$("$AGM" help)" "stealth <subcommand>"
+
+# calm no-daemon paths
+assert_contains "stealth status with no daemon is calm" "$(stealth_run stealth status)" "No stealth daemon"
+assert_ok "stealth stop with no daemon is calm" stealth_run stealth stop
+
+# pre-create the mitmproxy CA so ensure_ca does not try to generate it
+mkdir -p "$HOME/.mitmproxy"
+: > "$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+
+# happy path: parse a URL with userinfo+port+path, block its host, launch claude
+: > "$TMP/stealthlog/claude"
+: > "$TMP/stealthlog/mitm.args"
+assert_ok "stealth claude happy path" \
+  stealth_run stealth claude --otel "https://user:pass@otel.acme-corp.example:4318/v1/traces" -- --resume
+assert_contains "addon blocks the parsed host" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"otel.acme-corp.example"'
+assert_exists "stealth state lives under AGMAN_HOME" "$AGMAN_HOME/.stealth/block_otel.py"
+
+claude_log="$(cat "$TMP/stealthlog/claude")"
+assert_contains "claude gets the proxy set" "$claude_log" "HTTPS_PROXY=http://127.0.0.1:8080"
+assert_contains "claude gets the mitmproxy CA" "$claude_log" "NODE_EXTRA_CA_CERTS=$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
+assert_contains "claude forwards args after --" "$claude_log" "ARGS=--resume"
+assert_contains "mitmdump runs the generated addon" "$(cat "$TMP/stealthlog/mitm.args")" "block_otel.py"
+assert_contains "status reports the running daemon" "$(stealth_run stealth status)" "otel.acme-corp.example"
+
+# --profile sets CLAUDE_CONFIG_DIR; a changed host restarts the daemon
+assert_ok "create a profile for stealth --profile" "$AGM" create stealthprof
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude --profile" \
+  stealth_run stealth claude --otel "https://metrics.bigco.io" --profile stealthprof
+assert_contains "addon updated to the new host" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"metrics.bigco.io"'
+claude_log="$(cat "$TMP/stealthlog/claude")"
+assert_contains "--profile sets CLAUDE_CONFIG_DIR" "$claude_log" "CLAUDE_CONFIG_DIR=$AGMAN_HOME/stealthprof/claude"
+assert_eq "host change restarts the daemon" "2" "$(wc -l < "$TMP/stealthlog/mitm.args" | tr -d ' ')"
+
+# stop tears the daemon down
+assert_ok "stealth stop" stealth_run stealth stop
+assert_missing "stop removes the pid file" "$AGMAN_HOME/.stealth/mitmdump.pid"
+assert_contains "status is calm after stop" "$(stealth_run stealth status)" "No stealth daemon"
+
 # --- misc ------------------------------------------------------------------------------------------
 
 assert_ok "help runs" "$AGM" help
