@@ -2669,8 +2669,17 @@ stealth_stop_daemon() {
 }
 
 stealth_start_daemon() {
-  local host="$1" pid i
+  local host="$1" pid i lp
   mkdir -p "$STEALTH_DIR"
+  # Wait out a just-stopped daemon so we don't fail to bind its port.
+  for i in {1..30}; do
+    lp="$(stealth_port_owner || true)"
+    [ -z "$lp" ] && break
+    sleep 0.1
+  done
+  if [ -n "$(stealth_port_owner || true)" ]; then
+    die "port $STEALTH_PORT is still in use; free it or set AGMAN_STEALTH_PORT"
+  fi
   cat > "$STEALTH_ADDON_FILE" <<PYEOF
 from mitmproxy import http
 
@@ -2714,6 +2723,7 @@ PYEOF
 
 stealth_ensure_daemon() {
   local host="$1" pid lp current_host
+  mkdir -p "$STEALTH_DIR"
   pid="$(stealth_daemon_pid || true)"
   if [ -n "$pid" ]; then
     current_host=""
@@ -2729,13 +2739,14 @@ stealth_ensure_daemon() {
   fi
   lp="$(stealth_port_owner || true)"
   if [ -n "$lp" ]; then
-    if stealth_is_mitmdump "$lp"; then
-      printf 'Adopting existing mitmdump on port %s (pid %s).\n' "$STEALTH_PORT" "$lp"
-      printf '%s\n' "$lp" > "$STEALTH_PID_FILE"
-      printf '%s\n' "$host" > "$STEALTH_HOST_FILE"
-      return 0
+    if ! stealth_is_mitmdump "$lp"; then
+      die "port $STEALTH_PORT is in use by pid $lp (not mitmdump); free it or set AGMAN_STEALTH_PORT"
     fi
-    die "port $STEALTH_PORT is in use by pid $lp (not mitmdump); free it or set AGMAN_STEALTH_PORT"
+    # An untracked mitmdump on our port blocks a host we cannot verify (it may
+    # have been started by an earlier standalone run with a different target),
+    # so adopting it could silently leak telemetry. Stop it and start our own.
+    printf 'Replacing untracked mitmdump on port %s (pid %s) with our own.\n' "$STEALTH_PORT" "$lp"
+    stealth_stop_daemon
   fi
   stealth_start_daemon "$host"
 }
