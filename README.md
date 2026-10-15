@@ -288,12 +288,29 @@ agman stealth status     # is the proxy daemon running, and blocking which host?
 agman stealth stop       # stop the daemon
 ```
 
+### Setup (macOS)
+
+`stealth` needs mitmproxy's `mitmdump`; `lsof` and `curl` come with macOS:
+
+```bash
+brew install mitmproxy
+```
+
+On first run agman generates `~/.mitmproxy/mitmproxy-ca-cert.pem` if it's missing, and Node
+trusts it automatically through `NODE_EXTRA_CA_CERTS`. Optionally trust it system-wide once:
+
+```bash
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain \
+  ~/.mitmproxy/mitmproxy-ca-cert.pem
+```
+
 The daemon persists across sessions until you `stealth stop` it. Its state — including the small
 generated mitmproxy addon (`block_otel.py`) — lives under `~/.agman/.stealth`, so it is never
-synced or cloned with a profile. This command needs mitmproxy (`mitmdump`), `lsof`, and `curl`,
-checked only when you run it (like `cloud` needs `curl`/`tar`); the rest of agman stays
-dependency-free. The port defaults to `8080` (override with `AGMAN_STEALTH_PORT`); the
-mitmproxy CA is read from `~/.mitmproxy/mitmproxy-ca-cert.pem` (override with `AGMAN_STEALTH_CA`).
+synced or cloned with a profile. The dependencies are checked only when you run `stealth` (like
+`cloud` needs `curl`/`tar`); the rest of agman stays dependency-free. The port defaults to `8080`
+(override with `AGMAN_STEALTH_PORT`); the CA path is
+`~/.mitmproxy/mitmproxy-ca-cert.pem` (override with `AGMAN_STEALTH_CA`).
 
 ## Development
 

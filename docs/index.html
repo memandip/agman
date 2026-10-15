@@ -206,6 +206,7 @@
       <a href="#why" class="hide-sm">Why</a>
       <a href="#use-cases">Use cases</a>
       <a href="#how" class="hide-sm">How it works</a>
+      <a href="#stealth" class="hide-sm">Stealth</a>
       <a href="#roadmap">Roadmap</a>
       <a href="https://github.com/memandip/agman">GitHub</a>
     </nav>
@@ -220,10 +221,10 @@
     agents, MCP servers, and settings across Claude Code, Codex, and Gemini.
   </p>
   <div class="badges">
-    <span class="badge ok">v0.5.0</span>
-    <span class="badge">pure bash, zero dependencies</span>
+    <span class="badge ok">v0.17.1</span>
+    <span class="badge">pure bash</span>
     <span class="badge">macOS · Linux · WSL</span>
-    <span class="badge">204 tests, CI on two platforms</span>
+    <span class="badge">483 tests, CI on two platforms</span>
     <span class="badge">MIT</span>
   </div>
   <div class="cta">
@@ -326,6 +327,20 @@
         <h3>Lighter context windows</h3>
         <p>Only the instructions and skills that matter for this context get loaded, instead of
         one global file that grew to cover everything.</p>
+      </div>
+      <div class="card">
+        <span class="ico">🕶️</span>
+        <h3>Block forced telemetry</h3>
+        <p>Some team accounts inject an OTEL exporter you can't switch off.
+        <code>agman stealth</code> drops those exports at the network layer while everything
+        else keeps working.</p>
+      </div>
+      <div class="card">
+        <span class="ico">☁️</span>
+        <h3>Sync profiles across machines</h3>
+        <p><code>agman cloud</code> pushes and pulls versioned, encrypted profiles to an
+        <a href="https://github.com/memandip/agman-cloud">agman cloud</a> server — account
+        material stays local.</p>
       </div>
     </div>
   </div>
@@ -436,6 +451,29 @@ agman logout work    # back to your shared account</pre>
   </div>
 </section>
 
+<section id="stealth">
+  <div class="wrap">
+    <div class="kicker">Stealth</div>
+    <h2>Block a forced OTEL exporter</h2>
+    <p class="lede">
+      Some Claude Code team accounts inject an OpenTelemetry exporter
+      (<code>OTEL_EXPORTER_OTLP_ENDPOINT</code>) you can't switch off. <code>agman stealth</code>
+      drops those exports at the network layer — so telemetry never leaves your machine — while
+      <code>api.anthropic.com</code> and everything else keeps working.
+    </p>
+    <pre class="code">agman stealth claude --otel https://otel.acme-corp.example/v1/traces
+
+agman stealth status    # is the daemon running, and blocking which host?
+agman stealth stop      # stop the daemon</pre>
+    <div class="note">
+      <strong>Needs mitmproxy.</strong> Install it once with <code>brew install mitmproxy</code>;
+      <code>lsof</code> and <code>curl</code> come with macOS. On first run agman generates its
+      mitmproxy CA and Node trusts it automatically through <code>NODE_EXTRA_CA_CERTS</code>.
+      The daemon persists between sessions until you run <code>agman stealth stop</code>.
+    </div>
+  </div>
+</section>
+
 <section id="roadmap">
   <div class="wrap">
     <div class="kicker">Roadmap</div>
@@ -479,13 +517,37 @@ agman logout work    # back to your shared account</pre>
           a profile's account holds up in editors as well as the terminal.</p>
         </div>
       </li>
+      <li class="done">
+        <span class="mark">✓</span>
+        <div>
+          <h3>Profile syncing <span class="ver">v0.8.0</span></h3>
+          <p><code>agman cloud</code> pushes and pulls versioned, encrypted profiles to an
+          <a href="https://github.com/memandip/agman-cloud">agman cloud</a> server. Account
+          material and ephemeral state stay local by default.</p>
+        </div>
+      </li>
+      <li class="done">
+        <span class="mark">✓</span>
+        <div>
+          <h3>Shared state per tool <span class="ver">v0.16.0</span></h3>
+          <p>Session transcripts and history survive profile switches, and Codex rollouts plus
+          Gemini's browser profile are stored once, outside any single profile.</p>
+        </div>
+      </li>
+      <li class="done">
+        <span class="mark">✓</span>
+        <div>
+          <h3>Stealth <span class="ver">v0.17.0</span></h3>
+          <p><code>agman stealth claude --otel …</code> blocks a team-forced OTEL exporter at the
+          network layer so telemetry never leaves the machine.</p>
+        </div>
+      </li>
       <li class="next">
         <span class="mark">→</span>
         <div>
-          <h3>Shareable profiles <span class="ver">next</span></h3>
-          <p>Push and pull profiles through a git remote you own, plus an <code>.agman</code> file
-          in a project root so <code>agman use</code> fetches the right profile for that repo.
-          Credentials stay excluded by design.</p>
+          <h3>Profile sharing over git <span class="ver">next</span></h3>
+          <p>Push and pull profiles through a git remote you own, so teams can share a profile
+          without a hosted service. Credentials stay excluded by design.</p>
         </div>
       </li>
       <li class="later">
@@ -494,14 +556,6 @@ agman logout work    # back to your shared account</pre>
           <h3>More tools and shells <span class="ver">later</span></h3>
           <p>Qwen Code and Kimi CLI adapters once their layouts are verified, fish support, and
           shell completions.</p>
-        </div>
-      </li>
-      <li class="later">
-        <span class="mark">·</span>
-        <div>
-          <h3>Hosted profile sync <span class="ver">exploring</span></h3>
-          <p>Optional cloud storage with end-to-end encryption and company sign-in, only if there
-          is real demand for it. Git remotes cover most of the need without a service.</p>
         </div>
       </li>
     </ul>
@@ -514,10 +568,10 @@ agman logout work    # back to your shared account</pre>
     <h2>What "verified" means here</h2>
     <div class="grid g3">
       <div class="card">
-        <h3>204 assertions, two platforms</h3>
-        <p>Every release runs the suite on macOS bash 3.2 and Linux bash 5.2 — one of them
-        without <code>jq</code>, <code>python3</code>, or <code>curl</code>, so the fallback paths
-        are exercised too. shellcheck runs on every commit.</p>
+        <h3>483 assertions, two platforms</h3>
+        <p>Every release runs the full suite on macOS (bash 3.2) and Linux, and shellcheck runs on
+        every commit. The suite is dependency-free — bash and coreutils only — with
+        <code>jq</code> or <code>python3</code> used only for optional JSON-merge paths.</p>
       </div>
       <div class="card">
         <h3>Checked against the real tools</h3>
