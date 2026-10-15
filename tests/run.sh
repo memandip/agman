@@ -1573,6 +1573,19 @@ grep -qF 'otel\.acme-corp\.example' "$TMP/stealthlog/mitm.args" \
   || bad "allow-hosts regex names the blocked host"
 assert_contains "status reports the running daemon" "$(stealth_run stealth status)" "otel.acme-corp.example"
 
+# claude args pass through without needing a `--` separator, in either order
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude forwards claude flags directly" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example" --resume c908d8bf-a8c9-4ca3-85ec-c14d996e43d3
+claude_log="$(cat "$TMP/stealthlog/claude")"
+assert_contains "claude gets --resume directly" "$claude_log" "ARGS=--resume c908d8bf-a8c9-4ca3-85ec-c14d996e43d3"
+
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude forwards flags before --otel" \
+  stealth_run stealth claude --resume xyz --otel "https://otel.acme-corp.example"
+claude_log="$(cat "$TMP/stealthlog/claude")"
+assert_contains "claude gets flags even before --otel" "$claude_log" "ARGS=--resume xyz"
+
 # --profile sets CLAUDE_CONFIG_DIR; a changed host restarts the daemon
 assert_ok "create a profile for stealth --profile" "$AGM" create stealthprof
 : > "$TMP/stealthlog/claude"

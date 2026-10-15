@@ -2802,16 +2802,19 @@ stealth_verify_block() {
 
 stealth_claude() {
   local otel="" profile="" arg host claude_config=""
+  local claude_args n=0
+  claude_args=()
+  # --otel/--profile belong to stealth; every other argument (positionals and
+  # claude flags like --resume, --continue, -p) is forwarded to claude as-is,
+  # in order, whether or not a `--` separator is present.
   while [ $# -gt 0 ]; do
-    arg="$1"
+    arg="$1"; shift
     case "$arg" in
-      --otel) shift; otel="${1:-}"; [ -n "$otel" ] || usage_die "--otel requires a value" ;;
-      --profile) shift; profile="${1:-}"; [ -n "$profile" ] || usage_die "--profile requires a profile name" ;;
-      --) shift; break ;;
-      -*) usage_die "unknown option '$arg' for stealth claude" ;;
-      *) usage_die "unexpected argument '$arg' (put claude args after --)" ;;
+      --otel) otel="${1:-}"; [ -n "$otel" ] || usage_die "--otel requires a value"; shift ;;
+      --profile) profile="${1:-}"; [ -n "$profile" ] || usage_die "--profile requires a profile name"; shift ;;
+      --) while [ $# -gt 0 ]; do claude_args[$n]="$1"; n=$((n+1)); shift; done ;;
+      *) claude_args[$n]="$arg"; n=$((n+1)) ;;
     esac
-    shift
   done
 
   [ -n "$otel" ] || die "stealth claude requires --otel <endpoint>: the OTLP exporter endpoint to block"
@@ -2841,7 +2844,7 @@ stealth_claude() {
     export CLAUDE_CONFIG_DIR="$claude_config"
   fi
   printf 'Launching claude with OTEL host %s blocked.\n' "$host"
-  exec claude ${1+"$@"}
+  exec claude ${claude_args[@]+"${claude_args[@]}"}
 }
 
 stealth_status() {
@@ -2873,7 +2876,7 @@ cmd_stealth() {
     stop)   stealth_stop_daemon ;;
     status) stealth_status ;;
     ""|-h|--help)
-      printf 'Usage: agman stealth claude --otel <endpoint> [--profile <name>] [-- <claude args>]\n'
+      printf 'Usage: agman stealth claude --otel <endpoint> [--profile <name>] [<claude args>]\n'
       printf '       agman stealth stop\n'
       printf '       agman stealth status\n'
       ;;
@@ -2941,11 +2944,12 @@ Commands:
                          (override with AGMAN_CLOUD_INSECURE=1).
   stealth <subcommand>   Block a forced OTEL exporter from leaving this machine
                          (needs mitmproxy + lsof + curl):
-                           claude --otel <endpoint> [--profile <name>] [-- <args>]
+                           claude --otel <endpoint> [--profile <name>] [<claude args>]
                              Launch claude through a local proxy that answers
                              <endpoint>'s host with 403, dropping OTEL telemetry
                              while api.anthropic.com and the rest still work.
-                             --otel is required.
+                             --otel is required. Claude args (e.g. --resume)
+                             are forwarded as-is.
                            stop    Stop the stealth proxy daemon
                            status  Show whether the daemon is running
                          State lives under ~/.agman/.stealth; the daemon persists
