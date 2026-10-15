@@ -1628,6 +1628,20 @@ out="$(STEALTH_CURL_CODE=200 stealth_run stealth claude --otel "https://otel.acm
 assert_contains "stealth fails closed when the block check leaks" "$out" "telemetry would leak"
 assert_ok "stealth stop after fail-closed check" stealth_run stealth stop
 
+# multiple comma-separated endpoints block all their hosts (de-duplicated)
+: > "$TMP/stealthlog/claude"
+: > "$TMP/stealthlog/mitm.args"
+assert_ok "stealth claude blocks multiple hosts" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example, metrics.bigco.io , otel.acme-corp.example"
+assert_contains "addon lists every host" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["metrics.bigco.io", "otel.acme-corp.example"]'
+grep -qF '(metrics\.bigco\.io|otel\.acme-corp\.example)' "$TMP/stealthlog/mitm.args" \
+  && ok "allow-hosts regex covers both hosts" \
+  || bad "allow-hosts regex covers both hosts"
+assert_contains "status lists both hosts" \
+  "$(stealth_run stealth status)" "metrics.bigco.io, otel.acme-corp.example"
+assert_ok "stealth stop after multi-host" stealth_run stealth stop
+
 # --- misc ------------------------------------------------------------------------------------------
 
 assert_ok "help runs" "$AGM" help
