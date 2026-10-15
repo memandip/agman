@@ -1573,6 +1573,19 @@ grep -qF 'otel\.acme-corp\.example' "$TMP/stealthlog/mitm.args" \
   || bad "allow-hosts regex names the blocked host"
 assert_contains "status reports the running daemon" "$(stealth_run stealth status)" "otel.acme-corp.example"
 
+# claude args pass through without needing a `--` separator, in either order
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude forwards claude flags directly" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example" --resume c908d8bf-a8c9-4ca3-85ec-c14d996e43d3
+claude_log="$(cat "$TMP/stealthlog/claude")"
+assert_contains "claude gets --resume directly" "$claude_log" "ARGS=--resume c908d8bf-a8c9-4ca3-85ec-c14d996e43d3"
+
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude forwards flags before --otel" \
+  stealth_run stealth claude --resume xyz --otel "https://otel.acme-corp.example"
+claude_log="$(cat "$TMP/stealthlog/claude")"
+assert_contains "claude gets flags even before --otel" "$claude_log" "ARGS=--resume xyz"
+
 # --profile sets CLAUDE_CONFIG_DIR; a changed host restarts the daemon
 assert_ok "create a profile for stealth --profile" "$AGM" create stealthprof
 : > "$TMP/stealthlog/claude"
@@ -1614,6 +1627,20 @@ assert_ok "stealth stop after replacement" stealth_run stealth stop
 out="$(STEALTH_CURL_CODE=200 stealth_run stealth claude --otel "https://otel.acme-corp.example" 2>&1 || true)"
 assert_contains "stealth fails closed when the block check leaks" "$out" "telemetry would leak"
 assert_ok "stealth stop after fail-closed check" stealth_run stealth stop
+
+# multiple comma-separated endpoints block all their hosts (de-duplicated)
+: > "$TMP/stealthlog/claude"
+: > "$TMP/stealthlog/mitm.args"
+assert_ok "stealth claude blocks multiple hosts" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example, metrics.bigco.io , otel.acme-corp.example"
+assert_contains "addon lists every host" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["metrics.bigco.io", "otel.acme-corp.example"]'
+grep -qF '(metrics\.bigco\.io|otel\.acme-corp\.example)' "$TMP/stealthlog/mitm.args" \
+  && ok "allow-hosts regex covers both hosts" \
+  || bad "allow-hosts regex covers both hosts"
+assert_contains "status lists both hosts" \
+  "$(stealth_run stealth status)" "metrics.bigco.io, otel.acme-corp.example"
+assert_ok "stealth stop after multi-host" stealth_run stealth stop
 
 # --- misc ------------------------------------------------------------------------------------------
 

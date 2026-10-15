@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.17.2"
+AGMAN_VERSION="0.18.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -2615,6 +2615,48 @@ stealth_host_of_url() {
   printf '%s' "$host" | tr '[:upper:]' '[:lower:]'
 }
 
+# Comma-separated OTLP endpoints -> newline-separated, sorted, de-duplicated hosts.
+stealth_hosts_of_urls() {
+  local list="${1:-}" item host
+  list="${list},"
+  while [ -n "$list" ]; do
+    item="${list%%,*}"
+    list="${list#*,}"
+    item="$(printf '%s' "$item" | tr -d '[:space:]')"
+    [ -n "$item" ] || continue
+    host="$(stealth_host_of_url "$item")"
+    [ -n "$host" ] && printf '%s\n' "$host"
+  done | sort -u
+}
+
+# newline-separated hosts -> comma-separated, for display.
+stealth_hosts_commas() { printf '%s' "$1" | tr '\n' ',' | sed 's/,$//; s/,/, /g'; }
+
+# newline-separated hosts -> Python list literal, e.g. ["a.com", "b.com"].
+stealth_hosts_pylist() {
+  local hosts="$1" h py=""
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    py="${py:+$py, }\"$h\""
+  done <<EOF
+$hosts
+EOF
+  printf '[%s]' "$py"
+}
+
+# newline-separated hosts -> a single --allow-hosts regex (alternation).
+stealth_hosts_regex() {
+  local hosts="$1" h esc alt=""
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    esc="$(printf '%s' "$h" | sed 's/\./\\./g')"
+    alt="${alt:+$alt|}$esc"
+  done <<EOF
+$hosts
+EOF
+  printf '^(.*\.)?(%s)(:[0-9]+)?$' "$alt"
+}
+
 stealth_require_deps() {
   command -v mitmdump >/dev/null 2>&1 || die "mitmdump (mitmproxy) is required for stealth (brew install mitmproxy)"
   command -v lsof     >/dev/null 2>&1 || die "lsof is required for stealth"
@@ -2669,7 +2711,7 @@ stealth_stop_daemon() {
 }
 
 stealth_start_daemon() {
-  local host="$1" pid i lp allowhost
+  local hosts="$1" pid i lp pylist allowre
   mkdir -p "$STEALTH_DIR"
   # Wait out a just-stopped daemon so we don't fail to bind its port.
   for i in {1..30}; do
@@ -2680,13 +2722,15 @@ stealth_start_daemon() {
   if [ -n "$(stealth_port_owner || true)" ]; then
     die "port $STEALTH_PORT is still in use; free it or set AGMAN_STEALTH_PORT"
   fi
+  pylist="$(stealth_hosts_pylist "$hosts")"
   cat > "$STEALTH_ADDON_FILE" <<PYEOF
 from mitmproxy import http
 
-BLOCKED_HOST = "${host}"
+BLOCKED_HOSTS = ${pylist}
 
 def request(flow: http.HTTPFlow) -> None:
-    if flow.request.pretty_host == BLOCKED_HOST or flow.request.pretty_host.endswith("." + BLOCKED_HOST):
+    h = flow.request.pretty_host
+    if any(h == b or h.endswith("." + b) for b in BLOCKED_HOSTS):
         flow.response = http.Response.make(
             403,
             b"blocked by agman stealth",
@@ -2695,13 +2739,14 @@ def request(flow: http.HTTPFlow) -> None:
         print("[agman stealth] blocked %s %s" % (flow.request.method, flow.request.pretty_url), flush=True)
 PYEOF
 
-  # Intercept only the blocked host; pass everything else through un-decrypted so
+  # Intercept only the blocked hosts; pass everything else through un-decrypted so
   # tools that don't trust the mitmproxy CA (uv, gh, curl, git, …) see the real
   # server certificate and keep working. Dots are escaped for the regex.
-  allowhost="$(printf '%s' "$host" | sed 's/\./\\./g')"
-  printf 'Starting stealth daemon on 127.0.0.1:%s (blocking %s)...\n' "$STEALTH_PORT" "$host"
+  allowre="$(stealth_hosts_regex "$hosts")"
+  printf 'Starting stealth daemon on 127.0.0.1:%s (blocking %s)...\n' \
+    "$STEALTH_PORT" "$(stealth_hosts_commas "$hosts")"
   nohup mitmdump --listen-host 127.0.0.1 --listen-port "$STEALTH_PORT" \
-    --allow-hosts "^(.*\\.)?${allowhost}(:[0-9]+)?$" \
+    --allow-hosts "$allowre" \
     -s "$STEALTH_ADDON_FILE" \
     >"$STEALTH_LOG_FILE" 2>&1 </dev/null &
   pid=$!
@@ -2723,24 +2768,24 @@ PYEOF
   fi
 
   printf '%s\n' "$pid" > "$STEALTH_PID_FILE"
-  printf '%s\n' "$host" > "$STEALTH_HOST_FILE"
+  printf '%s\n' "$hosts" > "$STEALTH_HOST_FILE"
   printf 'Stealth daemon started (pid %s). Log: %s\n' "$pid" "$STEALTH_LOG_FILE"
 }
 
 stealth_ensure_daemon() {
-  local host="$1" pid lp current_host
+  local hosts="$1" pid lp current_host
   mkdir -p "$STEALTH_DIR"
   pid="$(stealth_daemon_pid || true)"
   if [ -n "$pid" ]; then
     current_host=""
     [ -f "$STEALTH_HOST_FILE" ] && current_host="$(<"$STEALTH_HOST_FILE")"
-    if [ "$current_host" = "$host" ]; then
+    if [ "$current_host" = "$hosts" ]; then
       printf 'Reusing stealth daemon (pid %s, port %s).\n' "$pid" "$STEALTH_PORT"
       return 0
     fi
-    printf 'Blocked host changed (%s -> %s); restarting.\n' "${current_host:-<none>}" "$host"
+    printf 'Blocked hosts changed; restarting (now: %s).\n' "$(stealth_hosts_commas "$hosts")"
     stealth_stop_daemon
-    stealth_start_daemon "$host"
+    stealth_start_daemon "$hosts"
     return 0
   fi
   lp="$(stealth_port_owner || true)"
@@ -2748,13 +2793,12 @@ stealth_ensure_daemon() {
     if ! stealth_is_mitmdump "$lp"; then
       die "port $STEALTH_PORT is in use by pid $lp (not mitmdump); free it or set AGMAN_STEALTH_PORT"
     fi
-    # An untracked mitmdump on our port blocks a host we cannot verify (it may
-    # have been started by an earlier standalone run with a different target),
-    # so adopting it could silently leak telemetry. Stop it and start our own.
+    # An untracked mitmdump on our port blocks hosts we cannot verify, so adopting
+    # it could silently leak telemetry. Stop it and start our own.
     printf 'Replacing untracked mitmdump on port %s (pid %s) with our own.\n' "$STEALTH_PORT" "$lp"
     stealth_stop_daemon
   fi
-  stealth_start_daemon "$host"
+  stealth_start_daemon "$hosts"
 }
 
 # Ensure the mitmproxy CA exists (Node trusts it via NODE_EXTRA_CA_CERTS even
@@ -2784,34 +2828,39 @@ stealth_ensure_ca() {
 # response that reached the real server is a hard stop. An unreachable host
 # (000) is only a warning — nothing can leak when the host is down.
 stealth_verify_block() {
-  local host="$1" code
-  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 -k \
-    -x "http://127.0.0.1:${STEALTH_PORT}" "https://${host}/" 2>/dev/null || true)"
-  code="${code:-000}"
-  if [ "$code" = "403" ]; then
-    printf 'Block verified: %s -> 403.\n' "$host"
-    return 0
-  fi
-  if [ "$code" = "000" ]; then
-    printf 'agman: warning: could not verify the block for %s (connection failed).\n' "$host" >&2
-    printf 'agman: continuing; check %s if telemetry still leaves this machine.\n' "$STEALTH_LOG_FILE" >&2
-    return 0
-  fi
-  die "block check for ${host} returned ${code} (expected 403) — telemetry would leak; check ${STEALTH_LOG_FILE}"
+  local hosts="$1" h code
+  while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 -k \
+      -x "http://127.0.0.1:${STEALTH_PORT}" "https://${h}/" 2>/dev/null || true)"
+    code="${code:-000}"
+    if [ "$code" = "403" ]; then
+      printf 'Block verified: %s -> 403.\n' "$h"
+    elif [ "$code" = "000" ]; then
+      printf 'agman: warning: could not verify the block for %s (connection failed).\n' "$h" >&2
+    else
+      die "block check for ${h} returned ${code} (expected 403) — telemetry would leak; check ${STEALTH_LOG_FILE}"
+    fi
+  done <<EOF
+$hosts
+EOF
 }
 
 stealth_claude() {
-  local otel="" profile="" arg host claude_config=""
+  local otel="" profile="" arg hosts claude_config=""
+  local claude_args n=0
+  claude_args=()
+  # --otel/--profile belong to stealth; every other argument (positionals and
+  # claude flags like --resume, --continue, -p) is forwarded to claude as-is,
+  # in order, whether or not a `--` separator is present.
   while [ $# -gt 0 ]; do
-    arg="$1"
+    arg="$1"; shift
     case "$arg" in
-      --otel) shift; otel="${1:-}"; [ -n "$otel" ] || usage_die "--otel requires a value" ;;
-      --profile) shift; profile="${1:-}"; [ -n "$profile" ] || usage_die "--profile requires a profile name" ;;
-      --) shift; break ;;
-      -*) usage_die "unknown option '$arg' for stealth claude" ;;
-      *) usage_die "unexpected argument '$arg' (put claude args after --)" ;;
+      --otel) otel="${1:-}"; [ -n "$otel" ] || usage_die "--otel requires a value"; shift ;;
+      --profile) profile="${1:-}"; [ -n "$profile" ] || usage_die "--profile requires a profile name"; shift ;;
+      --) while [ $# -gt 0 ]; do claude_args[$n]="$1"; n=$((n+1)); shift; done ;;
+      *) claude_args[$n]="$arg"; n=$((n+1)) ;;
     esac
-    shift
   done
 
   [ -n "$otel" ] || die "stealth claude requires --otel <endpoint>: the OTLP exporter endpoint to block"
@@ -2819,8 +2868,8 @@ stealth_claude() {
   stealth_require_deps
   command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
 
-  host="$(stealth_host_of_url "$otel")"
-  [ -n "$host" ] || die "could not parse a host from --otel '$otel'"
+  hosts="$(stealth_hosts_of_urls "$otel")"
+  [ -n "$hosts" ] || die "could not parse a host from --otel '$otel'"
 
   if [ -n "$profile" ]; then
     require_profile "$profile"
@@ -2829,8 +2878,8 @@ stealth_claude() {
   fi
 
   stealth_ensure_ca
-  stealth_ensure_daemon "$host"
-  stealth_verify_block "$host"
+  stealth_ensure_daemon "$hosts"
+  stealth_verify_block "$hosts"
 
   export HTTPS_PROXY="http://127.0.0.1:${STEALTH_PORT}"
   export HTTP_PROXY="http://127.0.0.1:${STEALTH_PORT}"
@@ -2840,19 +2889,19 @@ stealth_claude() {
   if [ -n "$claude_config" ]; then
     export CLAUDE_CONFIG_DIR="$claude_config"
   fi
-  printf 'Launching claude with OTEL host %s blocked.\n' "$host"
-  exec claude ${1+"$@"}
+  printf 'Launching claude with OTEL hosts %s blocked.\n' "$(stealth_hosts_commas "$hosts")"
+  exec claude ${claude_args[@]+"${claude_args[@]}"}
 }
 
 stealth_status() {
-  local pid lp host
+  local pid lp hosts
   pid="$(stealth_daemon_pid || true)"
   if [ -n "$pid" ]; then
-    host="<unknown>"
-    [ -f "$STEALTH_HOST_FILE" ] && host="$(<"$STEALTH_HOST_FILE")"
+    hosts="<unknown>"
+    [ -f "$STEALTH_HOST_FILE" ] && hosts="$(<"$STEALTH_HOST_FILE")"
     printf 'Stealth daemon running (pid %s, port %s).\n' "$pid" "$STEALTH_PORT"
-    printf '  Blocked host: %s\n' "$host"
-    printf '  State dir:    %s\n' "$STEALTH_DIR"
+    printf '  Blocked hosts: %s\n' "$(stealth_hosts_commas "$hosts")"
+    printf '  State dir:     %s\n' "$STEALTH_DIR"
     return 0
   fi
   lp="$(stealth_port_owner || true)"
@@ -2873,7 +2922,7 @@ cmd_stealth() {
     stop)   stealth_stop_daemon ;;
     status) stealth_status ;;
     ""|-h|--help)
-      printf 'Usage: agman stealth claude --otel <endpoint> [--profile <name>] [-- <claude args>]\n'
+      printf 'Usage: agman stealth claude --otel <endpoint>[,<endpoint>…] [--profile <name>] [<claude args>]\n'
       printf '       agman stealth stop\n'
       printf '       agman stealth status\n'
       ;;
@@ -2941,11 +2990,12 @@ Commands:
                          (override with AGMAN_CLOUD_INSECURE=1).
   stealth <subcommand>   Block a forced OTEL exporter from leaving this machine
                          (needs mitmproxy + lsof + curl):
-                           claude --otel <endpoint> [--profile <name>] [-- <args>]
+                           claude --otel <endpoint>[,<endpoint>…] [--profile <name>] [<claude args>]
                              Launch claude through a local proxy that answers
-                             <endpoint>'s host with 403, dropping OTEL telemetry
-                             while api.anthropic.com and the rest still work.
-                             --otel is required.
+                             every listed endpoint's host with 403, dropping OTEL
+                             telemetry while api.anthropic.com and the rest still
+                             work. --otel is required (comma-separate hosts).
+                             Claude args (e.g. --resume) are forwarded as-is.
                            stop    Stop the stealth proxy daemon
                            status  Show whether the daemon is running
                          State lives under ~/.agman/.stealth; the daemon persists
