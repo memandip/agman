@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.17.1"
+AGMAN_VERSION="0.17.2"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -2669,7 +2669,7 @@ stealth_stop_daemon() {
 }
 
 stealth_start_daemon() {
-  local host="$1" pid i lp
+  local host="$1" pid i lp allowhost
   mkdir -p "$STEALTH_DIR"
   # Wait out a just-stopped daemon so we don't fail to bind its port.
   for i in {1..30}; do
@@ -2695,8 +2695,14 @@ def request(flow: http.HTTPFlow) -> None:
         print("[agman stealth] blocked %s %s" % (flow.request.method, flow.request.pretty_url), flush=True)
 PYEOF
 
+  # Intercept only the blocked host; pass everything else through un-decrypted so
+  # tools that don't trust the mitmproxy CA (uv, gh, curl, git, …) see the real
+  # server certificate and keep working. Dots are escaped for the regex.
+  allowhost="$(printf '%s' "$host" | sed 's/\./\\./g')"
   printf 'Starting stealth daemon on 127.0.0.1:%s (blocking %s)...\n' "$STEALTH_PORT" "$host"
-  nohup mitmdump --listen-host 127.0.0.1 --listen-port "$STEALTH_PORT" -s "$STEALTH_ADDON_FILE" \
+  nohup mitmdump --listen-host 127.0.0.1 --listen-port "$STEALTH_PORT" \
+    --allow-hosts "^(.*\\.)?${allowhost}(:[0-9]+)?$" \
+    -s "$STEALTH_ADDON_FILE" \
     >"$STEALTH_LOG_FILE" 2>&1 </dev/null &
   pid=$!
   disown 2>/dev/null || true
@@ -2773,8 +2779,10 @@ stealth_ensure_ca() {
   fi
 }
 
-# Confirm the block actually fires (403) before launching, so a misconfigured
-# proxy can't silently leak telemetry. Non-fatal: a warning, not a hard stop.
+# Confirm the block fires before launching. With --allow-hosts a wrong regex
+# would pass the OTEL host through un-blocked and telemetry would leak, so a
+# response that reached the real server is a hard stop. An unreachable host
+# (000) is only a warning — nothing can leak when the host is down.
 stealth_verify_block() {
   local host="$1" code
   code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 -k \
@@ -2782,9 +2790,14 @@ stealth_verify_block() {
   code="${code:-000}"
   if [ "$code" = "403" ]; then
     printf 'Block verified: %s -> 403.\n' "$host"
-  else
-    printf 'agman: warning: block check for %s returned %s (expected 403).\n' "$host" "$code" >&2
+    return 0
   fi
+  if [ "$code" = "000" ]; then
+    printf 'agman: warning: could not verify the block for %s (connection failed).\n' "$host" >&2
+    printf 'agman: continuing; check %s if telemetry still leaves this machine.\n' "$STEALTH_LOG_FILE" >&2
+    return 0
+  fi
+  die "block check for ${host} returned ${code} (expected 403) — telemetry would leak; check ${STEALTH_LOG_FILE}"
 }
 
 stealth_claude() {
