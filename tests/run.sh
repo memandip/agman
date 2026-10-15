@@ -1518,7 +1518,7 @@ chmod +x "$TMP/stealthbin/lsof"
 cat > "$TMP/stealthbin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${STEALTH_CURL_ARGS:-/dev/null}"
-printf '403'
+printf '%s' "${STEALTH_CURL_CODE:-403}"
 EOF
 chmod +x "$TMP/stealthbin/curl"
 
@@ -1567,6 +1567,10 @@ assert_contains "claude gets the proxy set" "$claude_log" "HTTPS_PROXY=http://12
 assert_contains "claude gets the mitmproxy CA" "$claude_log" "NODE_EXTRA_CA_CERTS=$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 assert_contains "claude forwards args after --" "$claude_log" "ARGS=--resume"
 assert_contains "mitmdump runs the generated addon" "$(cat "$TMP/stealthlog/mitm.args")" "block_otel.py"
+assert_contains "mitmdump only intercepts the blocked host" "$(cat "$TMP/stealthlog/mitm.args")" "--allow-hosts"
+grep -qF 'otel\.acme-corp\.example' "$TMP/stealthlog/mitm.args" \
+  && ok "allow-hosts regex names the blocked host" \
+  || bad "allow-hosts regex names the blocked host"
 assert_contains "status reports the running daemon" "$(stealth_run stealth status)" "otel.acme-corp.example"
 
 # --profile sets CLAUDE_CONFIG_DIR; a changed host restarts the daemon
@@ -1605,6 +1609,11 @@ STEALTH_LSOF_COUNT="$TMP/stealthlog/lsof.count" \
 assert_contains "replacement blocks the requested host" \
   "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"otel.acme-corp.example"'
 assert_ok "stealth stop after replacement" stealth_run stealth stop
+
+# a response that reached the real server means the block did not fire — fail closed
+out="$(STEALTH_CURL_CODE=200 stealth_run stealth claude --otel "https://otel.acme-corp.example" 2>&1 || true)"
+assert_contains "stealth fails closed when the block check leaks" "$out" "telemetry would leak"
+assert_ok "stealth stop after fail-closed check" stealth_run stealth stop
 
 # --- misc ------------------------------------------------------------------------------------------
 
