@@ -1642,6 +1642,18 @@ assert_contains "status lists both hosts" \
   "$(stealth_run stealth status)" "metrics.bigco.io, otel.acme-corp.example"
 assert_ok "stealth stop after multi-host" stealth_run stealth stop
 
+# a daemon started before the 0.17.2 passthrough fix has no allow_hosts marker;
+# stealth must restart it (not reuse) so it doesn't MITM everything and break
+# tools that don't trust the mitmproxy CA
+assert_ok "stealth claude starts a passthrough daemon" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example"
+rm -f "$AGMAN_HOME/.stealth/allow_hosts"      # simulate a pre-0.17.2 daemon
+: > "$TMP/stealthlog/mitm.args"
+assert_ok "stealth restarts a daemon missing the passthrough marker" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example"
+assert_eq "stale daemon is re-launched" "1" "$(wc -l < "$TMP/stealthlog/mitm.args" | tr -d ' ')"
+assert_ok "stealth stop after stale-daemon restart" stealth_run stealth stop
+
 # --- misc ------------------------------------------------------------------------------------------
 
 assert_ok "help runs" "$AGM" help
