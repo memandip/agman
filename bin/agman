@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.18.1"
+AGMAN_VERSION="0.19.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -2944,11 +2944,99 @@ cmd_stealth() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# interactive menu
+#
+# `agman` with no arguments (and a terminal) drops into a menu that guides the
+# user through the common actions. Each choice calls the matching cmd_* function
+# with prompted inputs, so behavior is identical to the equivalent command.
+# `select` re-prompts after each action (loop-back) until Quit (or ^C / ^D).
+
+cmd_menu() {
+  local choice
+  printf 'agman %s — what would you like to do?\n' "$AGMAN_VERSION"
+  PS3='Choose an action (1-8): '
+  select choice in \
+    "Switch profile" \
+    "Create profile" \
+    "Run claude in stealth mode" \
+    "Turn off (deactivate)" \
+    "Diagnose (doctor)" \
+    "List profiles" \
+    "Help" \
+    "Quit"; do
+    case "$choice" in
+      "Switch profile")             menu_switch ;;
+      "Create profile")             menu_create ;;
+      "Run claude in stealth mode") menu_stealth ;;
+      "Turn off (deactivate)")      menu_off ;;
+      "Diagnose (doctor)")          cmd_doctor ;;
+      "List profiles")              cmd_list ;;
+      "Help")                       cmd_help ;;
+      "Quit")                       break ;;
+      *) printf 'Pick a number from 1 to 8.\n' ;;
+    esac
+    printf '\n'
+  done
+  printf 'Goodbye.\n'
+  return 0
+}
+
+menu_switch() {
+  local name=""
+  printf '\nProfiles:\n'
+  cmd_list
+  printf '\n'
+  read -r -p 'Profile to activate: ' name
+  if [ -z "$name" ]; then
+    printf 'Canceled.\n'
+  elif [ -d "$(profile_dir "$name")" ]; then
+    cmd_use "$name"
+  else
+    printf "No profile named '%s'.\n" "$name"
+  fi
+}
+
+menu_create() {
+  local name="" copy=""
+  read -r -p 'New profile name: ' name
+  [ -n "$name" ] || { printf 'Canceled.\n'; return 0; }
+  read -r -p 'Seed from your current config? [y/N]: ' copy
+  case "$copy" in
+    y|Y|yes|YES) cmd_create "$name" --copy-current ;;
+    *)           cmd_create "$name" ;;
+  esac
+}
+
+menu_stealth() {
+  local otel="" profile=""
+  read -r -p 'OTEL endpoint(s) to block (comma-separate for several): ' otel
+  [ -n "$otel" ] || { printf 'Canceled (--otel is required).\n'; return 0; }
+  read -r -p 'Profile [optional, Enter to skip]: ' profile
+  if [ -n "$profile" ]; then
+    cmd_stealth claude --otel "$otel" --profile "$profile"
+  else
+    cmd_stealth claude --otel "$otel"
+  fi
+}
+
+menu_off() {
+  local yn=""
+  read -r -p 'Deactivate agman and restore your original configs? [y/N]: ' yn
+  case "$yn" in
+    y|Y|yes|YES) cmd_off ;;
+    *) printf 'Canceled.\n' ;;
+  esac
+}
+
 cmd_help() {
   cat <<EOF
 agman $AGMAN_VERSION — agent manager: config profiles for AI coding agents
 
 Usage: agman <command> [args]
+
+With no command, 'agman' opens an interactive menu on a terminal (set AGMAN_MENU=1
+to force it when stdin isn't a terminal, e.g. for scripting).
 
 Commands:
   create <name> [opts]   Create a profile (empty, with a starter CLAUDE.md).
@@ -3052,6 +3140,8 @@ Environment:
   AGMAN_PROGRESS         Transfer progress for cloud push uploads. Auto: shown
                          only when stderr is a terminal. 1 forces on, 0 off.
   AGMAN_RAW_URL          Update source (default: GitHub main branch)
+  AGMAN_MENU             1 runs the interactive menu even when stdin isn't a
+                          terminal (used to script or test the menu).
 EOF
 }
 
@@ -3059,8 +3149,16 @@ EOF
 # dispatch
 
 main() {
-  local cmd="${1:-help}"
+  local cmd="${1:-}"
   [ $# -gt 0 ] && shift
+  if [ -z "$cmd" ]; then
+    if [ -t 0 ] || [ "${AGMAN_MENU:-0}" = "1" ]; then
+      cmd_menu
+    else
+      cmd_help
+    fi
+    return
+  fi
   case "$cmd" in
     create)  cmd_create ${1+"$@"} ;;
     list|ls) cmd_list ;;

@@ -32,6 +32,9 @@ $ claude                             # every new session now uses 'work'
 $ agman off                          # fully restore your original configs
 ```
 
+Prefer a guided flow? Run `agman` with no arguments to open an interactive menu — it
+walks you through switching, creating, or running stealth, and prompts for any inputs.
+
 ## How it works
 
 `agman use <name>` symlinks every managed config path at the profile (including `~/.claude.json`, so user-scope MCP servers follow it):
