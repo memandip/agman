@@ -1667,6 +1667,24 @@ assert_fail "remove an unknown profile fails" "$AGM" remove staging --yes
 assert_fail "use an unknown profile fails" "$AGM" use nosuch
 assert_fail "dir for an unknown profile fails" "$AGM" dir nosuch
 
+# --- interactive menu ---------------------------------------------------------------
+
+assert_ok "create a profile for the menu" "$AGM" create menuprof
+
+# no terminal: fall back to help (unchanged), not the menu
+assert_contains "no-arg on a non-TTY shows help" "$("$AGM" </dev/null)" "Usage: agman"
+assert_lacks  "no-arg on a non-TTY avoids the menu" "$("$AGM" </dev/null)" "Switch profile"
+
+# AGMAN_MENU=1 forces the menu so it can be driven by scripted stdin
+printf '8\n' | AGMAN_MENU=1 "$AGM" >/dev/null 2>&1 \
+  && ok "menu quits cleanly on 'Quit'" \
+  || bad "menu quits cleanly on 'Quit'"
+out="$(printf '6\n8\n' | AGMAN_MENU=1 "$AGM" 2>&1 || true)"
+assert_contains "menu 'List profiles' runs cmd_list" "$out" "menuprof"
+out="$(printf '1\nmenuprof\n8\n' | AGMAN_MENU=1 "$AGM" 2>&1 || true)"
+assert_symlink_to "menu 'Switch profile' activates the chosen profile" \
+  "$HOME/.claude" "$AGMAN_HOME/menuprof/claude"
+
 # --- summary --------------------------------------------------------------------
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
