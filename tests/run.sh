@@ -1538,6 +1538,18 @@ stealth_run() {
     "$AGM" "$@"
 }
 
+# The detached mitmdump stub records its invocation asynchronously, so poll until
+# it has written the expected number of lines before asserting on mitm.args.
+wait_for_mitm() {
+  local want="$1" n=0
+  while [ "$n" -lt 50 ]; do
+    [ "$(wc -l < "$TMP/stealthlog/mitm.args" 2>/dev/null | tr -d ' ')" -ge "$want" ] && return 0
+    sleep 0.1
+    n=$((n + 1))
+  done
+  return 1
+}
+
 # --otel is required — fails before any daemon, proxy, or dependency work.
 assert_fail "stealth claude requires --otel" stealth_run stealth claude
 out="$(stealth_run stealth claude 2>&1 || true)"
@@ -1566,6 +1578,7 @@ claude_log="$(cat "$TMP/stealthlog/claude")"
 assert_contains "claude gets the proxy set" "$claude_log" "HTTPS_PROXY=http://127.0.0.1:8080"
 assert_contains "claude gets the mitmproxy CA" "$claude_log" "NODE_EXTRA_CA_CERTS=$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 assert_contains "claude forwards args after --" "$claude_log" "ARGS=--resume"
+wait_for_mitm 1
 assert_contains "mitmdump runs the generated addon" "$(cat "$TMP/stealthlog/mitm.args")" "block_otel.py"
 assert_contains "mitmdump only intercepts the blocked host" "$(cat "$TMP/stealthlog/mitm.args")" "--allow-hosts"
 grep -qF 'otel\.acme-corp\.example' "$TMP/stealthlog/mitm.args" \
@@ -1595,6 +1608,7 @@ assert_contains "addon updated to the new host" \
   "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"metrics.bigco.io"'
 claude_log="$(cat "$TMP/stealthlog/claude")"
 assert_contains "--profile sets CLAUDE_CONFIG_DIR" "$claude_log" "CLAUDE_CONFIG_DIR=$AGMAN_HOME/stealthprof/claude"
+wait_for_mitm 2
 assert_eq "host change restarts the daemon" "2" "$(wc -l < "$TMP/stealthlog/mitm.args" | tr -d ' ')"
 
 # stop tears the daemon down
@@ -1635,6 +1649,7 @@ assert_ok "stealth claude blocks multiple hosts" \
   stealth_run stealth claude --otel "https://otel.acme-corp.example, metrics.bigco.io , otel.acme-corp.example"
 assert_contains "addon lists every host" \
   "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["metrics.bigco.io", "otel.acme-corp.example"]'
+wait_for_mitm 1
 grep -qF '(metrics\.bigco\.io|otel\.acme-corp\.example)' "$TMP/stealthlog/mitm.args" \
   && ok "allow-hosts regex covers both hosts" \
   || bad "allow-hosts regex covers both hosts"
@@ -1651,6 +1666,7 @@ rm -f "$AGMAN_HOME/.stealth/allow_hosts"      # simulate a pre-0.17.2 daemon
 : > "$TMP/stealthlog/mitm.args"
 assert_ok "stealth restarts a daemon missing the passthrough marker" \
   stealth_run stealth claude --otel "https://otel.acme-corp.example"
+wait_for_mitm 1
 assert_eq "stale daemon is re-launched" "1" "$(wc -l < "$TMP/stealthlog/mitm.args" | tr -d ' ')"
 assert_ok "stealth stop after stale-daemon restart" stealth_run stealth stop
 
