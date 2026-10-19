@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.18.0"
+AGMAN_VERSION="0.18.1"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -2600,6 +2600,10 @@ STEALTH_DIR="$AGMAN_HOME/.stealth"
 STEALTH_CA="${AGMAN_STEALTH_CA:-$HOME/.mitmproxy/mitmproxy-ca-cert.pem}"
 STEALTH_PID_FILE="$STEALTH_DIR/mitmdump.pid"
 STEALTH_HOST_FILE="$STEALTH_DIR/blocked_host"
+# Records the --allow-hosts regex the running daemon was started with. A daemon
+# predating the 0.17.2 passthrough fix has no such file, so stewardship can tell
+# a MITM-everything daemon apart from a passthrough one and restart stale ones.
+STEALTH_ALLOW_FILE="$STEALTH_DIR/allow_hosts"
 STEALTH_ADDON_FILE="$STEALTH_DIR/block_otel.py"
 STEALTH_LOG_FILE="$STEALTH_DIR/mitmdump.log"
 STEALTH_PORT="${AGMAN_STEALTH_PORT:-8080}"
@@ -2707,7 +2711,7 @@ stealth_stop_daemon() {
     printf 'Killing untracked mitmdump on port %s (pid %s).\n' "$STEALTH_PORT" "$lp"
     kill "$lp" 2>/dev/null || true
   fi
-  rm -f "$STEALTH_PID_FILE" "$STEALTH_HOST_FILE" "$STEALTH_ADDON_FILE"
+  rm -f "$STEALTH_PID_FILE" "$STEALTH_HOST_FILE" "$STEALTH_ADDON_FILE" "$STEALTH_ALLOW_FILE"
 }
 
 stealth_start_daemon() {
@@ -2769,21 +2773,31 @@ PYEOF
 
   printf '%s\n' "$pid" > "$STEALTH_PID_FILE"
   printf '%s\n' "$hosts" > "$STEALTH_HOST_FILE"
+  printf '%s\n' "$allowre" > "$STEALTH_ALLOW_FILE"
   printf 'Stealth daemon started (pid %s). Log: %s\n' "$pid" "$STEALTH_LOG_FILE"
 }
 
 stealth_ensure_daemon() {
-  local hosts="$1" pid lp current_host
+  local hosts="$1" pid lp current_host allowre current_allowre
   mkdir -p "$STEALTH_DIR"
   pid="$(stealth_daemon_pid || true)"
   if [ -n "$pid" ]; then
     current_host=""
     [ -f "$STEALTH_HOST_FILE" ] && current_host="$(<"$STEALTH_HOST_FILE")"
     if [ "$current_host" = "$hosts" ]; then
-      printf 'Reusing stealth daemon (pid %s, port %s).\n' "$pid" "$STEALTH_PORT"
-      return 0
+      # Reuse only a daemon started with the passthrough (--allow-hosts); one
+      # predating that fix MITMs everything and breaks git/uv/gh on its cert.
+      allowre="$(stealth_hosts_regex "$hosts")"
+      current_allowre=""
+      [ -f "$STEALTH_ALLOW_FILE" ] && current_allowre="$(<"$STEALTH_ALLOW_FILE")"
+      if [ "$current_allowre" = "$allowre" ]; then
+        printf 'Reusing stealth daemon (pid %s, port %s).\n' "$pid" "$STEALTH_PORT"
+        return 0
+      fi
+      printf 'Daemon predates the passthrough fix; restarting.\n'
+    else
+      printf 'Blocked hosts changed; restarting (now: %s).\n' "$(stealth_hosts_commas "$hosts")"
     fi
-    printf 'Blocked hosts changed; restarting (now: %s).\n' "$(stealth_hosts_commas "$hosts")"
     stealth_stop_daemon
     stealth_start_daemon "$hosts"
     return 0
