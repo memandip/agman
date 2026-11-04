@@ -1522,6 +1522,10 @@ cmd_run() {
   link_profile_identity "$(profile_dir "$name")"
   shift
   [ "${1:-}" = "--" ] && shift
+  if stealth_is_enabled "$name"; then
+    stealth_claude --profile "$name" -- ${1+"$@"}
+    return
+  fi
   command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
   local dir; dir="$(profile_dir "$name")"
   exec env CLAUDE_CONFIG_DIR="$(profile_claude_dir "$dir")" claude ${1+"$@"}
@@ -1547,6 +1551,7 @@ cmd_rename() {
   local was_active=0
   [ "$(active_profile 2>/dev/null || true)" = "$old" ] && was_active=1
   mv "$(profile_dir "$old")" "$(profile_dir "$new")"
+  stealth_rename_profile "$old" "$new"
   if [ "$(default_profile 2>/dev/null || true)" = "$old" ]; then
     printf '%s\n' "$new" > "$DEFAULT_FILE"
   fi
@@ -1592,6 +1597,7 @@ cmd_remove() {
     case "$reply" in y|Y|yes|YES) ;; *) printf 'Aborted.\n'; return 1 ;; esac
   fi
   rm -rf "$dir"
+  stealth_forget_profile "$name"
   if [ "$(default_profile 2>/dev/null || true)" = "$name" ]; then
     rm -f "$DEFAULT_FILE"
   fi
@@ -1951,6 +1957,11 @@ fi
 _agman_autoswitch
 
 claude() {
+  # A profile with `agman stealth enable` always launches through the proxy.
+  if command agman stealth enabled 2>/dev/null; then
+    command agman stealth claude -- "$@"
+    return $?
+  fi
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     command claude "$@"
     return $?
@@ -2674,6 +2685,11 @@ STEALTH_ALLOW_FILE="$STEALTH_DIR/allow_hosts"
 STEALTH_ADDON_FILE="$STEALTH_DIR/block_otel.py"
 STEALTH_LOG_FILE="$STEALTH_DIR/mitmdump.log"
 STEALTH_PORT="${AGMAN_STEALTH_PORT:-8080}"
+STEALTH_PROFILES_DIR="$STEALTH_DIR/profiles"
+STEALTH_OTEL_VARS="OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_TRACES_ENDPOINT OTEL_EXPORTER_OTLP_METRICS_ENDPOINT OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
+# Claude Code's admin-managed settings (macOS, Linux/WSL, Windows via Git Bash),
+# colon-separated. Overridable so tests never read the real machine's policy.
+STEALTH_MANAGED_FILES="${AGMAN_STEALTH_MANAGED:-/Library/Application Support/ClaudeCode/managed-settings.json:/etc/claude-code/managed-settings.json:/c/Program Files/ClaudeCode/managed-settings.json}"
 
 # Bare hostname out of an OTLP endpoint URL: strip scheme, userinfo, port,
 # path, query, and fragment. bash 3.2 has no ${var,,}, so lowercase via tr.
@@ -2732,6 +2748,114 @@ stealth_require_deps() {
   command -v mitmdump >/dev/null 2>&1 || die "mitmdump (mitmproxy) is required for stealth (brew install mitmproxy)"
   command -v lsof     >/dev/null 2>&1 || die "lsof is required for stealth"
   command -v curl     >/dev/null 2>&1 || die "curl is required for stealth"
+}
+
+# --- per-profile stealth config ---------------------------------------------
+#
+# Saved hosts and the enabled flag are machine-local, like the daemon: they
+# live under $STEALTH_DIR/profiles, not inside the profile tree, so a cloud
+# push or a `create --from` clone never turns stealth on somewhere mitmproxy
+# isn't installed. rename/remove keep them in step with the profile.
+
+stealth_profile_file() { printf '%s/%s.%s' "$STEALTH_PROFILES_DIR" "$1" "$2"; }
+
+stealth_saved_hosts() {
+  local f; f="$(stealth_profile_file "$1" hosts)"
+  [ -f "$f" ] && sed '/^$/d' "$f"
+  return 0
+}
+
+stealth_write_hosts() {
+  local name="$1" hosts="$2" f
+  f="$(stealth_profile_file "$name" hosts)"
+  if [ -z "$hosts" ]; then rm -f "$f"; return 0; fi
+  mkdir -p "$STEALTH_PROFILES_DIR"
+  printf '%s\n' "$hosts" | sed '/^$/d' | sort -u > "$f"
+}
+
+stealth_is_enabled() { [ -f "$(stealth_profile_file "$1" enabled)" ]; }
+
+stealth_forget_profile() {
+  rm -f "$(stealth_profile_file "$1" hosts)" "$(stealth_profile_file "$1" enabled)"
+}
+
+stealth_rename_profile() {
+  local old="$1" new="$2" ext
+  for ext in hosts enabled; do
+    [ -f "$(stealth_profile_file "$old" "$ext")" ] || continue
+    mv "$(stealth_profile_file "$old" "$ext")" "$(stealth_profile_file "$new" "$ext")"
+  done
+}
+
+# The profile a bare `claude` would run with here: the one CLAUDE_CONFIG_DIR
+# points into (a per-shell override always wins), else the active profile.
+stealth_current_profile() {
+  local name
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    profile_name_from_target "$CLAUDE_CONFIG_DIR" && return 0
+    return 1
+  fi
+  name="$(active_profile 2>/dev/null || default_profile 2>/dev/null)" || return 1
+  [ -n "$name" ] && printf '%s' "$name"
+}
+
+# --- auto-detection -----------------------------------------------------------
+#
+# Claude Code reads the exporter endpoint from the environment, which settings
+# files can inject through their "env" block: user settings, project settings
+# in the current directory, and the admin-managed file. Scanning for the
+# OTEL_EXPORTER_OTLP_*ENDPOINT keys is a plain grep — no JSON parser needed.
+# Loopback collectors are skipped: NO_PROXY bypasses the proxy for them, and
+# they don't send anything off the machine.
+
+stealth_is_loopback() {
+  case "$1" in
+    localhost|*.localhost|127.*|0.0.0.0|::1|\[*) return 0 ;;
+  esac
+  return 1
+}
+
+# "host<TAB>source" lines for one endpoint value.
+stealth_detect_emit() {
+  local val="$1" src="$2" h
+  stealth_hosts_of_urls "$val" | while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    stealth_is_loopback "$h" && continue
+    printf '%s\t%s\n' "$h" "$src"
+  done
+}
+
+# All OTEL endpoints Claude would see with the given config dir, as
+# "host<TAB>source" lines.
+stealth_detect() {
+  local claude_dir="${1:-}" var val f list
+  [ -n "$claude_dir" ] || claude_dir="${CLAUDE_CONFIG_DIR:-$TARGET_HOME/.claude}"
+  for var in $STEALTH_OTEL_VARS; do
+    eval "val=\${$var:-}"
+    [ -n "$val" ] && stealth_detect_emit "$val" "\$$var"
+  done
+  # Colon-separated so paths with spaces (macOS's managed dir) survive.
+  list="$claude_dir/settings.json:$claude_dir/settings.local.json:$PWD/.claude/settings.json:$PWD/.claude/settings.local.json:$STEALTH_MANAGED_FILES:"
+  while [ -n "$list" ]; do
+    f="${list%%:*}"; list="${list#*:}"
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    grep -o '"OTEL_EXPORTER_OTLP_[A-Z_]*ENDPOINT"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" 2>/dev/null \
+      | sed 's/^"[A-Z_]*"[[:space:]]*:[[:space:]]*"//; s/"$//' \
+      | while IFS= read -r val; do stealth_detect_emit "$val" "$f"; done
+  done
+  return 0
+}
+
+# Resolve the profile a stealth subcommand acts on: --profile wins, else the
+# current one. Dies with a hint when neither exists.
+stealth_target_profile() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    name="$(stealth_current_profile || true)"
+    [ -n "$name" ] || die "no active profile; pass --profile <name>"
+  fi
+  require_profile "$name"
+  printf '%s' "$name"
 }
 
 # PID from the tracked daemon pid file, or empty.
@@ -2851,6 +2975,10 @@ stealth_ensure_daemon() {
   if [ -n "$pid" ]; then
     current_host=""
     [ -f "$STEALTH_HOST_FILE" ] && current_host="$(<"$STEALTH_HOST_FILE")"
+    # Sessions launched earlier still route through this daemon. Replacing its
+    # host list would unblock their hosts mid-session, so it only ever grows;
+    # `agman stealth stop` is what resets it.
+    hosts="$(printf '%s\n%s\n' "$current_host" "$hosts" | sed '/^$/d' | sort -u)"
     if [ "$current_host" = "$hosts" ]; then
       # Reuse only a daemon started with the passthrough (--allow-hosts); one
       # predating that fix MITMs everything and breaks git/uv/gh on its cert.
@@ -2863,7 +2991,7 @@ stealth_ensure_daemon() {
       fi
       printf 'Daemon predates the passthrough fix; restarting.\n'
     else
-      printf 'Blocked hosts changed; restarting (now: %s).\n' "$(stealth_hosts_commas "$hosts")"
+      printf 'Adding blocked hosts; restarting (now: %s).\n' "$(stealth_hosts_commas "$hosts")"
     fi
     stealth_stop_daemon
     stealth_start_daemon "$hosts"
@@ -2928,35 +3056,82 @@ EOF
 }
 
 stealth_claude() {
-  local otel="" profile="" arg hosts claude_config=""
+  local otel="" profile="" arg hosts claude_config="" save=0 pname="" given saved detected h src
   local claude_args n=0
   claude_args=()
   # --otel/--profile belong to stealth; every other argument (positionals and
   # claude flags like --resume, --continue, -p) is forwarded to claude as-is,
   # in order, whether or not a `--` separator is present.
+  # --otel repeats and accepts --otel=<list>. An unquoted "a.com, b.com" reaches
+  # us as two words; a word ending in (or the next starting with) a comma
+  # continues the list, so b.com is blocked instead of becoming a claude prompt.
+  local val
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
-      --otel) otel="${1:-}"; [ -n "$otel" ] || usage_die "--otel requires a value"; shift ;;
+      --otel|--otel=*)
+        if [ "$arg" = "--otel" ]; then
+          [ $# -gt 0 ] || usage_die "--otel requires a value"
+          val="$1"; shift
+        else
+          val="${arg#--otel=}"
+        fi
+        while [ $# -gt 0 ]; do
+          case "$1" in -*) break ;; esac
+          case "$val" in
+            *,|*", "|*",  ") ;;
+            *) case "$1" in ,*) ;; *) break ;; esac ;;
+          esac
+          val="$val,$1"; shift
+        done
+        [ -n "$(printf '%s' "$val" | tr -d '[:space:],')" ] || usage_die "--otel requires a value"
+        otel="${otel:+$otel,}$val" ;;
       --profile) profile="${1:-}"; [ -n "$profile" ] || usage_die "--profile requires a profile name"; shift ;;
+      --save) save=1 ;;
       --) while [ $# -gt 0 ]; do claude_args[$n]="$1"; n=$((n+1)); shift; done ;;
       *) claude_args[$n]="$arg"; n=$((n+1)) ;;
     esac
   done
 
-  [ -n "$otel" ] || die "stealth claude requires --otel <endpoint>: the OTLP exporter endpoint to block"
+  if [ -n "$profile" ]; then
+    require_profile "$profile"
+    pname="$profile"
+    claude_config="$(profile_claude_dir "$(profile_dir "$profile")")"
+  else
+    pname="$(stealth_current_profile || true)"
+  fi
+
+  given=""
+  if [ -n "$otel" ]; then
+    given="$(stealth_hosts_of_urls "$otel")"
+    [ -n "$given" ] || die "could not parse a host from --otel '$otel'"
+  fi
+  if [ "$save" = "1" ]; then
+    [ -n "$given" ] || usage_die "--save requires --otel <host>"
+    [ -n "$pname" ] || die "--save needs a profile; pass --profile <name>"
+    stealth_write_hosts "$pname" "$(printf '%s\n%s\n' "$(stealth_saved_hosts "$pname")" "$given")"
+    printf "Saved %s for profile '%s'.\n" "$(stealth_hosts_commas "$given")" "$pname"
+  fi
+
+  # Block the union of --otel, the profile's saved hosts, and whatever Claude
+  # would be configured to export to: blocking an extra host is harmless,
+  # missing one leaks.
+  saved=""
+  [ -n "$pname" ] && saved="$(stealth_saved_hosts "$pname")"
+  detected="$(stealth_detect "$claude_config")"
+  if [ -n "$detected" ]; then
+    printf '%s\n' "$detected" | while IFS="$(printf '\t')" read -r h src; do
+      printf 'Detected OTEL host %s (%s).\n' "$h" "$src"
+    done
+  fi
+  hosts="$(printf '%s\n%s\n%s\n' "$given" "$saved" "$(printf '%s\n' "$detected" | cut -f1)" | sed '/^$/d' | sort -u)"
+  if [ -z "$hosts" ]; then
+    die "stealth claude requires --otel <host>: nothing is saved for ${pname:-this profile} and no OTEL exporter was detected"
+  fi
 
   stealth_require_deps
   command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
-
-  hosts="$(stealth_hosts_of_urls "$otel")"
-  [ -n "$hosts" ] || die "could not parse a host from --otel '$otel'"
-
-  if [ -n "$profile" ]; then
-    require_profile "$profile"
-    link_profile_identity "$(profile_dir "$profile")"
-    claude_config="$(profile_claude_dir "$(profile_dir "$profile")")"
-  fi
+  [ -n "$profile" ] && link_profile_identity "$(profile_dir "$profile")"
 
   stealth_ensure_ca
   stealth_ensure_daemon "$hosts"
@@ -2975,7 +3150,7 @@ stealth_claude() {
 }
 
 stealth_status() {
-  local pid lp hosts
+  local pid lp hosts f name saved state seen=""
   pid="$(stealth_daemon_pid || true)"
   if [ -n "$pid" ]; then
     hosts="<unknown>"
@@ -2983,31 +3158,136 @@ stealth_status() {
     printf 'Stealth daemon running (pid %s, port %s).\n' "$pid" "$STEALTH_PORT"
     printf '  Blocked hosts: %s\n' "$(stealth_hosts_commas "$hosts")"
     printf '  State dir:     %s\n' "$STEALTH_DIR"
+  else
+    lp="$(stealth_port_owner || true)"
+    if [ -n "$lp" ] && stealth_is_mitmdump "$lp"; then
+      printf 'Port %s held by untracked mitmdump (pid %s).\n' "$STEALTH_PORT" "$lp"
+    elif [ -n "$lp" ]; then
+      printf 'Port %s held by pid %s (not mitmdump).\n' "$STEALTH_PORT" "$lp"
+    else
+      printf 'No stealth daemon running.\n'
+    fi
+  fi
+  for f in "$STEALTH_PROFILES_DIR"/*.hosts "$STEALTH_PROFILES_DIR"/*.enabled; do
+    [ -f "$f" ] || continue
+    name="${f##*/}"; name="${name%.*}"
+    case "$seen/" in */"$name"/*) continue ;; esac
+    [ -n "$seen" ] || printf 'Profiles:\n'
+    seen="$seen/$name"
+    state="off"; stealth_is_enabled "$name" && state="on"
+    saved="$(stealth_saved_hosts "$name")"
+    printf '  %-14s stealth %-3s  saved hosts: %s\n' "$name" "$state" \
+      "$( [ -n "$saved" ] && stealth_hosts_commas "$saved" || printf 'none')"
+  done
+}
+
+# agman stealth detect [--profile <name>]
+stealth_cmd_detect() {
+  local profile="" arg dir="" out
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --profile) profile="${1:-}"; [ -n "$profile" ] || usage_die "--profile requires a profile name"; shift ;;
+      *) usage_die "unexpected argument '$arg' for stealth detect" ;;
+    esac
+  done
+  if [ -n "$profile" ]; then
+    require_profile "$profile"
+    dir="$(profile_claude_dir "$(profile_dir "$profile")")"
+  fi
+  out="$(stealth_detect "$dir")"
+  if [ -z "$out" ]; then
+    printf 'No OTEL exporter endpoint detected.\n'
     return 0
   fi
-  lp="$(stealth_port_owner || true)"
-  if [ -n "$lp" ] && stealth_is_mitmdump "$lp"; then
-    printf 'Port %s held by untracked mitmdump (pid %s).\n' "$STEALTH_PORT" "$lp"
-  elif [ -n "$lp" ]; then
-    printf 'Port %s held by pid %s (not mitmdump).\n' "$STEALTH_PORT" "$lp"
-  else
-    printf 'No stealth daemon running.\n'
+  printf '%s\n' "$out" | awk -F '\t' '{ printf "%-30s %s\n", $1, $2 }'
+}
+
+# agman stealth hosts [list|add|rm] [<host>…] [--profile <name>]
+stealth_cmd_hosts() {
+  local action="list" profile="" arg list="" name given saved
+  case "${1:-}" in list|add|rm|remove) action="$1"; shift ;; esac
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --profile) profile="${1:-}"; [ -n "$profile" ] || usage_die "--profile requires a profile name"; shift ;;
+      -*) usage_die "unknown option '$arg' for stealth hosts" ;;
+      *) list="${list:+$list,}$arg" ;;
+    esac
+  done
+  name="$(stealth_target_profile "$profile")"
+  saved="$(stealth_saved_hosts "$name")"
+  case "$action" in
+    list)
+      [ -z "$list" ] || usage_die "stealth hosts list takes no hosts (did you mean 'add'?)"
+      if [ -n "$saved" ]; then printf '%s\n' "$saved"
+      else printf "No hosts saved for '%s'.\n" "$name"; fi ;;
+    add)
+      given="$(stealth_hosts_of_urls "$list")"
+      [ -n "$given" ] || usage_die "stealth hosts add requires at least one host"
+      stealth_write_hosts "$name" "$(printf '%s\n%s\n' "$saved" "$given")"
+      printf "Saved %s for profile '%s'.\n" "$(stealth_hosts_commas "$given")" "$name" ;;
+    rm|remove)
+      given="$(stealth_hosts_of_urls "$list")"
+      [ -n "$given" ] || usage_die "stealth hosts rm requires at least one host"
+      stealth_write_hosts "$name" "$(printf '%s\n' "$saved" | grep -vxF "$given" || true)"
+      printf "Removed %s from profile '%s'.\n" "$(stealth_hosts_commas "$given")" "$name" ;;
+  esac
+}
+
+# agman stealth enable|disable [<name> | --profile <name>]
+stealth_cmd_toggle() {
+  local action="$1" name="" arg f
+  shift
+  # `--profile <name>` is accepted too: every other stealth subcommand spells
+  # it that way, and the no-profile error suggests it.
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --profile) [ $# -gt 0 ] && [ -n "$1" ] || usage_die "--profile requires a profile name"
+                 arg="$1"; shift ;;
+      -*) usage_die "unknown option '$arg' for stealth $action" ;;
+    esac
+    [ -z "$name" ] || usage_die "stealth $action takes at most one profile name"
+    name="$arg"
+  done
+  name="$(stealth_target_profile "$name")"
+  f="$(stealth_profile_file "$name" enabled)"
+  if [ "$action" = "disable" ]; then
+    rm -f "$f"
+    printf "Stealth disabled for profile '%s'.\n" "$name"
+    return 0
   fi
+  mkdir -p "$STEALTH_PROFILES_DIR"
+  : > "$f"
+  printf "Stealth enabled for profile '%s': 'agman run %s' and, with shell integration, plain 'claude' now launch through the proxy.\n" "$name" "$name"
+  if [ -z "$(stealth_saved_hosts "$name")" ] && \
+     [ -z "$(stealth_detect "$(profile_claude_dir "$(profile_dir "$name")")")" ]; then
+    warn "no hosts saved or detected for '$name'; launches will refuse to start until you add one: agman stealth hosts add <host> --profile $name"
+  fi
+}
+
+# Exit status only: is stealth on for the profile a bare `claude` would use?
+# Called by the shell integration before every claude launch, so it stays cheap.
+stealth_cmd_enabled() {
+  local name
+  name="$(stealth_current_profile)" || return 1
+  stealth_is_enabled "$name"
 }
 
 cmd_stealth() {
   local sub="${1:-}"
   [ $# -gt 0 ] && shift
   case "$sub" in
-    claude) stealth_claude ${1+"$@"} ;;
-    stop)   stealth_stop_daemon ;;
-    status) stealth_status ;;
-    ""|-h|--help)
-      printf 'Usage: agman stealth claude --otel <endpoint>[,<endpoint>…] [--profile <name>] [<claude args>]\n'
-      printf '       agman stealth stop\n'
-      printf '       agman stealth status\n'
-      ;;
-    *) usage_die "unknown stealth subcommand '$sub' (claude|stop|status)" ;;
+    claude)  stealth_claude ${1+"$@"} ;;
+    stop)    stealth_stop_daemon ;;
+    status)  stealth_status ;;
+    detect)  stealth_cmd_detect ${1+"$@"} ;;
+    hosts)   stealth_cmd_hosts ${1+"$@"} ;;
+    enable|disable) stealth_cmd_toggle "$sub" ${1+"$@"} ;;
+    enabled) stealth_cmd_enabled ;;
+    ""|-h|--help) help_stealth ;;
+    *) usage_die "unknown stealth subcommand '$sub' (claude|stop|status|detect|hosts|enable|disable)" ;;
   esac
 }
 
