@@ -1233,12 +1233,79 @@ cmd_list() {
   [ "$found" = "1" ] || printf "No profiles yet. Create one with: agman create <name>\n"
 }
 
+# Arrow-key menu of profiles on the terminal; prints the chosen name on stdout.
+# The menu itself is drawn on stderr so $(pick_profile) captures only the name.
+pick_profile() {
+  local names n=0 sel=0 i entry active key rest prev_stty
+  names=()
+  active="$(default_profile 2>/dev/null || true)"
+  for entry in "$AGMAN_HOME"/*/; do
+    [ -d "$entry" ] || continue
+    entry="${entry%/}"
+    names[$n]="${entry##*/}"
+    [ "${names[$n]}" = "$active" ] && sel=$n
+    n=$((n+1))
+  done
+  [ "$n" -gt 0 ] || die "no profiles yet. Create one with: agman create <name>"
+
+  prev_stty="$(stty -g 2>/dev/null || true)"
+  # shellcheck disable=SC2064  # expand prev_stty now, not at signal time
+  trap "printf '\033[?25h' >&2; stty '$prev_stty' 2>/dev/null; printf '\nCancelled; nothing changed.\n' >&2; exit 130" INT TERM
+  printf '\033[?25l' >&2
+  printf 'Select a profile  (↑/↓ move, Enter select, q cancel)\n' >&2
+  while :; do
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      if [ "$i" = "$sel" ]; then
+        printf '\r\033[K\033[7m> %d  %s%s\033[0m\n' "$((i+1))" "${names[$i]}" \
+          "$([ "${names[$i]}" = "$active" ] && printf '  (active)')" >&2
+      else
+        printf '\r\033[K  %d  %s%s\n' "$((i+1))" "${names[$i]}" \
+          "$([ "${names[$i]}" = "$active" ] && printf '  (active)')" >&2
+      fi
+      i=$((i+1))
+    done
+    key=""
+    IFS= read -rsn1 key || key="q"
+    case "$key" in
+      $'\033')
+        rest=""
+        IFS= read -rsn2 -t 1 rest || true
+        case "$rest" in
+          "[A"|"OA") key="up" ;;
+          "[B"|"OB") key="down" ;;
+          "") key="q" ;;
+          *) key="" ;;
+        esac ;;
+    esac
+    case "$key" in
+      up|k)   [ "$sel" -gt 0 ] && sel=$((sel-1)) ;;
+      down|j) [ "$sel" -lt $((n-1)) ] && sel=$((sel+1)) ;;
+      [1-9])  [ "$key" -le "$n" ] && sel=$((key-1)) ;;
+      ""|$'\n'|$'\r') break ;;
+      q|Q)
+        printf '\033[%dA\r\033[J\033[?25h' "$((n+1))" >&2
+        trap - INT TERM
+        printf 'Cancelled; nothing changed.\n' >&2
+        return 1 ;;
+    esac
+    printf '\033[%dA' "$n" >&2
+  done
+  printf '\033[%dA\r\033[J\033[?25h' "$((n+1))" >&2
+  trap - INT TERM
+  printf '%s' "${names[$sel]}"
+}
+
 cmd_use() {
   local name="${1:-}"
   if [ -z "$name" ]; then
-    name="$(resolve_project_profile)" || \
-      usage_die "no profile given and no usable $PROJECT_FILE found here"
-    printf "Using profile '%s' from %s.\n" "$name" "$(find_project_file "$PWD")"
+    if [ -n "$(find_project_file "$PWD" 2>/dev/null)" ] || [ ! -t 0 ] || [ ! -t 2 ]; then
+      name="$(resolve_project_profile)" || \
+        usage_die "no profile given and no usable $PROJECT_FILE found here"
+      printf "Using profile '%s' from %s.\n" "$name" "$(find_project_file "$PWD")"
+    else
+      name="$(pick_profile)" || exit $?
+    fi
   fi
   require_profile "$name"
 
@@ -3241,7 +3308,7 @@ main() {
   esac
   case "$cmd" in
     create)  cmd_create ${1+"$@"} ;;
-    list|ls) cmd_list ;;
+    list|ls|--list) cmd_list ;;
     use)     cmd_use ${1+"$@"} ;;
     off)     cmd_off ;;
     current) cmd_current ;;

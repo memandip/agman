@@ -1686,6 +1686,36 @@ assert_contains "help <command> falls back to its summary line" "$("$AGM" help o
 assert_contains "help env describes the env command" "$("$AGM" help env)" "agman env <name>"
 assert_contains "--help accepts a topic" "$("$AGM" --help create)" "--copy-current"
 assert_fail "help for an unknown topic fails" "$AGM" help frobnicate
+
+# interactive picker: 'agman use' with no name on a terminal. script(1) gives the
+# command a pseudo-terminal; BSD/macOS and util-linux spell it differently.
+pty_run() {
+  if script -qec true /dev/null >/dev/null 2>&1; then
+    script -qec "$*" /dev/null
+  else
+    script -q /dev/null "$@"
+  fi
+}
+if command -v script >/dev/null 2>&1; then
+  pickdir="$TMP/pickdir"; mkdir -p "$pickdir"
+  first="$(for d in "$AGMAN_HOME"/*/; do d="${d%/}"; printf '%s\n' "${d##*/}"; done | head -1)"
+  before="$("$AGM" current)"
+  out="$(cd "$pickdir" && printf 'q' | pty_run bash "$AGM" use 2>&1 || true)"
+  assert_contains "use with no name shows the picker" "$out" "Select a profile"
+  assert_contains "picker cancel says nothing changed" "$out" "Cancelled; nothing changed"
+  assert_eq "picker cancel keeps the active profile" "$before" "$("$AGM" current)"
+  (cd "$pickdir" && printf '1\n' | pty_run bash "$AGM" use >/dev/null 2>&1) || true
+  assert_contains "picker number + Enter switches" "$("$AGM" current)" "$first"
+  out="$(cd "$pickdir" && printf '\033[A\033[A\033[A\033[B\n' | pty_run bash "$AGM" use 2>&1 || true)"
+  assert_contains "picker arrow keys switch" "$out" "Switched to profile"
+else
+  ok "picker tests skipped (no script(1))"
+fi
+out="$(cd "$TMP" && "$AGM" use </dev/null 2>&1 || true)"
+assert_contains "use with no name and no terminal keeps the old error" "$out" "no profile given"
+assert_contains "--list lists profiles" "$("$AGM" --list)" "staging"
+assert_contains "ls lists profiles" "$("$AGM" ls)" "staging"
+assert_contains "help names the ls alias" "$("$AGM" help)" "list, ls"
 active_before="$("$AGM" current)"
 assert_contains "off --help shows help" "$("$AGM" off --help)" "restore your original configs"
 assert_eq "off --help does not deactivate" "$active_before" "$("$AGM" current)"
