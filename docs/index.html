@@ -221,10 +221,10 @@
     agents, MCP servers, and settings across Claude Code, Codex, and Gemini.
   </p>
   <div class="badges">
-    <span class="badge ok">v0.17.1</span>
+    <span class="badge ok">v0.19.0</span>
     <span class="badge">pure bash</span>
     <span class="badge">macOS · Linux · WSL</span>
-    <span class="badge">483 tests, CI on two platforms</span>
+    <span class="badge">580+ tests, CI on two platforms</span>
     <span class="badge">MIT</span>
   </div>
   <div class="cta">
@@ -332,8 +332,8 @@
         <span class="ico">🕶️</span>
         <h3>Block forced telemetry</h3>
         <p>Some team accounts inject an OTEL exporter you can't switch off.
-        <code>agman stealth</code> drops those exports at the network layer while everything
-        else keeps working.</p>
+        <code>agman stealth</code> finds it, blocks it, and remembers the setting per
+        profile, while everything else keeps working.</p>
       </div>
       <div class="card">
         <span class="ico">☁️</span>
@@ -461,10 +461,18 @@ agman logout work    # back to your shared account</pre>
       drops those exports at the network layer — so telemetry never leaves your machine — while
       <code>api.anthropic.com</code> and everything else keeps working.
     </p>
-    <pre class="code">agman stealth claude --otel https://otel.acme-corp.example/v1/traces
+    <pre class="code">agman stealth detect           # which telemetry hosts does Claude send to?
+agman stealth enable work      # from now on, 'agman run work' is always protected
+agman stealth claude           # start claude with those hosts blocked
 
-agman stealth status    # is the daemon running, and blocking which host?
-agman stealth stop      # stop the daemon</pre>
+agman stealth hosts add otel.acme-corp.example   # save a host it didn't find
+agman stealth status           # is it running, and what is blocked?
+agman stealth stop             # stop it</pre>
+    <p>
+      agman finds the exporter on its own: it checks your environment, the profile's settings,
+      the project's settings and your company's managed settings. Hosts you save stay with the
+      profile, so you type them once.
+    </p>
     <div class="note">
       <strong>Needs mitmproxy.</strong> Install it once with <code>brew install mitmproxy</code>;
       <code>lsof</code> and <code>curl</code> come with macOS. On first run agman generates its
@@ -540,6 +548,14 @@ agman stealth stop      # stop the daemon</pre>
           <h3>Stealth <span class="ver">v0.17.0</span></h3>
           <p><code>agman stealth claude --otel …</code> blocks a team-forced OTEL exporter at the
           network layer so telemetry never leaves the machine.</p>
+        </div>
+      </li>
+      <li class="done">
+        <span class="mark">✓</span>
+        <div>
+          <h3>Stealth per profile <span class="ver">v0.19.0</span></h3>
+          <p>Stealth finds the telemetry host by itself, remembers hosts per profile, and
+          <code>agman stealth enable</code> makes a profile always start protected.</p>
         </div>
       </li>
       <li class="next">
