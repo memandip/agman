@@ -1164,7 +1164,7 @@ out="$(printf '\ndefault-key-1\n' | cloud_run cloud login --key-stdin 2>&1)" \
   && ok "login accepts an empty URL and uses the default" \
   || bad "login accepts an empty URL and uses the default ($out)"
 assert_contains "empty URL stores the default server" "$(cat "$AGMAN_HOME/.cloud")" "url=https://agman.vercel.app"
-assert_contains "help documents the default cloud URL" "$("$AGM" help)" "agman.vercel.app"
+assert_contains "help documents the default cloud URL" "$("$AGM" help cloud)" "agman.vercel.app"
 # back to the stubbed test server for everything below
 printf 'test-key-123\n' | cloud_run cloud login --url http://cloud.test --key-stdin >/dev/null 2>&1 \
   || bad "re-login to the stub server"
@@ -1555,7 +1555,8 @@ assert_fail "stealth claude requires --otel" stealth_run stealth claude
 out="$(stealth_run stealth claude 2>&1 || true)"
 assert_contains "missing --otel says it is required" "$out" "requires --otel"
 assert_fail "unknown stealth subcommand fails" stealth_run stealth frobnicate
-assert_contains "help documents stealth" "$("$AGM" help)" "stealth <subcommand>"
+assert_contains "help lists stealth" "$("$AGM" help)" "stealth <command>"
+assert_contains "help stealth documents --otel" "$("$AGM" help stealth)" "--otel <host>"
 
 # calm no-daemon paths
 assert_contains "stealth status with no daemon is calm" "$(stealth_run stealth status)" "No stealth daemon"
@@ -1673,8 +1674,26 @@ assert_ok "stealth stop after stale-daemon restart" stealth_run stealth stop
 # --- misc ------------------------------------------------------------------------------------------
 
 assert_ok "help runs" "$AGM" help
-assert_contains "help documents the supported tools" "$("$AGM" help)" "Gemini CLI"
-assert_contains "help documents push --dry-run" "$("$AGM" help)" "--dry-run"
+assert_contains "help documents the supported tools" "$("$AGM" help tools)" "Gemini CLI"
+assert_contains "help documents push --dry-run" "$("$AGM" help cloud)" "--dry-run"
+assert_contains "help names the everyday commands" "$("$AGM" help)" "current               Show which profile is active"
+assert_lacks "short help leaves cloud details to its topic" "$("$AGM" help)" "--include-secrets"
+lines="$("$AGM" help | wc -l | tr -d ' ')"
+if [ "$lines" -le 50 ]; then ok "short help fits one screen"; else bad "short help fits one screen ($lines lines)"; fi
+assert_contains "help all includes every topic" "$("$AGM" help all)" "AGMAN_SHARE_STATE"
+assert_contains "help all includes stealth" "$("$AGM" help all)" "AGMAN_STEALTH_PORT"
+assert_contains "help <command> falls back to its summary line" "$("$AGM" help off)" "restore your original configs"
+assert_contains "help env describes the env command" "$("$AGM" help env)" "agman env <name>"
+assert_contains "--help accepts a topic" "$("$AGM" --help create)" "--copy-current"
+assert_fail "help for an unknown topic fails" "$AGM" help frobnicate
+active_before="$("$AGM" current)"
+assert_contains "off --help shows help" "$("$AGM" off --help)" "restore your original configs"
+assert_eq "off --help does not deactivate" "$active_before" "$("$AGM" current)"
+assert_contains "create <name> --help shows help" "$("$AGM" create helpprobe --help)" "--copy-current"
+assert_missing "create <name> --help creates nothing" "$AGMAN_HOME/helpprobe"
+assert_contains "-h works per command" "$("$AGM" doctor -h)" "Check your setup"
+assert_contains "cloud --help shows cloud help" "$("$AGM" cloud --help)" "--dry-run"
+assert_contains "rm --help resolves the alias" "$("$AGM" rm --help)" "Delete a profile"
 assert_contains "version prints" "$("$AGM" version)" "agman"
 assert_fail "unknown command fails" "$AGM" frobnicate
 assert_ok "remove an inactive profile with --yes" "$AGM" remove staging --yes

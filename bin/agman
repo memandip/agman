@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.18.1"
+AGMAN_VERSION="0.19.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -2944,123 +2944,301 @@ cmd_stealth() {
   esac
 }
 
-cmd_help() {
+help_summary() {
   cat <<EOF
-agman $AGMAN_VERSION — agent manager: config profiles for AI coding agents
+agman $AGMAN_VERSION — switch config profiles for Claude Code, Codex CLI and Gemini CLI
 
 Usage: agman <command> [args]
+       agman <command> --help
+
+Everyday:
+  list, ls              Show your profiles (* = active)
+  current               Show which profile is active
+  use [name]            Switch every tool to a profile (no name: pick from a list)
+  off                   Stop switching and restore your original configs
+  create <name>         Make a new profile (--copy-current copies your setup)
+
+Manage profiles:
+  rename <old> <new>    Rename a profile
+  remove, rm <name>     Delete a profile, not the active one (--yes: no prompt)
+  login <name>          Give a profile its own Claude account
+  logout <name>         Go back to the shared Claude login
+
+One shell or one command only:
+  run [name]            Start claude once with a profile
+  exec <name> -- <cmd>  Run any command with a profile
+  env <name>            Print exports: eval "\$(agman env work)"
+  dir <name>            Print a profile's Claude config folder
+
+Maintenance:
+  doctor                Check your setup for problems
+  update                Update agman
+  migrate               Move old profiles to the current layout
+  init [zsh|bash]       Print the optional shell integration
+
+Advanced:
+  cloud <command>       Sync profiles with an agman cloud server
+  stealth <command>     Block company telemetry (OTEL) when claude runs
+
+Examples:
+  agman create work --copy-current
+  agman use work
+  agman current
+
+More help:
+  agman help <command>     Options for one command (e.g. agman help cloud)
+  agman help projects      Pick a profile per repository with a .agman file
+  agman help tools         Which tools agman manages
+  agman help environment   Environment variables
+  agman help all           Everything
+EOF
+}
+
+help_create() {
+  cat <<'EOF'
+agman create <name> [options]
+
+  Make a new profile. By default it is empty apart from a starter CLAUDE.md.
+
+  --copy-current    Start from the configs you are using right now
+  --from <name>     Copy another profile
+  --link-plugins    Link plugins/ instead of copying it
+EOF
+}
+
+help_use() {
+  cat <<'EOF'
+agman use [name]
+
+  Switch every managed tool to a profile by pointing ~/.claude, ~/.claude.json,
+  ~/.codex and ~/.gemini at it. Applies to every new session, IDEs included;
+  sessions already running keep their old config.
+
+  The first switch saves your original configs as the profile 'global'.
+  'agman off' puts them back exactly as they were.
+
+  With no name, the profile comes from the nearest .agman file
+  (see 'agman help projects'). Without one, a terminal shows a menu:
+  ↑/↓ or j/k to move, 1-9 to jump, Enter to switch, q or Esc to cancel.
+EOF
+}
+
+help_run() {
+  cat <<'EOF'
+agman run [name] [-- claude args]
+agman exec <name> -- <command>
+agman env <name>
+
+  Use a profile for one process or one shell without switching the machine.
+
+  run    Start claude once with the profile. Arguments after -- go to claude.
+         With no name, uses the nearest .agman file.
+  exec   Run any command with the profile's environment variables set.
+  env    Print export lines for this shell:  eval "$(agman env work)"
+
+  A CLAUDE_CONFIG_DIR set in a shell always wins over 'agman use' there.
+EOF
+}
+
+help_dir() {
+  cat <<'EOF'
+agman dir <name> | --active | --for-cwd
+
+  Print a profile's Claude config folder.
+
+  --active    The active profile
+  --for-cwd   The profile named by the nearest trusted .agman file
+EOF
+}
+
+help_login() {
+  cat <<'EOF'
+agman login <name> [options]
+agman logout <name>
+
+  By default every profile shares your Claude login. 'login' gives one profile
+  its own account (its own token); 'logout' drops it again.
+
+  --token-stdin   Read the token from stdin
+  --no-run        Don't run 'claude setup-token' first
+EOF
+}
+
+help_cloud() {
+  cat <<'EOF'
+agman cloud <command> [options]
+
+  Sync profiles with an agman cloud server (default https://agman.vercel.app).
 
 Commands:
-  create <name> [opts]   Create a profile (empty, with a starter CLAUDE.md).
-                           --copy-current   seed from your current configs
-                           --from <name>    clone another profile
-                           --link-plugins   symlink plugins/ instead of copying
-  list                   List profiles (* = default, (active: …) = live tools)
-  use [name]             Activate a profile: symlinks each tool's config at it.
-                         First use backs up your originals as 'global'. With no
-                         name, reads the profile from the nearest .agman file.
-  off                    Deactivate and restore your original configs
-  current                Show the active profile and which tools it covers
-  dir <name>|--active|--for-cwd
-                         Print a profile's Claude config directory (--for-cwd
-                         resolves the nearest trusted .agman file)
-  env <name>             Print export lines: eval "\$(agman env work)"
-  run [name] [-- args]   Launch claude once under a profile (per-process).
-                         With no name, uses the nearest .agman file.
-  exec <name> -- <cmd>   Run a command with per-tool env vars set
-  login <name>           Give a profile its own Claude account (own token)
-                           --token-stdin    read the token from stdin
-                           --no-run         don't run 'claude setup-token' first
-  logout <name>          Drop that account; back to your shared login
-  cloud <subcommand>     Sync profiles with an agman cloud server:
-                           login [--url <url>] [--key-stdin]
-                             (URL defaults to https://agman.vercel.app)
-                           push [name] [--include-secrets] [--force] [--dry-run]
-                           pull <name> [--as <local>] [--force] [--with-secrets]
-                           init <org-slug> [name] [--with-secrets]
-                           list | status | logout
-                         --verbose (or AGMAN_VERBOSE=1) logs the request
-                         line, push payload size, and response code.
-                         Pushes are versioned server-side. A synced profile is
-                         a persona, not a login: account material (the identity
-                         file, tokens, codex/gemini auth, .env) and ephemeral
-                         state stay local, and a push is refused if a file looks
-                         like it holds a secret. push --dry-run lists what a
-                         push would carry; a payload over the server limit is
-                         refused before upload with the largest files named.
-                         The limit comes from the server when it advertises
-                         one (AGMAN_CLOUD_MAX_PUSH_BYTES overrides). Archives
-                         too big for a direct request travel via the server's
-                         presigned blob-upload flow automatically.
-                         --include-secrets (push) /
-                         --with-secrets (pull) opt into carrying account material
-                         for your own machine-to-machine restore. Pulls strip
-                         hooks/apiKeyHelper from an untrusted settings.json, back
-                         up an existing profile first, and refuse the active
-                         profile without --force. Plugin caches and marketplace
-                         clones are never synced; pull reinstalls them from the
-                         profile's references via the claude CLI
-                         (AGMAN_CLOUD_NO_INSTALL=1 skips). https required
-                         (override with AGMAN_CLOUD_INSECURE=1).
-  stealth <subcommand>   Block a forced OTEL exporter from leaving this machine
-                         (needs mitmproxy + lsof + curl):
-                           claude --otel <endpoint>[,<endpoint>…] [--profile <name>] [<claude args>]
-                             Launch claude through a local proxy that answers
-                             every listed endpoint's host with 403, dropping OTEL
-                             telemetry while api.anthropic.com and the rest still
-                             work. --otel is required (comma-separate hosts).
-                             Claude args (e.g. --resume) are forwarded as-is.
-                           stop    Stop the stealth proxy daemon
-                           status  Show whether the daemon is running
-                         State lives under ~/.agman/.stealth; the daemon persists
-                         across sessions until you run 'stealth stop'.
-  rename <old> <new>     Rename a profile (repoints active symlinks)
-  remove <name> [--yes]  Delete a profile (refuses if active)
-  migrate                Move profiles to the current layout, then relink
-  update                 Self-update: git pull in a checkout, else download
-  doctor                 Diagnose setup, tools, and per-profile auth
-  init [zsh|bash]        Print optional per-shell integration snippet
-  help, version
+  login [--url <url>] [--key-stdin]          Connect to a server
+  push [name] [--dry-run] [--force]          Upload a profile
+  pull <name> [--as <local>] [--force]       Download a profile
+  init <org-slug> [name]                     Start from an org's profile
+  list | status | logout
 
-Per-project profiles:
+Options:
+  --dry-run          List what a push would upload, upload nothing
+  --include-secrets  (push) Also upload logins and tokens
+  --with-secrets     (pull, init) Also download logins and tokens
+  --verbose          Log each request, its payload size and response code
+
+What gets synced:
+  A synced profile is a persona, not a login. Logins, tokens, codex/gemini auth,
+  .env and session state stay on this machine unless you pass the secrets flags.
+  A push is refused if a file looks like it holds a secret. Pushes are versioned
+  on the server. Plugin caches are never synced; pull reinstalls plugins with
+  the claude CLI.
+
+Safety on pull:
+  Hooks and apiKeyHelper are removed from a downloaded settings.json, an existing
+  profile is backed up first, and the active profile is refused without --force.
+
+Size:
+  A push over the server's limit is refused before upload and names the largest
+  files. Large archives upload through the server's blob flow automatically.
+
+Environment:
+  AGMAN_VERBOSE=1                 Same as --verbose
+  AGMAN_CLOUD_MAX_PUSH_BYTES      Override the push size limit
+  AGMAN_CLOUD_NO_INSTALL=1        Don't reinstall plugins after pull
+  AGMAN_CLOUD_INSECURE=1          Allow http:// servers
+  AGMAN_PROGRESS                  Upload progress: unset = auto, 1 = on, 0 = off
+EOF
+}
+
+help_stealth() {
+  cat <<'EOF'
+agman stealth — stop Claude Code from sending telemetry (OTEL) to your company
+
+Quick start:
+  agman stealth detect            See which telemetry hosts were found
+  agman stealth enable [name]     Always protect this profile (default: active one)
+  agman stealth claude            Start claude with telemetry blocked
+
+All commands:
+  agman stealth claude [--otel <host>] [--save] [--profile <name>] [claude args]
+  agman stealth hosts [list|add|rm] [<host>…] [--profile <name>]
+  agman stealth enable [name]  /  agman stealth disable [name]
+  agman stealth detect [--profile <name>]
+  agman stealth status
+  agman stealth stop
+
+How it works:
+  claude runs through a small local proxy. Telemetry hosts get a 403;
+  everything else, including api.anthropic.com, works normally.
+  Needs mitmproxy, lsof and curl (macOS: brew install mitmproxy).
+
+Which hosts are blocked:
+  - hosts you pass with --otel (add --save to remember them)
+  - hosts saved with 'agman stealth hosts add'
+  - hosts found automatically in your environment and in Claude's settings
+    (profile, project, and company-managed). localhost is never blocked.
+  If none are found, claude is not started.
+
+When it applies:
+  - 'agman stealth claude' always.
+  - 'agman run <name>' when the profile is enabled.
+  - plain 'claude' when the profile is enabled and 'agman init' is loaded
+    in your shell. IDE extensions are not covered.
+  The proxy keeps running, and keeps every host it has blocked, until
+  'agman stealth stop'.
+
+Hosts can be full URLs or bare names; list several with commas:
+  agman stealth claude --otel https://a.example.com/v1/traces, b.example.com
+
+Environment:
+  AGMAN_STEALTH_PORT     Proxy port (default 8080)
+  AGMAN_STEALTH_CA       mitmproxy CA (default ~/.mitmproxy/mitmproxy-ca-cert.pem)
+  AGMAN_STEALTH_MANAGED  Managed-settings files to scan, separated by ':'
+  State lives in ~/.agman/.stealth.
+EOF
+}
+
+help_projects() {
+  cat <<'EOF'
+Per-project profiles
+
   Put a .agman file in a repository root naming the profile it wants:
 
       profile: acme-work
 
-  'agman use' and 'agman run' with no argument read it. Because the file arrives
-  with a clone, agman asks once before trusting it. Add the shell integration
-  and each directory switches automatically in that terminal; IDE extensions do
-  not inherit shell environment, so they follow 'agman use' instead.
+  'agman use' and 'agman run' with no name read it. Because the file arrives
+  with a clone, agman asks once before trusting it.
 
-Supported tools:
+  With the shell integration ('agman init'), each terminal switches profile as
+  you change directory. IDE extensions don't see shell variables, so they
+  follow 'agman use' instead.
+EOF
+}
+
+help_tools() {
+  cat <<'EOF'
+Supported tools
+
   claude   Claude Code   ~/.claude + ~/.claude.json   (env: CLAUDE_CONFIG_DIR)
   codex    Codex CLI     ~/.codex                     (env: CODEX_HOME)
   gemini   Gemini CLI    ~/.gemini                    (no env override)
 
-Only tools you actually have are managed: a profile covers a tool when it
-holds config for it, the CLI is on PATH, or its config path exists.
-
-Environment:
-  AGMAN_HOME             Profile storage root (default: ~/.agman)
-  AGMAN_TARGET_HOME      Where tool config paths live (default: \$HOME)
-  AGMAN_TOOLS            Space-separated allowlist, e.g. "claude codex".
-                         Unset means every supported tool you have.
-  AGMAN_SHARE_STATE      1 (default) shares session history and other machine-
-                         local state (Codex rollouts, Antigravity's browser
-                         profile) across profiles so 'claude --resume' keeps
-                         working. 0 keeps it per-profile.
-  AGMAN_PROGRESS         Transfer progress for cloud push uploads. Auto: shown
-                         only when stderr is a terminal. 1 forces on, 0 off.
-  AGMAN_RAW_URL          Update source (default: GitHub main branch)
+  agman only manages tools you have: a profile covers a tool when it holds
+  config for it, the CLI is on PATH, or its config path exists.
 EOF
+}
+
+help_environment() {
+  cat <<'EOF'
+Environment variables
+
+  AGMAN_HOME          Where profiles are stored (default ~/.agman)
+  AGMAN_TARGET_HOME   Where tool configs live (default $HOME)
+  AGMAN_TOOLS         Only manage these tools, e.g. "claude codex"
+  AGMAN_SHARE_STATE   1 (default): share session history across profiles so
+                      'claude --resume' keeps working. 0: keep it per profile.
+  AGMAN_RAW_URL       Where 'agman update' downloads from
+
+  Cloud and stealth variables: see 'agman help cloud' and 'agman help stealth'.
+EOF
+}
+
+cmd_help() {
+  local topic="${1:-}" line
+  case "$topic" in
+    "") help_summary ;;
+    all)
+      help_summary
+      for topic in create use run dir login cloud stealth projects tools environment; do
+        printf '\n'; "help_$topic"
+      done ;;
+    create|use|dir|login|cloud|stealth|projects|tools|environment) "help_$topic" ;;
+    run|exec|env) help_run ;;
+    logout) help_login ;;
+    *)
+      [ "$topic" = "ls" ] && topic="list"
+      [ "$topic" = "rm" ] && topic="remove"
+      line="$(help_summary | grep -E "^  $topic(,| |\$)" || true)"
+      [ -n "$line" ] || usage_die "no help for '$topic'"
+      printf 'agman %s\n\n%s\n' "$topic" "$line" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
 # dispatch
 
 main() {
-  local cmd="${1:-help}"
+  local cmd="${1:-help}" arg
   [ $# -gt 0 ] && shift
+  # --help must never run the command. run/exec/stealth forward everything
+  # after their first argument, so only that first argument can ask for help.
+  case "$cmd" in
+    help|-h|--help) ;;
+    run|exec|stealth)
+      case "${1:-}" in -h|--help) cmd_help "$cmd"; return ;; esac ;;
+    *)
+      for arg in ${1+"$@"}; do
+        [ "$arg" = "--" ] && break
+        case "$arg" in -h|--help) cmd_help "$cmd"; return ;; esac
+      done ;;
+  esac
   case "$cmd" in
     create)  cmd_create ${1+"$@"} ;;
     list|ls) cmd_list ;;
@@ -3081,7 +3259,7 @@ main() {
     update)  cmd_update ;;
     doctor)  cmd_doctor ;;
     init)    cmd_init ${1+"$@"} ;;
-    help|-h|--help) cmd_help ;;
+    help|-h|--help) cmd_help ${1+"$@"} ;;
     version|-v|--version) printf 'agman %s\n' "$AGMAN_VERSION" ;;
     *) usage_die "unknown command '$cmd'" ;;
   esac
