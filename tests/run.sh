@@ -1857,11 +1857,20 @@ if command -v script >/dev/null 2>&1; then
   assert_contains "picker number + Enter switches" "$("$AGM" current)" "$first"
   out="$(cd "$pickdir" && printf '\033[A\033[A\033[A\033[B\n' | pty_run bash "$AGM" use 2>&1 || true)"
   assert_contains "picker arrow keys switch" "$out" "Switched to profile"
+  cat > "$TMP/hooktest.sh" <<'EOF'
+eval "$(agman init bash)"
+agman use
+printf 'HOOKDIR=%s\n' "${CLAUDE_CONFIG_DIR:-unset}"
+EOF
+  out="$(cd "$pickdir" && printf '1\n' | pty_run bash "$TMP/hooktest.sh" 2>&1 || true)"
+  assert_contains "shell hook follows a picked profile" "$out" "HOOKDIR=$AGMAN_HOME/$first/claude"
 else
   ok "picker tests skipped (no script(1))"
 fi
 out="$(cd "$TMP" && "$AGM" use </dev/null 2>&1 || true)"
 assert_contains "use with no name and no terminal keeps the old error" "$out" "no profile given"
+out="$(cd "$TMP" && bash -c 'eval "$(agman init bash)"; agman use --help >/dev/null 2>&1; printf "%s" "${CLAUDE_CONFIG_DIR:-unset}"')"
+assert_eq "shell hook ignores 'use --help'" "unset" "$out"
 assert_contains "--list lists profiles" "$("$AGM" --list)" "staging"
 assert_contains "ls lists profiles" "$("$AGM" ls)" "staging"
 assert_contains "help names the ls alias" "$("$AGM" help)" "list, ls"

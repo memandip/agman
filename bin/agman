@@ -1914,8 +1914,9 @@ agman() {
   case "${1:-}" in
     use)
       command agman "$@" || return $?
-      local _agman_dir
-      if _agman_dir="$(command agman dir "${2:-}" 2>/dev/null)" && [ -n "$_agman_dir" ]; then
+      local _agman_a _agman_dir
+      for _agman_a in "$@"; do case "$_agman_a" in -h|--help) return 0 ;; esac; done
+      if _agman_dir="$(command agman dir --active 2>/dev/null)" && [ -n "$_agman_dir" ]; then
         export CLAUDE_CONFIG_DIR="$_agman_dir"
       fi
       ;;
