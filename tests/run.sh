@@ -1835,6 +1835,8 @@ assert_contains "help <command> falls back to its summary line" "$("$AGM" help o
 assert_contains "help env describes the env command" "$("$AGM" help env)" "agman env <name>"
 assert_contains "--help accepts a topic" "$("$AGM" --help create)" "--copy-current"
 assert_fail "help for an unknown topic fails" "$AGM" help frobnicate
+assert_contains "help version describes the version command" "$("$AGM" help version)" "Print the agman version"
+assert_contains "version --help shows help" "$("$AGM" version --help)" "Print the agman version"
 
 # interactive picker: 'agman use' with no name on a terminal. script(1) gives the
 # command a pseudo-terminal; BSD/macOS and util-linux spell it differently.

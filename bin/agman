@@ -3323,6 +3323,7 @@ Maintenance:
   update                Update agman
   migrate               Move old profiles to the current layout
   init [zsh|bash]       Print the optional shell integration
+  version               Print the agman version
 
 Advanced:
   cloud <command>       Sync profiles with an agman cloud server
