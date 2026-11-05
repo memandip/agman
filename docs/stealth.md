@@ -57,6 +57,9 @@ path.
 --otel a.example.com --otel=b.example.com       # repeat the flag
 ```
 
+Detected and saved targets print in the same shape: `host`, `host/base`, or `host!path`
+for an exact path (see the guards below).
+
 A blocked host covers its subdomains too: blocking `example.com` also blocks
 `otel.example.com`. Sibling hosts are not covered: blocking `otel.example.com` does not
 block `metrics.example.com`.
@@ -72,18 +75,20 @@ on the same host pass through untouched.
 
 The passthrough is not free: on a blocked host, agman's local proxy terminates TLS (claude
 trusts it via `NODE_EXTRA_CA_CERTS`) and forwards the request unmodified to the real
-server. Nothing is stored, but the proxy is on the path for that host's traffic.
+server. Nothing is stored beyond one log line per request (method and path, never the
+query string or body), but the proxy is on the path for that host's traffic.
 
 Three guards keep the scoped block honest when the org changes things:
 
 - The signal-specific endpoint variables (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and
   friends) carry the full URL the exporter posts to, so a path that is not itself an
-  OTLP path is blocked exactly, not treated as a base to extend.
+  OTLP path is blocked at that path and below it, not treated as a base to extend.
+  Such a target shows as `host!path`, or `host!` when the URL has no path at all (the
+  exporter then posts to the root).
 - Requests carrying an OTLP/protobuf or gRPC body are blocked on a blocked host even
   when the path is unknown — no Claude Code API traffic uses those content types.
-- Everything that passes through on a blocked host is logged in the daemon log
-  (`[agman stealth] passed …`), so telemetry taking an unexpected route is visible
-  instead of escaping silently.
+- Every request on a blocked host is logged in the daemon log as `blocked` or `passed`,
+  so telemetry taking an unexpected route is visible instead of escaping silently.
 
 ### Auto-detect
 
