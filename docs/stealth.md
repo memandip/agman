@@ -24,8 +24,10 @@ Nothing found? Save the host yourself: `agman stealth hosts add otel.example.com
 agman stealth claude --otel https://otel.example.com/v1/traces
 ```
 
-This starts your normal `claude` through a local [mitmproxy](https://mitmproxy.org). Requests
-to that host get a `403`; everything else, including `api.anthropic.com`, works as usual.
+This starts your normal `claude` through a local [mitmproxy](https://mitmproxy.org). The
+exporter's own requests (`/v1/traces`, `/v1/metrics`, `/v1/logs`, and the gRPC service
+paths) get a `403`; everything else — including `api.anthropic.com` and any
+non-telemetry traffic to the blocked host itself — works as usual.
 
 | Option | Meaning |
 |---|---|
@@ -42,10 +44,14 @@ agman stealth stop     # stop the proxy
 
 ### Listing hosts
 
-Full URLs and bare names both work; agman keeps only the host name.
+Full URLs and bare names both work. A bare name blocks the exporter's paths on the
+whole host; a URL with a path scopes the block to the exporter's paths under that
+path.
 
 ```bash
---otel https://otel.example.com:4317/v1/traces   # blocks otel.example.com
+--otel https://otel.example.com:4317/v1/traces   # same as blocking otel.example.com
+--otel https://otel.example.com/collect          # blocks /collect/v1/traces, /collect/v1/metrics, /collect/v1/logs
+--otel otel.example.com                          # blocks the exporter's paths on the whole host
 --otel a.example.com,b.example.com
 --otel a.example.com, b.example.com             # spaces are fine, quoted or not
 --otel a.example.com --otel=b.example.com       # repeat the flag
@@ -54,6 +60,19 @@ Full URLs and bare names both work; agman keeps only the host name.
 A blocked host covers its subdomains too: blocking `example.com` also blocks
 `otel.example.com`. Sibling hosts are not covered: blocking `otel.example.com` does not
 block `metrics.example.com`.
+
+### Hosts that serve more than telemetry
+
+Some companies run one hostname for everything Claude Code needs: the login gateway,
+the remotely managed settings, a usage-limits widget — and the OTEL collector. Blocking
+such a host outright breaks Claude Code (with `forceRemoteSettingsRefresh` the CLI exits
+when it cannot freshly fetch the managed settings). That is why the block is scoped to
+the exporter's own request paths: the collector answers `403`, and the gateway endpoints
+on the same host pass through untouched.
+
+The passthrough is not free: on a blocked host, agman's local proxy terminates TLS (claude
+trusts it via `NODE_EXTRA_CA_CERTS`) and forwards the request unmodified to the real
+server. Nothing is stored, but the proxy is on the path for that host's traffic.
 
 ### Auto-detect
 
@@ -149,8 +168,10 @@ sudo security add-trusted-cert -d -r trustRoot \
 - One proxy serves every stealth session. Starting another session with new hosts adds them;
   it never drops hosts an already-running session needs. `agman stealth stop` clears the list.
 - Dependencies are checked only when you run `stealth`; the rest of agman needs none.
-- Before launching, agman checks that the block actually works. If a request gets through, it
-  stops instead of running unprotected.
+- Before launching, agman checks that the block actually works: an exporter path must be
+  answered by the addon's own `403`, and a non-telemetry path on the same host must not
+  be. If either check fails, it stops instead of running with a leaking or over-broad
+  block.
 
 | Variable | Default |
 |---|---|
