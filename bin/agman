@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.19.1"
+AGMAN_VERSION="0.20.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -2729,6 +2729,12 @@ STEALTH_HOST_FILE="$STEALTH_DIR/blocked_host"
 # a MITM-everything daemon apart from a passthrough one and restart stale ones.
 STEALTH_ALLOW_FILE="$STEALTH_DIR/allow_hosts"
 STEALTH_ADDON_FILE="$STEALTH_DIR/block_otel.py"
+# Records which addon generation the running daemon was started with. The addon
+# blocks OTLP paths rather than whole hosts (a blocked host may also serve
+# traffic claude needs), so a daemon still running an older addon is restarted
+# even when its host list matches.
+STEALTH_ADDONVER_FILE="$STEALTH_DIR/addon_version"
+STEALTH_ADDONVER="2"
 STEALTH_LOG_FILE="$STEALTH_DIR/mitmdump.log"
 STEALTH_PORT="${AGMAN_STEALTH_PORT:-8080}"
 STEALTH_PROFILES_DIR="$STEALTH_DIR/profiles"
@@ -2736,6 +2742,13 @@ STEALTH_OTEL_VARS="OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_TRACES_ENDPOIN
 # Claude Code's admin-managed settings (macOS, Linux/WSL, Windows via Git Bash),
 # colon-separated. Overridable so tests never read the real machine's policy.
 STEALTH_MANAGED_FILES="${AGMAN_STEALTH_MANAGED:-/Library/Application Support/ClaudeCode/managed-settings.json:/etc/claude-code/managed-settings.json:/c/Program Files/ClaudeCode/managed-settings.json}"
+
+# The OTLP request paths an exporter sends to the endpoint: the HTTP/json and
+# HTTP/protobuf exporters append /v1/traces, /v1/metrics or /v1/logs; the gRPC
+# exporter posts to the service paths. Blocking only these paths is what lets
+# a host that also serves other traffic keep working.
+STEALTH_OTLP_HTTP_PATHS="v1/traces v1/metrics v1/logs"
+STEALTH_OTLP_GRPC_PREFIXES="opentelemetry.proto.collector.trace.v1.TraceService/ opentelemetry.proto.collector.metrics.v1.MetricsService/ opentelemetry.proto.collector.logs.v1.LogsService/"
 
 # Bare hostname out of an OTLP endpoint URL: strip scheme, userinfo, port,
 # path, query, and fragment. bash 3.2 has no ${var,,}, so lowercase via tr.
@@ -2748,33 +2761,82 @@ stealth_host_of_url() {
   printf '%s' "$host" | tr '[:upper:]' '[:lower:]'
 }
 
-# Comma-separated OTLP endpoints -> newline-separated, sorted, de-duplicated hosts.
-stealth_hosts_of_urls() {
-  local list="${1:-}" item host
+# "host" or "host/base-path" out of one endpoint URL. The path is kept so the
+# block can stay scoped to the exporter's own paths: a telemetry host may
+# share its name with traffic claude needs (a company gateway serves login,
+# managed settings and OTEL on one hostname). A URL that already ends in an
+# OTLP path (.../v1/traces) names one signal's route, and a collector serves
+# the other signals beside it — so the parent path is kept and all of the
+# exporter's paths under it are blocked. Query strings and fragments are
+# dropped; the path is not percent-decoded (exporter endpoints do not use
+# escapes).
+stealth_target_of_url() {
+  local item="$1" host rest path="" s suf
+  host="$(stealth_host_of_url "$item")"
+  [ -n "$host" ] || return 0
+  rest="$item"
+  case "$rest" in *://*) rest="${rest#*://}" ;; esac
+  case "$rest" in
+    *[/?#]*)
+      path="${rest#*[/?#]}"
+      path="${path%%[?#]*}"
+      path="${path%/}"
+      ;;
+  esac
+  if [ -n "$path" ]; then
+    for s in $STEALTH_OTLP_HTTP_PATHS; do
+      case "$path" in
+        "$s") path="" ;;
+        *)
+          suf="/$s"
+          case "$path" in *"$suf") path="${path%"$suf"}" ;; esac ;;
+      esac
+    done
+    path="${path#/}"
+  fi
+  if [ -n "$path" ]; then printf '%s/%s\n' "$host" "$path"
+  else printf '%s\n' "$host"; fi
+}
+
+# Comma-separated OTLP endpoints -> newline-separated, sorted, de-duplicated
+# targets ("host" or "host/base-path").
+stealth_targets_of_urls() {
+  local list="${1:-}" item
   list="${list},"
   while [ -n "$list" ]; do
     item="${list%%,*}"
     list="${list#*,}"
     item="$(printf '%s' "$item" | tr -d '[:space:]')"
     [ -n "$item" ] || continue
-    host="$(stealth_host_of_url "$item")"
-    [ -n "$host" ] && printf '%s\n' "$host"
+    stealth_target_of_url "$item"
   done | sort -u
 }
 
 # newline-separated hosts -> comma-separated, for display.
 stealth_hosts_commas() { printf '%s' "$1" | tr '\n' ',' | sed 's/,$//; s/,/, /g'; }
 
-# newline-separated hosts -> Python list literal, e.g. ["a.com", "b.com"].
-stealth_hosts_pylist() {
-  local hosts="$1" h py=""
-  while IFS= read -r h; do
-    [ -n "$h" ] || continue
-    py="${py:+$py, }\"$h\""
+# newline-separated targets -> a Python dict literal mapping each host to the
+# exporter's request paths blocked on it: the OTLP paths under its base path.
+stealth_targets_pydict() {
+  local t host base s p paths out="{"
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    host="${t%%/*}"
+    case "$t" in */*) base="${t#*/}" ;; *) base="" ;; esac
+    paths=""
+    for s in $STEALTH_OTLP_HTTP_PATHS; do
+      p="/${base:+$base/}$s"
+      paths="${paths:+$paths, }\"$p\""
+    done
+    for s in $STEALTH_OTLP_GRPC_PREFIXES; do
+      p="/${base:+$base/}$s"
+      paths="${paths:+$paths, }\"$p\""
+    done
+    out="$out\"$host\": [$paths], "
   done <<EOF
-$hosts
+$1
 EOF
-  printf '[%s]' "$py"
+  printf '%s}' "${out%, }"
 }
 
 # newline-separated hosts -> a single --allow-hosts regex (alternation).
@@ -2861,13 +2923,14 @@ stealth_is_loopback() {
   return 1
 }
 
-# "host<TAB>source" lines for one endpoint value.
+# "host-or-target<TAB>source" lines for one endpoint value.
 stealth_detect_emit() {
-  local val="$1" src="$2" h
-  stealth_hosts_of_urls "$val" | while IFS= read -r h; do
-    [ -n "$h" ] || continue
+  local val="$1" src="$2" t h
+  stealth_targets_of_urls "$val" | while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    h="${t%%/*}"
     stealth_is_loopback "$h" && continue
-    printf '%s\t%s\n' "$h" "$src"
+    printf '%s\t%s\n' "$t" "$src"
   done
 }
 
@@ -2948,7 +3011,7 @@ stealth_stop_daemon() {
     printf 'Killing untracked mitmdump on port %s (pid %s).\n' "$STEALTH_PORT" "$lp"
     kill "$lp" 2>/dev/null || true
   fi
-  rm -f "$STEALTH_PID_FILE" "$STEALTH_HOST_FILE" "$STEALTH_ADDON_FILE" "$STEALTH_ALLOW_FILE"
+  rm -f "$STEALTH_PID_FILE" "$STEALTH_HOST_FILE" "$STEALTH_ADDON_FILE" "$STEALTH_ALLOW_FILE" "$STEALTH_ADDONVER_FILE"
 }
 
 stealth_start_daemon() {
@@ -2963,21 +3026,38 @@ stealth_start_daemon() {
   if [ -n "$(stealth_port_owner || true)" ]; then
     die "port $STEALTH_PORT is still in use; free it or set AGMAN_STEALTH_PORT"
   fi
-  pylist="$(stealth_hosts_pylist "$hosts")"
+  pydict="$(stealth_targets_pydict "$hosts")"
   cat > "$STEALTH_ADDON_FILE" <<PYEOF
 from mitmproxy import http
 
-BLOCKED_HOSTS = ${pylist}
+# Generated by agman stealth. Blocks only the OpenTelemetry exporter's own
+# request paths on each listed host; every other request to those hosts is
+# passed through to the real server untouched, so a host that also serves
+# non-telemetry traffic (a company gateway serving login or managed settings,
+# for example) keeps working.
+
+BLOCKED = ${pydict}
 
 def request(flow: http.HTTPFlow) -> None:
-    h = flow.request.pretty_host
-    if any(h == b or h.endswith("." + b) for b in BLOCKED_HOSTS):
-        flow.response = http.Response.make(
-            403,
-            b"blocked by agman stealth",
-            {"Content-Type": "text/plain"},
-        )
-        print("[agman stealth] blocked %s %s" % (flow.request.method, flow.request.pretty_url), flush=True)
+    prefixes = None
+    for host in BLOCKED:
+        if flow.request.pretty_host == host or flow.request.pretty_host.endswith("." + host):
+            prefixes = BLOCKED[host]
+            break
+    if prefixes is None:
+        return
+    path = flow.request.path.split("?", 1)[0]
+    if path.endswith("/") and len(path) > 1:
+        path = path[:-1]
+    for p in prefixes:
+        if path == p or path.startswith(p + "/"):
+            flow.response = http.Response.make(
+                403,
+                b"blocked by agman stealth",
+                {"Content-Type": "text/plain"},
+            )
+            print("[agman stealth] blocked %s %s" % (flow.request.method, flow.request.pretty_url), flush=True)
+            return
 PYEOF
 
   # Intercept only the blocked hosts; pass everything else through un-decrypted so
@@ -3011,6 +3091,7 @@ PYEOF
   printf '%s\n' "$pid" > "$STEALTH_PID_FILE"
   printf '%s\n' "$hosts" > "$STEALTH_HOST_FILE"
   printf '%s\n' "$allowre" > "$STEALTH_ALLOW_FILE"
+  printf '%s\n' "$STEALTH_ADDONVER" > "$STEALTH_ADDONVER_FILE"
   printf 'Stealth daemon started (pid %s). Log: %s\n' "$pid" "$STEALTH_LOG_FILE"
 }
 
@@ -3031,11 +3112,14 @@ stealth_ensure_daemon() {
       allowre="$(stealth_hosts_regex "$hosts")"
       current_allowre=""
       [ -f "$STEALTH_ALLOW_FILE" ] && current_allowre="$(<"$STEALTH_ALLOW_FILE")"
-      if [ "$current_allowre" = "$allowre" ]; then
+      if [ "$current_allowre" != "$allowre" ]; then
+        printf 'Daemon predates the passthrough fix; restarting.\n'
+      elif [ ! -f "$STEALTH_ADDONVER_FILE" ] || [ "$(<"$STEALTH_ADDONVER_FILE")" != "$STEALTH_ADDONVER" ]; then
+        printf 'Daemon runs an older block addon; restarting.\n'
+      else
         printf 'Reusing stealth daemon (pid %s, port %s).\n' "$pid" "$STEALTH_PORT"
         return 0
       fi
-      printf 'Daemon predates the passthrough fix; restarting.\n'
     else
       printf 'Adding blocked hosts; restarting (now: %s).\n' "$(stealth_hosts_commas "$hosts")"
     fi
@@ -3078,27 +3162,57 @@ stealth_ensure_ca() {
   fi
 }
 
-# Confirm the block fires before launching. With --allow-hosts a wrong regex
-# would pass the OTEL host through un-blocked and telemetry would leak, so a
-# response that reached the real server is a hard stop. An unreachable host
-# (000) is only a warning — nothing can leak when the host is down.
+# Confirm the block fires before launching, with two checks per target:
+#   1. an OTLP path must be answered by the addon's own 403 — with path-scoped
+#      blocking a wrong rule would pass the exporter through and telemetry
+#      would leak, so anything else is a hard stop;
+#   2. a non-telemetry path must NOT be answered by the addon — path scoping
+#      exists so a shared host keeps serving its other traffic, and an agman
+#      403 there means the rule is over-broad.
+# An unreachable host (000) is only a warning — nothing can leak when the
+# host is down.
 stealth_verify_block() {
-  local hosts="$1" h code
-  while IFS= read -r h; do
-    [ -n "$h" ] || continue
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 -k \
-      -x "http://127.0.0.1:${STEALTH_PORT}" "https://${h}/" 2>/dev/null || true)"
+  local targets="$1" t host base probe url code body tmpf
+  tmpf="$(mktemp "${TMPDIR:-/tmp}/agman-block-check.XXXXXX")" || return 1
+  while IFS= read -r t; do
+    [ -n "$t" ] || continue
+    host="${t%%/*}"
+    case "$t" in */*) base="/${t#*/}" ;; *) base="" ;; esac
+    probe="${base}/v1/traces"
+
+    url="https://${host}${probe}"
+    code="$(curl -s -o "$tmpf" -w '%{http_code}' --max-time 6 -k \
+      -x "http://127.0.0.1:${STEALTH_PORT}" "$url" 2>/dev/null || true)"
     code="${code:-000}"
-    if [ "$code" = "403" ]; then
-      printf 'Block verified: %s -> 403.\n' "$h"
+    body=""
+    [ -f "$tmpf" ] && body="$(cat "$tmpf" 2>/dev/null)"
+    if [ "$code" = "403" ] && [ "$body" = "blocked by agman stealth" ]; then
+      printf 'Block verified: %s -> 403.\n' "$t"
     elif [ "$code" = "000" ]; then
-      printf 'agman: warning: could not verify the block for %s (connection failed).\n' "$h" >&2
+      printf 'agman: warning: could not verify the block for %s (connection failed).\n' "$t" >&2
     else
-      die "block check for ${h} returned ${code} (expected 403) — telemetry would leak; check ${STEALTH_LOG_FILE}"
+      rm -f "$tmpf"
+      die "block check for ${t} returned ${code} (expected the agman 403) — telemetry would leak; check ${STEALTH_LOG_FILE}"
+    fi
+
+    url="https://${host}/"
+    code="$(curl -s -o "$tmpf" -w '%{http_code}' --max-time 6 -k \
+      -x "http://127.0.0.1:${STEALTH_PORT}" "$url" 2>/dev/null || true)"
+    code="${code:-000}"
+    body=""
+    [ -f "$tmpf" ] && body="$(cat "$tmpf" 2>/dev/null)"
+    if [ "$code" = "403" ] && [ "$body" = "blocked by agman stealth" ]; then
+      rm -f "$tmpf"
+      die "block check for ${t}: a non-telemetry path (${url}) got the agman 403 — the block is broader than the exporter; check ${STEALTH_LOG_FILE}"
+    elif [ "$code" = "000" ]; then
+      printf 'agman: warning: could not verify passthrough for %s (connection failed).\n' "$t" >&2
+    else
+      printf 'Passthrough verified: %s -> %s.\n' "$t" "$code"
     fi
   done <<EOF
-$hosts
+$targets
 EOF
+  rm -f "$tmpf"
 }
 
 stealth_claude() {
@@ -3149,7 +3263,7 @@ stealth_claude() {
 
   given=""
   if [ -n "$otel" ]; then
-    given="$(stealth_hosts_of_urls "$otel")"
+    given="$(stealth_targets_of_urls "$otel")"
     [ -n "$given" ] || die "could not parse a host from --otel '$otel'"
   fi
   if [ "$save" = "1" ]; then
@@ -3167,7 +3281,7 @@ stealth_claude() {
   detected="$(stealth_detect "$claude_config")"
   if [ -n "$detected" ]; then
     printf '%s\n' "$detected" | while IFS="$(printf '\t')" read -r h src; do
-      printf 'Detected OTEL host %s (%s).\n' "$h" "$src"
+      printf 'Detected OTEL endpoint %s (%s).\n' "$h" "$src"
     done
   fi
   hosts="$(printf '%s\n%s\n%s\n' "$given" "$saved" "$(printf '%s\n' "$detected" | cut -f1)" | sed '/^$/d' | sort -u)"
@@ -3278,12 +3392,12 @@ stealth_cmd_hosts() {
       if [ -n "$saved" ]; then printf '%s\n' "$saved"
       else printf "No hosts saved for '%s'.\n" "$name"; fi ;;
     add)
-      given="$(stealth_hosts_of_urls "$list")"
+      given="$(stealth_targets_of_urls "$list")"
       [ -n "$given" ] || usage_die "stealth hosts add requires at least one host"
       stealth_write_hosts "$name" "$(printf '%s\n%s\n' "$saved" "$given")"
       printf "Saved %s for profile '%s'.\n" "$(stealth_hosts_commas "$given")" "$name" ;;
     rm|remove)
-      given="$(stealth_hosts_of_urls "$list")"
+      given="$(stealth_targets_of_urls "$list")"
       [ -n "$given" ] || usage_die "stealth hosts rm requires at least one host"
       stealth_write_hosts "$name" "$(printf '%s\n' "$saved" | grep -vxF "$given" || true)"
       printf "Removed %s from profile '%s'.\n" "$(stealth_hosts_commas "$given")" "$name" ;;
@@ -3531,12 +3645,14 @@ All commands:
   agman stealth stop
 
 How it works:
-  claude runs through a small local proxy. Telemetry hosts get a 403;
-  everything else, including api.anthropic.com, works normally.
-  Needs mitmproxy, lsof and curl (macOS: brew install mitmproxy).
+  claude runs through a small local proxy. The exporter's own request paths
+  (/v1/traces, /v1/metrics, /v1/logs) get a 403; everything else, including
+  api.anthropic.com and any non-telemetry traffic to the blocked host itself,
+  works normally. Needs mitmproxy, lsof and curl (macOS: brew install mitmproxy).
 
 Which hosts are blocked:
-  - hosts you pass with --otel (add --save to remember them)
+  - hosts you pass with --otel (add --save to remember them); when the URL
+    carries a path, only the exporter's paths under it are blocked
   - hosts saved with 'agman stealth hosts add'
   - hosts found automatically in your environment and in Claude's settings
     (profile, project, and company-managed). localhost is never blocked.

@@ -1518,7 +1518,22 @@ chmod +x "$TMP/stealthbin/lsof"
 cat > "$TMP/stealthbin/curl" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "${STEALTH_CURL_ARGS:-/dev/null}"
-printf '%s' "${STEALTH_CURL_CODE:-403}"
+out=/dev/null
+prev=""
+for a in "$@"; do
+  [ "$prev" = "-o" ] && out="$a"
+  prev="$a"
+done
+case " $* " in
+  *[/]v1/traces*|*[/]v1/metrics*|*[/]v1/logs*)
+    # an OTLP path: answered by the generated addon
+    printf '%s' "${STEALTH_CURL_BODY-blocked by agman stealth}" > "$out"
+    printf '%s' "${STEALTH_CURL_CODE-403}" ;;
+  *)
+    # a non-telemetry path: answered by the real server
+    printf '%s' "${STEALTH_CURL_OTHER_BODY-}" > "$out"
+    printf '%s' "${STEALTH_CURL_OTHER_CODE-200}" ;;
+esac
 EOF
 chmod +x "$TMP/stealthbin/curl"
 
@@ -1652,7 +1667,9 @@ assert_ok "stealth stop after fail-closed check" stealth_run stealth stop
 assert_ok "stealth claude joins an unquoted comma list" \
   stealth_run stealth claude --otel https://claude.myapps.hey.io, abc.com --resume r1
 assert_contains "unquoted list blocks every host" \
-  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["abc.com", "claude.myapps.hey.io"]'
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"abc.com": ['
+assert_contains "unquoted list blocks the second host" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"claude.myapps.hey.io": ['
 assert_contains "unquoted list does not leak a host to claude" "$(cat "$TMP/stealthlog/claude")" "ARGS=--resume r1"
 
 stealth_run stealth stop >/dev/null   # each parse case starts from an empty host list
@@ -1660,16 +1677,16 @@ stealth_run stealth stop >/dev/null   # each parse case starts from an empty hos
 assert_ok "stealth claude joins a leading-comma word" \
   stealth_run stealth claude --otel abc.com ,def.com
 assert_contains "leading-comma word is blocked" \
-  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["abc.com", "def.com"]'
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"def.com": ['
 grep -q 'ARGS=$' "$TMP/stealthlog/claude" \
   && ok "leading-comma word does not reach claude" \
   || bad "leading-comma word does not reach claude ($(cat "$TMP/stealthlog/claude"))"
 
 stealth_run stealth stop >/dev/null
 assert_ok "stealth claude accepts repeated --otel and --otel=" \
-  stealth_run stealth claude --otel abc.com --otel=https://def.com:4317/v1
+  stealth_run stealth claude --otel abc.com --otel=https://def.com:4317
 assert_contains "repeated --otel blocks every host" \
-  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["abc.com", "def.com"]'
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"def.com": ['
 
 : > "$TMP/stealthlog/claude"
 assert_ok "a prompt after the list still reaches claude" \
@@ -1686,7 +1703,9 @@ assert_ok "stealth stop after list parsing" stealth_run stealth stop
 assert_ok "stealth claude blocks multiple hosts" \
   stealth_run stealth claude --otel "https://otel.acme-corp.example, metrics.bigco.io , otel.acme-corp.example"
 assert_contains "addon lists every host" \
-  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["metrics.bigco.io", "otel.acme-corp.example"]'
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"metrics.bigco.io": ['
+assert_contains "addon lists the second host" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"otel.acme-corp.example": ['
 wait_for_mitm 1
 grep -qF '(metrics\.bigco\.io|otel\.acme-corp\.example)' "$TMP/stealthlog/mitm.args" \
   && ok "allow-hosts regex covers both hosts" \
@@ -1750,6 +1769,63 @@ assert_lacks "no exclusion when nothing points at another profile" \
   "$(cat "$TMP/stealthlog/claude")" "claudeMdExcludes"
 assert_ok "stealth stop after memory checks" stealth_run stealth stop
 
+# --- stealth: blocks the exporter's paths, not the whole host -------------------
+
+# A blocked host may share its name with traffic claude needs (a company
+# gateway serves login, managed settings and OTEL on one hostname), so the
+# addon blocks only the OTLP exporter's own request paths.
+assert_ok "stealth claude starts for path scoping" \
+  stealth_run stealth claude --otel "https://gw.acme.io"
+addon="$(cat "$AGMAN_HOME/.stealth/block_otel.py")"
+for p in '"/v1/traces"' '"/v1/metrics"' '"/v1/logs"' \
+         '"/opentelemetry.proto.collector.trace.v1.TraceService/"'; do
+  assert_contains "bare-host block names the exporter path $p" "$addon" "$p"
+done
+assert_ok "stealth stop after path scoping" stealth_run stealth stop
+
+# a URL with its own base path scopes the block under it
+assert_ok "stealth claude with a base path" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example/collect"
+grep -qF '"/collect/v1/traces"' "$AGMAN_HOME/.stealth/block_otel.py" \
+  && ok "base path scopes the blocked paths" \
+  || bad "base path scopes the blocked paths"
+assert_ok "stealth stop after base path" stealth_run stealth stop
+
+# an explicit .../v1/traces-style endpoint scopes to the exporter's paths on
+# the whole host (a collector serves all three signals side by side)
+assert_ok "stealth claude with an explicit endpoint" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example/v1/logs"
+assert_contains "explicit endpoint blocks the exporter's paths on the host" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" \
+  '"otel.acme-corp.example": ["/v1/traces", "/v1/metrics", "/v1/logs",'
+assert_ok "stealth stop after explicit endpoint" stealth_run stealth stop
+
+# fail closed when the OTLP path is not answered by the addon (block gone)
+out="$(STEALTH_CURL_BODY="" stealth_run stealth claude --otel "https://otel.acme-corp.example" 2>&1 || true)"
+assert_contains "block check requires the addon's own 403" "$out" "telemetry would leak"
+assert_ok "stealth stop after addon-gone check" stealth_run stealth stop
+
+# fail closed when the addon answers a non-telemetry path (block over-broad)
+out="$(STEALTH_CURL_OTHER_CODE=403 STEALTH_CURL_OTHER_BODY='blocked by agman stealth' \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example" 2>&1 || true)"
+assert_contains "block check refuses an over-broad rule" "$out" "broader than the exporter"
+assert_ok "stealth stop after over-broad check" stealth_run stealth stop
+
+# a daemon still running the old host-wide addon is restarted even though its
+# host list matches
+assert_ok "stealth claude starts a current daemon" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example"
+: > "$TMP/stealthlog/mitm.args"
+assert_ok "relaunch with the same host reuses the daemon" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example"
+assert_eq "matching hosts and addon reuse the daemon" "0" "$(wc -l < "$TMP/stealthlog/mitm.args" | tr -d ' ')"
+rm -f "$AGMAN_HOME/.stealth/addon_version"   # simulate a pre-path-scoping daemon
+assert_ok "relaunch with a stale addon restarts the daemon" \
+  stealth_run stealth claude --otel "https://otel.acme-corp.example"
+wait_for_mitm 1
+assert_eq "stale-addon daemon is re-launched" "1" "$(wc -l < "$TMP/stealthlog/mitm.args" | tr -d ' ')"
+assert_ok "stealth stop after stale-addon restart" stealth_run stealth stop
+
 # --- stealth: two profiles at once ---------------------------------------------------------------
 
 # A second launch with different hosts must not unblock the first session's
@@ -1757,7 +1833,9 @@ assert_ok "stealth stop after memory checks" stealth_run stealth stop
 assert_ok "first session blocks host A" stealth_run stealth claude --otel a-session.example
 assert_ok "second session blocks host B" stealth_run stealth claude --otel b-session.example
 assert_contains "daemon still blocks host A after host B is added" \
-  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["a-session.example", "b-session.example"]'
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"a-session.example": ['
+assert_contains "daemon still blocks host B" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"b-session.example": ['
 grep -qF '(a-session\.example|b-session\.example)' "$AGMAN_HOME/.stealth/allow_hosts" \
   && ok "allow-hosts keeps intercepting host A" \
   || bad "allow-hosts keeps intercepting host A"
@@ -1791,7 +1869,7 @@ assert_ok "stealth claude --save" \
   stealth_run stealth claude --otel extra.bigco.io --save --profile stealthprof
 assert_contains "--save persists the host" "$(stealth_run stealth hosts --profile stealthprof)" "extra.bigco.io"
 assert_contains "--otel and saved hosts are both blocked" \
-  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["extra.bigco.io", "saved.bigco.io"]'
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"extra.bigco.io": ['
 assert_ok "stealth stop after --save" stealth_run stealth stop
 
 # auto-detect: profile settings env block, environment, managed settings; loopback skipped
@@ -1817,8 +1895,9 @@ assert_lacks "detect skips loopback collectors" "$out" "localhost"
 : > "$TMP/stealthlog/claude"
 assert_ok "stealth claude blocks detected hosts" stealth_run stealth claude --profile stealthprof
 assert_contains "detected and saved hosts are all blocked" \
-  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" \
-  '["collector.corp.example", "extra.bigco.io", "managed.corp.example", "saved.bigco.io"]'
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"collector.corp.example": ['
+assert_contains "detected managed endpoint is blocked" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"managed.corp.example": ['
 assert_ok "stealth stop after detection" stealth_run stealth stop
 rm -f "$TMP/stealthlog/managed-settings.json"
 
