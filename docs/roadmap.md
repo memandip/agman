@@ -581,3 +581,27 @@ profile and deleted by `agman remove`. They now follow Claude's sessions into
 directories on `agman off`. Claude's `plugins/` (1.1 GB on the reference machine, mostly
 `plugins/cache` and `plugins/marketplaces`) was left per-profile on purpose: which plugins a
 profile has is persona, and `create --from --link-plugins` already shares the tree when wanted.
+
+### v0.19.0 — profile picker, topic help, stealth per profile
+
+`agman use` with no name and no `.agman` file used to be an error. On a terminal it now draws an
+arrow-key menu of profiles, hand-rolled on `read -rsn1` and ANSI cursor moves so it stays
+dependency-free and bash 3.2 clean; without a terminal the old error stands, so scripts are
+unaffected. A `select`-based top-level menu (PR #27) was closed in its favour: it duplicated the
+command surface and drifted from it as soon as stealth grew new subcommands, while the short
+`agman help` already serves as the guided entry point. Only its test fix, waiting for the detached
+mitmdump stub before reading its log, was kept.
+
+`agman help` is one screen; `agman help <topic>` and `agman <command> --help` hold the detail, and
+`agman help all` prints everything. `--help` is intercepted in `main` so it never runs the command
+it is attached to; `run`, `exec` and `stealth` only honour it as their first argument because
+everything after that is forwarded.
+
+Stealth became per profile. `stealth detect` greps the `OTEL_EXPORTER_OTLP_*ENDPOINT` keys Claude
+would see (environment, the profile's `settings.json`/`settings.local.json`, the project's
+`.claude/settings*.json`, the managed-settings file), `stealth hosts` saves hosts per profile, and
+`stealth enable` makes `agman run` and, with the shell hook, bare `claude` launch through the
+proxy. The daemon's host list only grows between launches: replacing it would unblock a host an
+earlier session still relies on, so `stealth stop` is the reset. That state lives under
+`~/.agman/.stealth/profiles/`, outside the profile tree, so a cloud push or `create --from` can
+never carry an enabled flag to a machine without mitmproxy.

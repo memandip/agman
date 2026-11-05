@@ -1164,7 +1164,7 @@ out="$(printf '\ndefault-key-1\n' | cloud_run cloud login --key-stdin 2>&1)" \
   && ok "login accepts an empty URL and uses the default" \
   || bad "login accepts an empty URL and uses the default ($out)"
 assert_contains "empty URL stores the default server" "$(cat "$AGMAN_HOME/.cloud")" "url=https://agman.vercel.app"
-assert_contains "help documents the default cloud URL" "$("$AGM" help)" "agman.vercel.app"
+assert_contains "help documents the default cloud URL" "$("$AGM" help cloud)" "agman.vercel.app"
 # back to the stubbed test server for everything below
 printf 'test-key-123\n' | cloud_run cloud login --url http://cloud.test --key-stdin >/dev/null 2>&1 \
   || bad "re-login to the stub server"
@@ -1535,7 +1535,23 @@ stealth_run() {
     STEALTH_MITM_ARGS="$TMP/stealthlog/mitm.args" \
     STEALTH_CURL_ARGS="$TMP/stealthlog/curl.args" \
     STEALTH_CLAUDE_LOG="$TMP/stealthlog/claude" \
+    AGMAN_STEALTH_MANAGED="$TMP/stealthlog/managed-settings.json" \
     "$AGM" "$@"
+}
+unset OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_TRACES_ENDPOINT \
+      OTEL_EXPORTER_OTLP_METRICS_ENDPOINT OTEL_EXPORTER_OTLP_LOGS_ENDPOINT \
+      HTTPS_PROXY HTTP_PROXY NODE_EXTRA_CA_CERTS 2>/dev/null || true
+
+# The detached mitmdump stub records its invocation asynchronously, so poll until
+# it has written the expected number of lines before asserting on mitm.args.
+wait_for_mitm() {
+  local want="$1" n=0
+  while [ "$n" -lt 50 ]; do
+    [ "$(wc -l < "$TMP/stealthlog/mitm.args" 2>/dev/null | tr -d ' ')" -ge "$want" ] && return 0
+    sleep 0.1
+    n=$((n + 1))
+  done
+  return 1
 }
 
 # --otel is required — fails before any daemon, proxy, or dependency work.
@@ -1543,7 +1559,8 @@ assert_fail "stealth claude requires --otel" stealth_run stealth claude
 out="$(stealth_run stealth claude 2>&1 || true)"
 assert_contains "missing --otel says it is required" "$out" "requires --otel"
 assert_fail "unknown stealth subcommand fails" stealth_run stealth frobnicate
-assert_contains "help documents stealth" "$("$AGM" help)" "stealth <subcommand>"
+assert_contains "help lists stealth" "$("$AGM" help)" "stealth <command>"
+assert_contains "help stealth documents --otel" "$("$AGM" help stealth)" "--otel <host>"
 
 # calm no-daemon paths
 assert_contains "stealth status with no daemon is calm" "$(stealth_run stealth status)" "No stealth daemon"
@@ -1566,6 +1583,7 @@ claude_log="$(cat "$TMP/stealthlog/claude")"
 assert_contains "claude gets the proxy set" "$claude_log" "HTTPS_PROXY=http://127.0.0.1:8080"
 assert_contains "claude gets the mitmproxy CA" "$claude_log" "NODE_EXTRA_CA_CERTS=$HOME/.mitmproxy/mitmproxy-ca-cert.pem"
 assert_contains "claude forwards args after --" "$claude_log" "ARGS=--resume"
+wait_for_mitm 1
 assert_contains "mitmdump runs the generated addon" "$(cat "$TMP/stealthlog/mitm.args")" "block_otel.py"
 assert_contains "mitmdump only intercepts the blocked host" "$(cat "$TMP/stealthlog/mitm.args")" "--allow-hosts"
 grep -qF 'otel\.acme-corp\.example' "$TMP/stealthlog/mitm.args" \
@@ -1595,6 +1613,7 @@ assert_contains "addon updated to the new host" \
   "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"metrics.bigco.io"'
 claude_log="$(cat "$TMP/stealthlog/claude")"
 assert_contains "--profile sets CLAUDE_CONFIG_DIR" "$claude_log" "CLAUDE_CONFIG_DIR=$AGMAN_HOME/stealthprof/claude"
+wait_for_mitm 2
 assert_eq "host change restarts the daemon" "2" "$(wc -l < "$TMP/stealthlog/mitm.args" | tr -d ' ')"
 
 # stop tears the daemon down
@@ -1628,6 +1647,39 @@ out="$(STEALTH_CURL_CODE=200 stealth_run stealth claude --otel "https://otel.acm
 assert_contains "stealth fails closed when the block check leaks" "$out" "telemetry would leak"
 assert_ok "stealth stop after fail-closed check" stealth_run stealth stop
 
+# unquoted "a, b" arrives as two words: both are blocked, nothing leaks to claude
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude joins an unquoted comma list" \
+  stealth_run stealth claude --otel https://claude.myapps.hey.io, abc.com --resume r1
+assert_contains "unquoted list blocks every host" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["abc.com", "claude.myapps.hey.io"]'
+assert_contains "unquoted list does not leak a host to claude" "$(cat "$TMP/stealthlog/claude")" "ARGS=--resume r1"
+
+stealth_run stealth stop >/dev/null   # each parse case starts from an empty host list
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude joins a leading-comma word" \
+  stealth_run stealth claude --otel abc.com ,def.com
+assert_contains "leading-comma word is blocked" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["abc.com", "def.com"]'
+grep -q 'ARGS=$' "$TMP/stealthlog/claude" \
+  && ok "leading-comma word does not reach claude" \
+  || bad "leading-comma word does not reach claude ($(cat "$TMP/stealthlog/claude"))"
+
+stealth_run stealth stop >/dev/null
+assert_ok "stealth claude accepts repeated --otel and --otel=" \
+  stealth_run stealth claude --otel abc.com --otel=https://def.com:4317/v1
+assert_contains "repeated --otel blocks every host" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["abc.com", "def.com"]'
+
+: > "$TMP/stealthlog/claude"
+assert_ok "a prompt after the list still reaches claude" \
+  stealth_run stealth claude --otel abc.com "explain this repo"
+assert_contains "word without a comma is not swallowed" "$(cat "$TMP/stealthlog/claude")" "ARGS=explain this repo"
+
+assert_fail "--otel with only commas fails" stealth_run stealth claude --otel ", ,"
+assert_fail "--otel= with no value fails" stealth_run stealth claude --otel=
+assert_ok "stealth stop after list parsing" stealth_run stealth stop
+
 # multiple comma-separated endpoints block all their hosts (de-duplicated)
 : > "$TMP/stealthlog/claude"
 : > "$TMP/stealthlog/mitm.args"
@@ -1635,6 +1687,7 @@ assert_ok "stealth claude blocks multiple hosts" \
   stealth_run stealth claude --otel "https://otel.acme-corp.example, metrics.bigco.io , otel.acme-corp.example"
 assert_contains "addon lists every host" \
   "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["metrics.bigco.io", "otel.acme-corp.example"]'
+wait_for_mitm 1
 grep -qF '(metrics\.bigco\.io|otel\.acme-corp\.example)' "$TMP/stealthlog/mitm.args" \
   && ok "allow-hosts regex covers both hosts" \
   || bad "allow-hosts regex covers both hosts"
@@ -1651,14 +1704,188 @@ rm -f "$AGMAN_HOME/.stealth/allow_hosts"      # simulate a pre-0.17.2 daemon
 : > "$TMP/stealthlog/mitm.args"
 assert_ok "stealth restarts a daemon missing the passthrough marker" \
   stealth_run stealth claude --otel "https://otel.acme-corp.example"
+wait_for_mitm 1
 assert_eq "stale daemon is re-launched" "1" "$(wc -l < "$TMP/stealthlog/mitm.args" | tr -d ' ')"
 assert_ok "stealth stop after stale-daemon restart" stealth_run stealth stop
+
+# --- stealth: two profiles at once ---------------------------------------------------------------
+
+# A second launch with different hosts must not unblock the first session's
+# hosts: the running daemon only grows its list until `stealth stop`.
+assert_ok "first session blocks host A" stealth_run stealth claude --otel a-session.example
+assert_ok "second session blocks host B" stealth_run stealth claude --otel b-session.example
+assert_contains "daemon still blocks host A after host B is added" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["a-session.example", "b-session.example"]'
+grep -qF '(a-session\.example|b-session\.example)' "$AGMAN_HOME/.stealth/allow_hosts" \
+  && ok "allow-hosts keeps intercepting host A" \
+  || bad "allow-hosts keeps intercepting host A"
+wait_for_mitm 3   # host A started and host B restarted the daemon; let both land first
+: > "$TMP/stealthlog/mitm.args"
+assert_ok "relaunching with a host already blocked" stealth_run stealth claude --otel a-session.example
+assert_eq "a subset of the blocked hosts reuses the daemon" "0" "$(wc -l < "$TMP/stealthlog/mitm.args" | tr -d ' ')"
+assert_ok "stop resets the host list" stealth_run stealth stop
+assert_missing "stop clears the blocked-host file" "$AGMAN_HOME/.stealth/blocked_host"
+
+# --- stealth: saved hosts, auto-detect, per-profile enable ------------------------------------------
+
+# saved hosts: add (URLs normalized), list, rm; --profile required when unresolvable is covered by name
+assert_ok "stealth hosts add" stealth_run stealth hosts add "https://saved.bigco.io:4318/v1/traces,  other.bigco.io" --profile stealthprof
+assert_eq "hosts are saved normalized and sorted" "$(printf 'other.bigco.io\nsaved.bigco.io')" \
+  "$(stealth_run stealth hosts --profile stealthprof)"
+assert_ok "stealth hosts rm" stealth_run stealth hosts rm other.bigco.io --profile stealthprof
+assert_eq "rm drops only that host" "saved.bigco.io" "$(stealth_run stealth hosts list --profile stealthprof)"
+assert_fail "hosts add needs a host" stealth_run stealth hosts add --profile stealthprof
+assert_fail "hosts on an unknown profile fails" stealth_run stealth hosts --profile nosuch
+
+# stealth claude without --otel uses the saved hosts
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude uses saved hosts without --otel" \
+  stealth_run stealth claude --profile stealthprof
+assert_contains "saved host is blocked" "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"saved.bigco.io"'
+assert_ok "stealth stop after saved-host launch" stealth_run stealth stop
+
+# --save stores the --otel hosts for the profile; --otel unions with saved
+assert_ok "stealth claude --save" \
+  stealth_run stealth claude --otel extra.bigco.io --save --profile stealthprof
+assert_contains "--save persists the host" "$(stealth_run stealth hosts --profile stealthprof)" "extra.bigco.io"
+assert_contains "--otel and saved hosts are both blocked" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '["extra.bigco.io", "saved.bigco.io"]'
+assert_ok "stealth stop after --save" stealth_run stealth stop
+
+# auto-detect: profile settings env block, environment, managed settings; loopback skipped
+sp_settings="$AGMAN_HOME/stealthprof/claude/settings.json"
+cat > "$sp_settings" <<'EOF'
+{
+  "env": {
+    "CLAUDE_CODE_ENABLE_TELEMETRY": "1",
+    "OTEL_EXPORTER_OTLP_ENDPOINT": "https://collector.corp.example:4318",
+    "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT": "http://localhost:4318/v1/logs"
+  }
+}
+EOF
+printf '{"env":{"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT":"https://managed.corp.example/v1/metrics"}}\n' \
+  > "$TMP/stealthlog/managed-settings.json"
+out="$(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://envvar.corp.example stealth_run stealth detect --profile stealthprof)"
+assert_contains "detect finds the settings.json endpoint" "$out" "collector.corp.example"
+assert_contains "detect names the source file" "$out" "$sp_settings"
+assert_contains "detect finds the managed-settings endpoint" "$out" "managed.corp.example"
+assert_contains "detect finds the environment endpoint" "$out" "envvar.corp.example"
+assert_lacks "detect skips loopback collectors" "$out" "localhost"
+
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude blocks detected hosts" stealth_run stealth claude --profile stealthprof
+assert_contains "detected and saved hosts are all blocked" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" \
+  '["collector.corp.example", "extra.bigco.io", "managed.corp.example", "saved.bigco.io"]'
+assert_ok "stealth stop after detection" stealth_run stealth stop
+rm -f "$TMP/stealthlog/managed-settings.json"
+
+# nothing given, saved, or detected: still refuses
+assert_ok "create an empty stealth profile" "$AGM" create stealthbare
+out="$(stealth_run stealth claude --profile stealthbare 2>&1 || true)"
+assert_contains "no host anywhere still requires --otel" "$out" "requires --otel"
+assert_fail "--save without --otel fails" stealth_run stealth claude --save --profile stealthprof
+
+# enable/disable: `agman run` goes through the proxy only while enabled
+assert_ok "stealth enable" stealth_run stealth enable stealthprof
+assert_contains "status lists the enabled profile" "$(stealth_run stealth status)" "stealthprof"
+: > "$TMP/stealthlog/claude"
+assert_ok "run an enabled profile" stealth_run run stealthprof -- --resume r9
+claude_log="$(cat "$TMP/stealthlog/claude")"
+assert_contains "run of an enabled profile sets the proxy" "$claude_log" "HTTPS_PROXY=http://127.0.0.1:8080"
+assert_contains "run of an enabled profile keeps its config dir" "$claude_log" "CLAUDE_CONFIG_DIR=$AGMAN_HOME/stealthprof/claude"
+assert_contains "run of an enabled profile forwards args" "$claude_log" "ARGS=--resume r9"
+assert_ok "stealth enabled reports on via CLAUDE_CONFIG_DIR" \
+  env CLAUDE_CONFIG_DIR="$AGMAN_HOME/stealthprof/claude" "$AGM" stealth enabled
+assert_fail "stealth enabled is off for another profile" \
+  env CLAUDE_CONFIG_DIR="$AGMAN_HOME/stealthbare/claude" "$AGM" stealth enabled
+assert_ok "stealth stop after enabled run" stealth_run stealth stop
+out="$(stealth_run stealth enable stealthbare 2>&1)"
+assert_contains "enable warns when no host is known" "$out" "no hosts saved or detected"
+
+assert_ok "stealth disable" stealth_run stealth disable stealthprof
+assert_ok "stealth enable accepts --profile" stealth_run stealth enable --profile stealthprof
+assert_exists "enable --profile sets the flag" "$AGMAN_HOME/.stealth/profiles/stealthprof.enabled"
+assert_ok "stealth disable accepts --profile" stealth_run stealth disable --profile stealthprof
+assert_fail "enable rejects two profile names" stealth_run stealth enable stealthprof stealthbare
+: > "$TMP/stealthlog/claude"
+stealth_run run stealthprof >/dev/null 2>&1
+assert_lacks "run of a disabled profile skips the proxy" "$(cat "$TMP/stealthlog/claude")" "HTTPS_PROXY=http"
+assert_contains "shell integration routes claude through stealth" "$("$AGM" init bash)" "agman stealth enabled"
+
+# rename carries the stealth config; remove forgets it
+assert_ok "rename a stealth-configured profile" "$AGM" rename stealthbare stealthbare2
+assert_exists "rename moves the enabled flag" "$AGMAN_HOME/.stealth/profiles/stealthbare2.enabled"
+assert_missing "rename leaves no stale flag" "$AGMAN_HOME/.stealth/profiles/stealthbare.enabled"
+assert_ok "remove a stealth-configured profile" "$AGM" remove stealthbare2 --yes
+assert_missing "remove forgets the stealth config" "$AGMAN_HOME/.stealth/profiles/stealthbare2.enabled"
 
 # --- misc ------------------------------------------------------------------------------------------
 
 assert_ok "help runs" "$AGM" help
-assert_contains "help documents the supported tools" "$("$AGM" help)" "Gemini CLI"
-assert_contains "help documents push --dry-run" "$("$AGM" help)" "--dry-run"
+assert_contains "help documents the supported tools" "$("$AGM" help tools)" "Gemini CLI"
+assert_contains "help documents push --dry-run" "$("$AGM" help cloud)" "--dry-run"
+assert_contains "help names the everyday commands" "$("$AGM" help)" "current               Show which profile is active"
+assert_lacks "short help leaves cloud details to its topic" "$("$AGM" help)" "--include-secrets"
+lines="$("$AGM" help | wc -l | tr -d ' ')"
+if [ "$lines" -le 50 ]; then ok "short help fits one screen"; else bad "short help fits one screen ($lines lines)"; fi
+assert_contains "help all includes every topic" "$("$AGM" help all)" "AGMAN_SHARE_STATE"
+assert_contains "help all includes stealth" "$("$AGM" help all)" "AGMAN_STEALTH_PORT"
+assert_contains "help <command> falls back to its summary line" "$("$AGM" help off)" "restore your original configs"
+assert_contains "help env describes the env command" "$("$AGM" help env)" "agman env <name>"
+assert_contains "--help accepts a topic" "$("$AGM" --help create)" "--copy-current"
+assert_fail "help for an unknown topic fails" "$AGM" help frobnicate
+assert_contains "help version describes the version command" "$("$AGM" help version)" "Print the agman version"
+assert_contains "version --help shows help" "$("$AGM" version --help)" "Print the agman version"
+
+# interactive picker: 'agman use' with no name on a terminal. script(1) gives the
+# command a pseudo-terminal; BSD/macOS and util-linux spell it differently.
+pty_run() {
+  # Probe on a closed stdin: util-linux script forwards stdin to its pty, so a
+  # probe sharing the pipe would swallow the keys meant for the real run.
+  if script -qec true /dev/null </dev/null >/dev/null 2>&1; then
+    script -qec "$*" /dev/null
+  else
+    script -q /dev/null "$@"
+  fi
+}
+if command -v script >/dev/null 2>&1; then
+  pickdir="$TMP/pickdir"; mkdir -p "$pickdir"
+  first="$(for d in "$AGMAN_HOME"/*/; do d="${d%/}"; printf '%s\n' "${d##*/}"; done | head -1)"
+  before="$("$AGM" current)"
+  out="$(cd "$pickdir" && printf 'q' | pty_run bash "$AGM" use 2>&1 || true)"
+  assert_contains "use with no name shows the picker" "$out" "Select a profile"
+  assert_contains "picker cancel says nothing changed" "$out" "Cancelled; nothing changed"
+  assert_eq "picker cancel keeps the active profile" "$before" "$("$AGM" current)"
+  (cd "$pickdir" && printf '1\n' | pty_run bash "$AGM" use >/dev/null 2>&1) || true
+  assert_contains "picker number + Enter switches" "$("$AGM" current)" "$first"
+  out="$(cd "$pickdir" && printf '\033[A\033[A\033[A\033[B\n' | pty_run bash "$AGM" use 2>&1 || true)"
+  assert_contains "picker arrow keys switch" "$out" "Switched to profile"
+  cat > "$TMP/hooktest.sh" <<'EOF'
+eval "$(agman init bash)"
+agman use
+printf 'HOOKDIR=%s\n' "${CLAUDE_CONFIG_DIR:-unset}"
+EOF
+  out="$(cd "$pickdir" && printf '1\n' | pty_run bash "$TMP/hooktest.sh" 2>&1 || true)"
+  assert_contains "shell hook follows a picked profile" "$out" "HOOKDIR=$AGMAN_HOME/$first/claude"
+else
+  ok "picker tests skipped (no script(1))"
+fi
+out="$(cd "$TMP" && "$AGM" use </dev/null 2>&1 || true)"
+assert_contains "use with no name and no terminal keeps the old error" "$out" "no profile given"
+out="$(cd "$TMP" && bash -c 'eval "$(agman init bash)"; agman use --help >/dev/null 2>&1; printf "%s" "${CLAUDE_CONFIG_DIR:-unset}"')"
+assert_eq "shell hook ignores 'use --help'" "unset" "$out"
+assert_contains "--list lists profiles" "$("$AGM" --list)" "staging"
+assert_contains "ls lists profiles" "$("$AGM" ls)" "staging"
+assert_contains "help names the ls alias" "$("$AGM" help)" "list, ls"
+active_before="$("$AGM" current)"
+assert_contains "off --help shows help" "$("$AGM" off --help)" "restore your original configs"
+assert_eq "off --help does not deactivate" "$active_before" "$("$AGM" current)"
+assert_contains "create <name> --help shows help" "$("$AGM" create helpprobe --help)" "--copy-current"
+assert_missing "create <name> --help creates nothing" "$AGMAN_HOME/helpprobe"
+assert_contains "-h works per command" "$("$AGM" doctor -h)" "Check your setup"
+assert_contains "cloud --help shows cloud help" "$("$AGM" cloud --help)" "--dry-run"
+assert_contains "rm --help resolves the alias" "$("$AGM" rm --help)" "Delete a profile"
 assert_contains "version prints" "$("$AGM" version)" "agman"
 assert_fail "unknown command fails" "$AGM" frobnicate
 assert_ok "remove an inactive profile with --yes" "$AGM" remove staging --yes

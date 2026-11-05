@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.18.1"
+AGMAN_VERSION="0.19.0"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -1233,12 +1233,79 @@ cmd_list() {
   [ "$found" = "1" ] || printf "No profiles yet. Create one with: agman create <name>\n"
 }
 
+# Arrow-key menu of profiles on the terminal; prints the chosen name on stdout.
+# The menu itself is drawn on stderr so $(pick_profile) captures only the name.
+pick_profile() {
+  local names n=0 sel=0 i entry active key rest prev_stty
+  names=()
+  active="$(default_profile 2>/dev/null || true)"
+  for entry in "$AGMAN_HOME"/*/; do
+    [ -d "$entry" ] || continue
+    entry="${entry%/}"
+    names[$n]="${entry##*/}"
+    [ "${names[$n]}" = "$active" ] && sel=$n
+    n=$((n+1))
+  done
+  [ "$n" -gt 0 ] || die "no profiles yet. Create one with: agman create <name>"
+
+  prev_stty="$(stty -g 2>/dev/null || true)"
+  # shellcheck disable=SC2064  # expand prev_stty now, not at signal time
+  trap "printf '\033[?25h' >&2; stty '$prev_stty' 2>/dev/null; printf '\nCancelled; nothing changed.\n' >&2; exit 130" INT TERM
+  printf '\033[?25l' >&2
+  printf 'Select a profile  (↑/↓ move, Enter select, q cancel)\n' >&2
+  while :; do
+    i=0
+    while [ "$i" -lt "$n" ]; do
+      if [ "$i" = "$sel" ]; then
+        printf '\r\033[K\033[7m> %d  %s%s\033[0m\n' "$((i+1))" "${names[$i]}" \
+          "$([ "${names[$i]}" = "$active" ] && printf '  (active)')" >&2
+      else
+        printf '\r\033[K  %d  %s%s\n' "$((i+1))" "${names[$i]}" \
+          "$([ "${names[$i]}" = "$active" ] && printf '  (active)')" >&2
+      fi
+      i=$((i+1))
+    done
+    key=""
+    IFS= read -rsn1 key || key="q"
+    case "$key" in
+      $'\033')
+        rest=""
+        IFS= read -rsn2 -t 1 rest || true
+        case "$rest" in
+          "[A"|"OA") key="up" ;;
+          "[B"|"OB") key="down" ;;
+          "") key="q" ;;
+          *) key="" ;;
+        esac ;;
+    esac
+    case "$key" in
+      up|k)   [ "$sel" -gt 0 ] && sel=$((sel-1)) ;;
+      down|j) [ "$sel" -lt $((n-1)) ] && sel=$((sel+1)) ;;
+      [1-9])  [ "$key" -le "$n" ] && sel=$((key-1)) ;;
+      ""|$'\n'|$'\r') break ;;
+      q|Q)
+        printf '\033[%dA\r\033[J\033[?25h' "$((n+1))" >&2
+        trap - INT TERM
+        printf 'Cancelled; nothing changed.\n' >&2
+        return 1 ;;
+    esac
+    printf '\033[%dA' "$n" >&2
+  done
+  printf '\033[%dA\r\033[J\033[?25h' "$((n+1))" >&2
+  trap - INT TERM
+  printf '%s' "${names[$sel]}"
+}
+
 cmd_use() {
   local name="${1:-}"
   if [ -z "$name" ]; then
-    name="$(resolve_project_profile)" || \
-      usage_die "no profile given and no usable $PROJECT_FILE found here"
-    printf "Using profile '%s' from %s.\n" "$name" "$(find_project_file "$PWD")"
+    if [ -n "$(find_project_file "$PWD" 2>/dev/null)" ] || [ ! -t 0 ] || [ ! -t 2 ]; then
+      name="$(resolve_project_profile)" || \
+        usage_die "no profile given and no usable $PROJECT_FILE found here"
+      printf "Using profile '%s' from %s.\n" "$name" "$(find_project_file "$PWD")"
+    else
+      name="$(pick_profile)" || exit $?
+    fi
   fi
   require_profile "$name"
 
@@ -1455,6 +1522,10 @@ cmd_run() {
   link_profile_identity "$(profile_dir "$name")"
   shift
   [ "${1:-}" = "--" ] && shift
+  if stealth_is_enabled "$name"; then
+    stealth_claude --profile "$name" -- ${1+"$@"}
+    return
+  fi
   command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
   local dir; dir="$(profile_dir "$name")"
   exec env CLAUDE_CONFIG_DIR="$(profile_claude_dir "$dir")" claude ${1+"$@"}
@@ -1480,6 +1551,7 @@ cmd_rename() {
   local was_active=0
   [ "$(active_profile 2>/dev/null || true)" = "$old" ] && was_active=1
   mv "$(profile_dir "$old")" "$(profile_dir "$new")"
+  stealth_rename_profile "$old" "$new"
   if [ "$(default_profile 2>/dev/null || true)" = "$old" ]; then
     printf '%s\n' "$new" > "$DEFAULT_FILE"
   fi
@@ -1525,6 +1597,7 @@ cmd_remove() {
     case "$reply" in y|Y|yes|YES) ;; *) printf 'Aborted.\n'; return 1 ;; esac
   fi
   rm -rf "$dir"
+  stealth_forget_profile "$name"
   if [ "$(default_profile 2>/dev/null || true)" = "$name" ]; then
     rm -f "$DEFAULT_FILE"
   fi
@@ -1841,8 +1914,9 @@ agman() {
   case "${1:-}" in
     use)
       command agman "$@" || return $?
-      local _agman_dir
-      if _agman_dir="$(command agman dir "${2:-}" 2>/dev/null)" && [ -n "$_agman_dir" ]; then
+      local _agman_a _agman_dir
+      for _agman_a in "$@"; do case "$_agman_a" in -h|--help) return 0 ;; esac; done
+      if _agman_dir="$(command agman dir --active 2>/dev/null)" && [ -n "$_agman_dir" ]; then
         export CLAUDE_CONFIG_DIR="$_agman_dir"
       fi
       ;;
@@ -1884,6 +1958,11 @@ fi
 _agman_autoswitch
 
 claude() {
+  # A profile with `agman stealth enable` always launches through the proxy.
+  if command agman stealth enabled 2>/dev/null; then
+    command agman stealth claude -- "$@"
+    return $?
+  fi
   if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
     command claude "$@"
     return $?
@@ -2607,6 +2686,11 @@ STEALTH_ALLOW_FILE="$STEALTH_DIR/allow_hosts"
 STEALTH_ADDON_FILE="$STEALTH_DIR/block_otel.py"
 STEALTH_LOG_FILE="$STEALTH_DIR/mitmdump.log"
 STEALTH_PORT="${AGMAN_STEALTH_PORT:-8080}"
+STEALTH_PROFILES_DIR="$STEALTH_DIR/profiles"
+STEALTH_OTEL_VARS="OTEL_EXPORTER_OTLP_ENDPOINT OTEL_EXPORTER_OTLP_TRACES_ENDPOINT OTEL_EXPORTER_OTLP_METRICS_ENDPOINT OTEL_EXPORTER_OTLP_LOGS_ENDPOINT"
+# Claude Code's admin-managed settings (macOS, Linux/WSL, Windows via Git Bash),
+# colon-separated. Overridable so tests never read the real machine's policy.
+STEALTH_MANAGED_FILES="${AGMAN_STEALTH_MANAGED:-/Library/Application Support/ClaudeCode/managed-settings.json:/etc/claude-code/managed-settings.json:/c/Program Files/ClaudeCode/managed-settings.json}"
 
 # Bare hostname out of an OTLP endpoint URL: strip scheme, userinfo, port,
 # path, query, and fragment. bash 3.2 has no ${var,,}, so lowercase via tr.
@@ -2665,6 +2749,114 @@ stealth_require_deps() {
   command -v mitmdump >/dev/null 2>&1 || die "mitmdump (mitmproxy) is required for stealth (brew install mitmproxy)"
   command -v lsof     >/dev/null 2>&1 || die "lsof is required for stealth"
   command -v curl     >/dev/null 2>&1 || die "curl is required for stealth"
+}
+
+# --- per-profile stealth config ---------------------------------------------
+#
+# Saved hosts and the enabled flag are machine-local, like the daemon: they
+# live under $STEALTH_DIR/profiles, not inside the profile tree, so a cloud
+# push or a `create --from` clone never turns stealth on somewhere mitmproxy
+# isn't installed. rename/remove keep them in step with the profile.
+
+stealth_profile_file() { printf '%s/%s.%s' "$STEALTH_PROFILES_DIR" "$1" "$2"; }
+
+stealth_saved_hosts() {
+  local f; f="$(stealth_profile_file "$1" hosts)"
+  [ -f "$f" ] && sed '/^$/d' "$f"
+  return 0
+}
+
+stealth_write_hosts() {
+  local name="$1" hosts="$2" f
+  f="$(stealth_profile_file "$name" hosts)"
+  if [ -z "$hosts" ]; then rm -f "$f"; return 0; fi
+  mkdir -p "$STEALTH_PROFILES_DIR"
+  printf '%s\n' "$hosts" | sed '/^$/d' | sort -u > "$f"
+}
+
+stealth_is_enabled() { [ -f "$(stealth_profile_file "$1" enabled)" ]; }
+
+stealth_forget_profile() {
+  rm -f "$(stealth_profile_file "$1" hosts)" "$(stealth_profile_file "$1" enabled)"
+}
+
+stealth_rename_profile() {
+  local old="$1" new="$2" ext
+  for ext in hosts enabled; do
+    [ -f "$(stealth_profile_file "$old" "$ext")" ] || continue
+    mv "$(stealth_profile_file "$old" "$ext")" "$(stealth_profile_file "$new" "$ext")"
+  done
+}
+
+# The profile a bare `claude` would run with here: the one CLAUDE_CONFIG_DIR
+# points into (a per-shell override always wins), else the active profile.
+stealth_current_profile() {
+  local name
+  if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then
+    profile_name_from_target "$CLAUDE_CONFIG_DIR" && return 0
+    return 1
+  fi
+  name="$(active_profile 2>/dev/null || default_profile 2>/dev/null)" || return 1
+  [ -n "$name" ] && printf '%s' "$name"
+}
+
+# --- auto-detection -----------------------------------------------------------
+#
+# Claude Code reads the exporter endpoint from the environment, which settings
+# files can inject through their "env" block: user settings, project settings
+# in the current directory, and the admin-managed file. Scanning for the
+# OTEL_EXPORTER_OTLP_*ENDPOINT keys is a plain grep — no JSON parser needed.
+# Loopback collectors are skipped: NO_PROXY bypasses the proxy for them, and
+# they don't send anything off the machine.
+
+stealth_is_loopback() {
+  case "$1" in
+    localhost|*.localhost|127.*|0.0.0.0|::1|\[*) return 0 ;;
+  esac
+  return 1
+}
+
+# "host<TAB>source" lines for one endpoint value.
+stealth_detect_emit() {
+  local val="$1" src="$2" h
+  stealth_hosts_of_urls "$val" | while IFS= read -r h; do
+    [ -n "$h" ] || continue
+    stealth_is_loopback "$h" && continue
+    printf '%s\t%s\n' "$h" "$src"
+  done
+}
+
+# All OTEL endpoints Claude would see with the given config dir, as
+# "host<TAB>source" lines.
+stealth_detect() {
+  local claude_dir="${1:-}" var val f list
+  [ -n "$claude_dir" ] || claude_dir="${CLAUDE_CONFIG_DIR:-$TARGET_HOME/.claude}"
+  for var in $STEALTH_OTEL_VARS; do
+    eval "val=\${$var:-}"
+    [ -n "$val" ] && stealth_detect_emit "$val" "\$$var"
+  done
+  # Colon-separated so paths with spaces (macOS's managed dir) survive.
+  list="$claude_dir/settings.json:$claude_dir/settings.local.json:$PWD/.claude/settings.json:$PWD/.claude/settings.local.json:$STEALTH_MANAGED_FILES:"
+  while [ -n "$list" ]; do
+    f="${list%%:*}"; list="${list#*:}"
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    grep -o '"OTEL_EXPORTER_OTLP_[A-Z_]*ENDPOINT"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" 2>/dev/null \
+      | sed 's/^"[A-Z_]*"[[:space:]]*:[[:space:]]*"//; s/"$//' \
+      | while IFS= read -r val; do stealth_detect_emit "$val" "$f"; done
+  done
+  return 0
+}
+
+# Resolve the profile a stealth subcommand acts on: --profile wins, else the
+# current one. Dies with a hint when neither exists.
+stealth_target_profile() {
+  local name="${1:-}"
+  if [ -z "$name" ]; then
+    name="$(stealth_current_profile || true)"
+    [ -n "$name" ] || die "no active profile; pass --profile <name>"
+  fi
+  require_profile "$name"
+  printf '%s' "$name"
 }
 
 # PID from the tracked daemon pid file, or empty.
@@ -2784,6 +2976,10 @@ stealth_ensure_daemon() {
   if [ -n "$pid" ]; then
     current_host=""
     [ -f "$STEALTH_HOST_FILE" ] && current_host="$(<"$STEALTH_HOST_FILE")"
+    # Sessions launched earlier still route through this daemon. Replacing its
+    # host list would unblock their hosts mid-session, so it only ever grows;
+    # `agman stealth stop` is what resets it.
+    hosts="$(printf '%s\n%s\n' "$current_host" "$hosts" | sed '/^$/d' | sort -u)"
     if [ "$current_host" = "$hosts" ]; then
       # Reuse only a daemon started with the passthrough (--allow-hosts); one
       # predating that fix MITMs everything and breaks git/uv/gh on its cert.
@@ -2796,7 +2992,7 @@ stealth_ensure_daemon() {
       fi
       printf 'Daemon predates the passthrough fix; restarting.\n'
     else
-      printf 'Blocked hosts changed; restarting (now: %s).\n' "$(stealth_hosts_commas "$hosts")"
+      printf 'Adding blocked hosts; restarting (now: %s).\n' "$(stealth_hosts_commas "$hosts")"
     fi
     stealth_stop_daemon
     stealth_start_daemon "$hosts"
@@ -2861,35 +3057,82 @@ EOF
 }
 
 stealth_claude() {
-  local otel="" profile="" arg hosts claude_config=""
+  local otel="" profile="" arg hosts claude_config="" save=0 pname="" given saved detected h src
   local claude_args n=0
   claude_args=()
   # --otel/--profile belong to stealth; every other argument (positionals and
   # claude flags like --resume, --continue, -p) is forwarded to claude as-is,
   # in order, whether or not a `--` separator is present.
+  # --otel repeats and accepts --otel=<list>. An unquoted "a.com, b.com" reaches
+  # us as two words; a word ending in (or the next starting with) a comma
+  # continues the list, so b.com is blocked instead of becoming a claude prompt.
+  local val
   while [ $# -gt 0 ]; do
     arg="$1"; shift
     case "$arg" in
-      --otel) otel="${1:-}"; [ -n "$otel" ] || usage_die "--otel requires a value"; shift ;;
+      --otel|--otel=*)
+        if [ "$arg" = "--otel" ]; then
+          [ $# -gt 0 ] || usage_die "--otel requires a value"
+          val="$1"; shift
+        else
+          val="${arg#--otel=}"
+        fi
+        while [ $# -gt 0 ]; do
+          case "$1" in -*) break ;; esac
+          case "$val" in
+            *,|*", "|*",  ") ;;
+            *) case "$1" in ,*) ;; *) break ;; esac ;;
+          esac
+          val="$val,$1"; shift
+        done
+        [ -n "$(printf '%s' "$val" | tr -d '[:space:],')" ] || usage_die "--otel requires a value"
+        otel="${otel:+$otel,}$val" ;;
       --profile) profile="${1:-}"; [ -n "$profile" ] || usage_die "--profile requires a profile name"; shift ;;
+      --save) save=1 ;;
       --) while [ $# -gt 0 ]; do claude_args[$n]="$1"; n=$((n+1)); shift; done ;;
       *) claude_args[$n]="$arg"; n=$((n+1)) ;;
     esac
   done
 
-  [ -n "$otel" ] || die "stealth claude requires --otel <endpoint>: the OTLP exporter endpoint to block"
+  if [ -n "$profile" ]; then
+    require_profile "$profile"
+    pname="$profile"
+    claude_config="$(profile_claude_dir "$(profile_dir "$profile")")"
+  else
+    pname="$(stealth_current_profile || true)"
+  fi
+
+  given=""
+  if [ -n "$otel" ]; then
+    given="$(stealth_hosts_of_urls "$otel")"
+    [ -n "$given" ] || die "could not parse a host from --otel '$otel'"
+  fi
+  if [ "$save" = "1" ]; then
+    [ -n "$given" ] || usage_die "--save requires --otel <host>"
+    [ -n "$pname" ] || die "--save needs a profile; pass --profile <name>"
+    stealth_write_hosts "$pname" "$(printf '%s\n%s\n' "$(stealth_saved_hosts "$pname")" "$given")"
+    printf "Saved %s for profile '%s'.\n" "$(stealth_hosts_commas "$given")" "$pname"
+  fi
+
+  # Block the union of --otel, the profile's saved hosts, and whatever Claude
+  # would be configured to export to: blocking an extra host is harmless,
+  # missing one leaks.
+  saved=""
+  [ -n "$pname" ] && saved="$(stealth_saved_hosts "$pname")"
+  detected="$(stealth_detect "$claude_config")"
+  if [ -n "$detected" ]; then
+    printf '%s\n' "$detected" | while IFS="$(printf '\t')" read -r h src; do
+      printf 'Detected OTEL host %s (%s).\n' "$h" "$src"
+    done
+  fi
+  hosts="$(printf '%s\n%s\n%s\n' "$given" "$saved" "$(printf '%s\n' "$detected" | cut -f1)" | sed '/^$/d' | sort -u)"
+  if [ -z "$hosts" ]; then
+    die "stealth claude requires --otel <host>: nothing is saved for ${pname:-this profile} and no OTEL exporter was detected"
+  fi
 
   stealth_require_deps
   command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
-
-  hosts="$(stealth_hosts_of_urls "$otel")"
-  [ -n "$hosts" ] || die "could not parse a host from --otel '$otel'"
-
-  if [ -n "$profile" ]; then
-    require_profile "$profile"
-    link_profile_identity "$(profile_dir "$profile")"
-    claude_config="$(profile_claude_dir "$(profile_dir "$profile")")"
-  fi
+  [ -n "$profile" ] && link_profile_identity "$(profile_dir "$profile")"
 
   stealth_ensure_ca
   stealth_ensure_daemon "$hosts"
@@ -2908,7 +3151,7 @@ stealth_claude() {
 }
 
 stealth_status() {
-  local pid lp hosts
+  local pid lp hosts f name saved state seen=""
   pid="$(stealth_daemon_pid || true)"
   if [ -n "$pid" ]; then
     hosts="<unknown>"
@@ -2916,154 +3159,438 @@ stealth_status() {
     printf 'Stealth daemon running (pid %s, port %s).\n' "$pid" "$STEALTH_PORT"
     printf '  Blocked hosts: %s\n' "$(stealth_hosts_commas "$hosts")"
     printf '  State dir:     %s\n' "$STEALTH_DIR"
+  else
+    lp="$(stealth_port_owner || true)"
+    if [ -n "$lp" ] && stealth_is_mitmdump "$lp"; then
+      printf 'Port %s held by untracked mitmdump (pid %s).\n' "$STEALTH_PORT" "$lp"
+    elif [ -n "$lp" ]; then
+      printf 'Port %s held by pid %s (not mitmdump).\n' "$STEALTH_PORT" "$lp"
+    else
+      printf 'No stealth daemon running.\n'
+    fi
+  fi
+  for f in "$STEALTH_PROFILES_DIR"/*.hosts "$STEALTH_PROFILES_DIR"/*.enabled; do
+    [ -f "$f" ] || continue
+    name="${f##*/}"; name="${name%.*}"
+    case "$seen/" in */"$name"/*) continue ;; esac
+    [ -n "$seen" ] || printf 'Profiles:\n'
+    seen="$seen/$name"
+    state="off"; stealth_is_enabled "$name" && state="on"
+    saved="$(stealth_saved_hosts "$name")"
+    printf '  %-14s stealth %-3s  saved hosts: %s\n' "$name" "$state" \
+      "$( [ -n "$saved" ] && stealth_hosts_commas "$saved" || printf 'none')"
+  done
+}
+
+# agman stealth detect [--profile <name>]
+stealth_cmd_detect() {
+  local profile="" arg dir="" out
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --profile) profile="${1:-}"; [ -n "$profile" ] || usage_die "--profile requires a profile name"; shift ;;
+      *) usage_die "unexpected argument '$arg' for stealth detect" ;;
+    esac
+  done
+  if [ -n "$profile" ]; then
+    require_profile "$profile"
+    dir="$(profile_claude_dir "$(profile_dir "$profile")")"
+  fi
+  out="$(stealth_detect "$dir")"
+  if [ -z "$out" ]; then
+    printf 'No OTEL exporter endpoint detected.\n'
     return 0
   fi
-  lp="$(stealth_port_owner || true)"
-  if [ -n "$lp" ] && stealth_is_mitmdump "$lp"; then
-    printf 'Port %s held by untracked mitmdump (pid %s).\n' "$STEALTH_PORT" "$lp"
-  elif [ -n "$lp" ]; then
-    printf 'Port %s held by pid %s (not mitmdump).\n' "$STEALTH_PORT" "$lp"
-  else
-    printf 'No stealth daemon running.\n'
+  printf '%s\n' "$out" | awk -F '\t' '{ printf "%-30s %s\n", $1, $2 }'
+}
+
+# agman stealth hosts [list|add|rm] [<host>…] [--profile <name>]
+stealth_cmd_hosts() {
+  local action="list" profile="" arg list="" name given saved
+  case "${1:-}" in list|add|rm|remove) action="$1"; shift ;; esac
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --profile) profile="${1:-}"; [ -n "$profile" ] || usage_die "--profile requires a profile name"; shift ;;
+      -*) usage_die "unknown option '$arg' for stealth hosts" ;;
+      *) list="${list:+$list,}$arg" ;;
+    esac
+  done
+  name="$(stealth_target_profile "$profile")"
+  saved="$(stealth_saved_hosts "$name")"
+  case "$action" in
+    list)
+      [ -z "$list" ] || usage_die "stealth hosts list takes no hosts (did you mean 'add'?)"
+      if [ -n "$saved" ]; then printf '%s\n' "$saved"
+      else printf "No hosts saved for '%s'.\n" "$name"; fi ;;
+    add)
+      given="$(stealth_hosts_of_urls "$list")"
+      [ -n "$given" ] || usage_die "stealth hosts add requires at least one host"
+      stealth_write_hosts "$name" "$(printf '%s\n%s\n' "$saved" "$given")"
+      printf "Saved %s for profile '%s'.\n" "$(stealth_hosts_commas "$given")" "$name" ;;
+    rm|remove)
+      given="$(stealth_hosts_of_urls "$list")"
+      [ -n "$given" ] || usage_die "stealth hosts rm requires at least one host"
+      stealth_write_hosts "$name" "$(printf '%s\n' "$saved" | grep -vxF "$given" || true)"
+      printf "Removed %s from profile '%s'.\n" "$(stealth_hosts_commas "$given")" "$name" ;;
+  esac
+}
+
+# agman stealth enable|disable [<name> | --profile <name>]
+stealth_cmd_toggle() {
+  local action="$1" name="" arg f
+  shift
+  # `--profile <name>` is accepted too: every other stealth subcommand spells
+  # it that way, and the no-profile error suggests it.
+  while [ $# -gt 0 ]; do
+    arg="$1"; shift
+    case "$arg" in
+      --profile) [ $# -gt 0 ] && [ -n "$1" ] || usage_die "--profile requires a profile name"
+                 arg="$1"; shift ;;
+      -*) usage_die "unknown option '$arg' for stealth $action" ;;
+    esac
+    [ -z "$name" ] || usage_die "stealth $action takes at most one profile name"
+    name="$arg"
+  done
+  name="$(stealth_target_profile "$name")"
+  f="$(stealth_profile_file "$name" enabled)"
+  if [ "$action" = "disable" ]; then
+    rm -f "$f"
+    printf "Stealth disabled for profile '%s'.\n" "$name"
+    return 0
   fi
+  mkdir -p "$STEALTH_PROFILES_DIR"
+  : > "$f"
+  printf "Stealth enabled for profile '%s': 'agman run %s' and, with shell integration, plain 'claude' now launch through the proxy.\n" "$name" "$name"
+  if [ -z "$(stealth_saved_hosts "$name")" ] && \
+     [ -z "$(stealth_detect "$(profile_claude_dir "$(profile_dir "$name")")")" ]; then
+    warn "no hosts saved or detected for '$name'; launches will refuse to start until you add one: agman stealth hosts add <host> --profile $name"
+  fi
+}
+
+# Exit status only: is stealth on for the profile a bare `claude` would use?
+# Called by the shell integration before every claude launch, so it stays cheap.
+stealth_cmd_enabled() {
+  local name
+  name="$(stealth_current_profile)" || return 1
+  stealth_is_enabled "$name"
 }
 
 cmd_stealth() {
   local sub="${1:-}"
   [ $# -gt 0 ] && shift
   case "$sub" in
-    claude) stealth_claude ${1+"$@"} ;;
-    stop)   stealth_stop_daemon ;;
-    status) stealth_status ;;
-    ""|-h|--help)
-      printf 'Usage: agman stealth claude --otel <endpoint>[,<endpoint>…] [--profile <name>] [<claude args>]\n'
-      printf '       agman stealth stop\n'
-      printf '       agman stealth status\n'
-      ;;
-    *) usage_die "unknown stealth subcommand '$sub' (claude|stop|status)" ;;
+    claude)  stealth_claude ${1+"$@"} ;;
+    stop)    stealth_stop_daemon ;;
+    status)  stealth_status ;;
+    detect)  stealth_cmd_detect ${1+"$@"} ;;
+    hosts)   stealth_cmd_hosts ${1+"$@"} ;;
+    enable|disable) stealth_cmd_toggle "$sub" ${1+"$@"} ;;
+    enabled) stealth_cmd_enabled ;;
+    ""|-h|--help) help_stealth ;;
+    *) usage_die "unknown stealth subcommand '$sub' (claude|stop|status|detect|hosts|enable|disable)" ;;
   esac
 }
 
-cmd_help() {
+help_summary() {
   cat <<EOF
-agman $AGMAN_VERSION — agent manager: config profiles for AI coding agents
+agman $AGMAN_VERSION — switch config profiles for Claude Code, Codex CLI and Gemini CLI
 
 Usage: agman <command> [args]
+       agman <command> --help
+
+Everyday:
+  list, ls              Show your profiles (* = active)
+  current               Show which profile is active
+  use [name]            Switch every tool to a profile (no name: pick from a list)
+  off                   Stop switching and restore your original configs
+  create <name>         Make a new profile (--copy-current copies your setup)
+
+Manage profiles:
+  rename <old> <new>    Rename a profile
+  remove, rm <name>     Delete a profile, not the active one (--yes: no prompt)
+  login <name>          Give a profile its own Claude account
+  logout <name>         Go back to the shared Claude login
+
+One shell or one command only:
+  run [name]            Start claude once with a profile
+  exec <name> -- <cmd>  Run any command with a profile
+  env <name>            Print exports: eval "\$(agman env work)"
+  dir <name>            Print a profile's Claude config folder
+
+Maintenance:
+  doctor                Check your setup for problems
+  update                Update agman
+  migrate               Move old profiles to the current layout
+  init [zsh|bash]       Print the optional shell integration
+  version               Print the agman version
+
+Advanced:
+  cloud <command>       Sync profiles with an agman cloud server
+  stealth <command>     Block company telemetry (OTEL) when claude runs
+
+Examples:
+  agman create work --copy-current
+  agman use work
+  agman current
+
+More help:
+  agman help <command>     Options for one command (e.g. agman help cloud)
+  agman help projects      Pick a profile per repository with a .agman file
+  agman help tools         Which tools agman manages
+  agman help environment   Environment variables
+  agman help all           Everything
+EOF
+}
+
+help_create() {
+  cat <<'EOF'
+agman create <name> [options]
+
+  Make a new profile. By default it is empty apart from a starter CLAUDE.md.
+
+  --copy-current    Start from the configs you are using right now
+  --from <name>     Copy another profile
+  --link-plugins    Link plugins/ instead of copying it
+EOF
+}
+
+help_use() {
+  cat <<'EOF'
+agman use [name]
+
+  Switch every managed tool to a profile by pointing ~/.claude, ~/.claude.json,
+  ~/.codex and ~/.gemini at it. Applies to every new session, IDEs included;
+  sessions already running keep their old config.
+
+  The first switch saves your original configs as the profile 'global'.
+  'agman off' puts them back exactly as they were.
+
+  With no name, the profile comes from the nearest .agman file
+  (see 'agman help projects'). Without one, a terminal shows a menu:
+  ↑/↓ or j/k to move, 1-9 to jump, Enter to switch, q or Esc to cancel.
+EOF
+}
+
+help_run() {
+  cat <<'EOF'
+agman run [name] [-- claude args]
+agman exec <name> -- <command>
+agman env <name>
+
+  Use a profile for one process or one shell without switching the machine.
+
+  run    Start claude once with the profile. Arguments after -- go to claude.
+         With no name, uses the nearest .agman file.
+  exec   Run any command with the profile's environment variables set.
+  env    Print export lines for this shell:  eval "$(agman env work)"
+
+  A CLAUDE_CONFIG_DIR set in a shell always wins over 'agman use' there.
+EOF
+}
+
+help_dir() {
+  cat <<'EOF'
+agman dir <name> | --active | --for-cwd
+
+  Print a profile's Claude config folder.
+
+  --active    The active profile
+  --for-cwd   The profile named by the nearest trusted .agman file
+EOF
+}
+
+help_login() {
+  cat <<'EOF'
+agman login <name> [options]
+agman logout <name>
+
+  By default every profile shares your Claude login. 'login' gives one profile
+  its own account (its own token); 'logout' drops it again.
+
+  --token-stdin   Read the token from stdin
+  --no-run        Don't run 'claude setup-token' first
+EOF
+}
+
+help_cloud() {
+  cat <<'EOF'
+agman cloud <command> [options]
+
+  Sync profiles with an agman cloud server (default https://agman.vercel.app).
 
 Commands:
-  create <name> [opts]   Create a profile (empty, with a starter CLAUDE.md).
-                           --copy-current   seed from your current configs
-                           --from <name>    clone another profile
-                           --link-plugins   symlink plugins/ instead of copying
-  list                   List profiles (* = default, (active: …) = live tools)
-  use [name]             Activate a profile: symlinks each tool's config at it.
-                         First use backs up your originals as 'global'. With no
-                         name, reads the profile from the nearest .agman file.
-  off                    Deactivate and restore your original configs
-  current                Show the active profile and which tools it covers
-  dir <name>|--active|--for-cwd
-                         Print a profile's Claude config directory (--for-cwd
-                         resolves the nearest trusted .agman file)
-  env <name>             Print export lines: eval "\$(agman env work)"
-  run [name] [-- args]   Launch claude once under a profile (per-process).
-                         With no name, uses the nearest .agman file.
-  exec <name> -- <cmd>   Run a command with per-tool env vars set
-  login <name>           Give a profile its own Claude account (own token)
-                           --token-stdin    read the token from stdin
-                           --no-run         don't run 'claude setup-token' first
-  logout <name>          Drop that account; back to your shared login
-  cloud <subcommand>     Sync profiles with an agman cloud server:
-                           login [--url <url>] [--key-stdin]
-                             (URL defaults to https://agman.vercel.app)
-                           push [name] [--include-secrets] [--force] [--dry-run]
-                           pull <name> [--as <local>] [--force] [--with-secrets]
-                           init <org-slug> [name] [--with-secrets]
-                           list | status | logout
-                         --verbose (or AGMAN_VERBOSE=1) logs the request
-                         line, push payload size, and response code.
-                         Pushes are versioned server-side. A synced profile is
-                         a persona, not a login: account material (the identity
-                         file, tokens, codex/gemini auth, .env) and ephemeral
-                         state stay local, and a push is refused if a file looks
-                         like it holds a secret. push --dry-run lists what a
-                         push would carry; a payload over the server limit is
-                         refused before upload with the largest files named.
-                         The limit comes from the server when it advertises
-                         one (AGMAN_CLOUD_MAX_PUSH_BYTES overrides). Archives
-                         too big for a direct request travel via the server's
-                         presigned blob-upload flow automatically.
-                         --include-secrets (push) /
-                         --with-secrets (pull) opt into carrying account material
-                         for your own machine-to-machine restore. Pulls strip
-                         hooks/apiKeyHelper from an untrusted settings.json, back
-                         up an existing profile first, and refuse the active
-                         profile without --force. Plugin caches and marketplace
-                         clones are never synced; pull reinstalls them from the
-                         profile's references via the claude CLI
-                         (AGMAN_CLOUD_NO_INSTALL=1 skips). https required
-                         (override with AGMAN_CLOUD_INSECURE=1).
-  stealth <subcommand>   Block a forced OTEL exporter from leaving this machine
-                         (needs mitmproxy + lsof + curl):
-                           claude --otel <endpoint>[,<endpoint>…] [--profile <name>] [<claude args>]
-                             Launch claude through a local proxy that answers
-                             every listed endpoint's host with 403, dropping OTEL
-                             telemetry while api.anthropic.com and the rest still
-                             work. --otel is required (comma-separate hosts).
-                             Claude args (e.g. --resume) are forwarded as-is.
-                           stop    Stop the stealth proxy daemon
-                           status  Show whether the daemon is running
-                         State lives under ~/.agman/.stealth; the daemon persists
-                         across sessions until you run 'stealth stop'.
-  rename <old> <new>     Rename a profile (repoints active symlinks)
-  remove <name> [--yes]  Delete a profile (refuses if active)
-  migrate                Move profiles to the current layout, then relink
-  update                 Self-update: git pull in a checkout, else download
-  doctor                 Diagnose setup, tools, and per-profile auth
-  init [zsh|bash]        Print optional per-shell integration snippet
-  help, version
+  login [--url <url>] [--key-stdin]          Connect to a server
+  push [name] [--dry-run] [--force]          Upload a profile
+  pull <name> [--as <local>] [--force]       Download a profile
+  init <org-slug> [name]                     Start from an org's profile
+  list | status | logout
 
-Per-project profiles:
+Options:
+  --dry-run          List what a push would upload, upload nothing
+  --include-secrets  (push) Also upload logins and tokens
+  --with-secrets     (pull, init) Also download logins and tokens
+  --verbose          Log each request, its payload size and response code
+
+What gets synced:
+  A synced profile is a persona, not a login. Logins, tokens, codex/gemini auth,
+  .env and session state stay on this machine unless you pass the secrets flags.
+  A push is refused if a file looks like it holds a secret. Pushes are versioned
+  on the server. Plugin caches are never synced; pull reinstalls plugins with
+  the claude CLI.
+
+Safety on pull:
+  Hooks and apiKeyHelper are removed from a downloaded settings.json, an existing
+  profile is backed up first, and the active profile is refused without --force.
+
+Size:
+  A push over the server's limit is refused before upload and names the largest
+  files. Large archives upload through the server's blob flow automatically.
+
+Environment:
+  AGMAN_VERBOSE=1                 Same as --verbose
+  AGMAN_CLOUD_MAX_PUSH_BYTES      Override the push size limit
+  AGMAN_CLOUD_NO_INSTALL=1        Don't reinstall plugins after pull
+  AGMAN_CLOUD_INSECURE=1          Allow http:// servers
+  AGMAN_PROGRESS                  Upload progress: unset = auto, 1 = on, 0 = off
+EOF
+}
+
+help_stealth() {
+  cat <<'EOF'
+agman stealth — stop Claude Code from sending telemetry (OTEL) to your company
+
+Quick start:
+  agman stealth detect            See which telemetry hosts were found
+  agman stealth enable [name]     Always protect this profile (default: active one)
+  agman stealth claude            Start claude with telemetry blocked
+
+All commands:
+  agman stealth claude [--otel <host>] [--save] [--profile <name>] [claude args]
+  agman stealth hosts [list|add|rm] [<host>…] [--profile <name>]
+  agman stealth enable [name]  /  agman stealth disable [name]
+  agman stealth detect [--profile <name>]
+  agman stealth status
+  agman stealth stop
+
+How it works:
+  claude runs through a small local proxy. Telemetry hosts get a 403;
+  everything else, including api.anthropic.com, works normally.
+  Needs mitmproxy, lsof and curl (macOS: brew install mitmproxy).
+
+Which hosts are blocked:
+  - hosts you pass with --otel (add --save to remember them)
+  - hosts saved with 'agman stealth hosts add'
+  - hosts found automatically in your environment and in Claude's settings
+    (profile, project, and company-managed). localhost is never blocked.
+  If none are found, claude is not started.
+
+When it applies:
+  - 'agman stealth claude' always.
+  - 'agman run <name>' when the profile is enabled.
+  - plain 'claude' when the profile is enabled and 'agman init' is loaded
+    in your shell. IDE extensions are not covered.
+  The proxy keeps running, and keeps every host it has blocked, until
+  'agman stealth stop'.
+
+Hosts can be full URLs or bare names; list several with commas:
+  agman stealth claude --otel https://a.example.com/v1/traces, b.example.com
+
+Environment:
+  AGMAN_STEALTH_PORT     Proxy port (default 8080)
+  AGMAN_STEALTH_CA       mitmproxy CA (default ~/.mitmproxy/mitmproxy-ca-cert.pem)
+  AGMAN_STEALTH_MANAGED  Managed-settings files to scan, separated by ':'
+  State lives in ~/.agman/.stealth.
+EOF
+}
+
+help_projects() {
+  cat <<'EOF'
+Per-project profiles
+
   Put a .agman file in a repository root naming the profile it wants:
 
       profile: acme-work
 
-  'agman use' and 'agman run' with no argument read it. Because the file arrives
-  with a clone, agman asks once before trusting it. Add the shell integration
-  and each directory switches automatically in that terminal; IDE extensions do
-  not inherit shell environment, so they follow 'agman use' instead.
+  'agman use' and 'agman run' with no name read it. Because the file arrives
+  with a clone, agman asks once before trusting it.
 
-Supported tools:
+  With the shell integration ('agman init'), each terminal switches profile as
+  you change directory. IDE extensions don't see shell variables, so they
+  follow 'agman use' instead.
+EOF
+}
+
+help_tools() {
+  cat <<'EOF'
+Supported tools
+
   claude   Claude Code   ~/.claude + ~/.claude.json   (env: CLAUDE_CONFIG_DIR)
   codex    Codex CLI     ~/.codex                     (env: CODEX_HOME)
   gemini   Gemini CLI    ~/.gemini                    (no env override)
 
-Only tools you actually have are managed: a profile covers a tool when it
-holds config for it, the CLI is on PATH, or its config path exists.
-
-Environment:
-  AGMAN_HOME             Profile storage root (default: ~/.agman)
-  AGMAN_TARGET_HOME      Where tool config paths live (default: \$HOME)
-  AGMAN_TOOLS            Space-separated allowlist, e.g. "claude codex".
-                         Unset means every supported tool you have.
-  AGMAN_SHARE_STATE      1 (default) shares session history and other machine-
-                         local state (Codex rollouts, Antigravity's browser
-                         profile) across profiles so 'claude --resume' keeps
-                         working. 0 keeps it per-profile.
-  AGMAN_PROGRESS         Transfer progress for cloud push uploads. Auto: shown
-                         only when stderr is a terminal. 1 forces on, 0 off.
-  AGMAN_RAW_URL          Update source (default: GitHub main branch)
+  agman only manages tools you have: a profile covers a tool when it holds
+  config for it, the CLI is on PATH, or its config path exists.
 EOF
+}
+
+help_environment() {
+  cat <<'EOF'
+Environment variables
+
+  AGMAN_HOME          Where profiles are stored (default ~/.agman)
+  AGMAN_TARGET_HOME   Where tool configs live (default $HOME)
+  AGMAN_TOOLS         Only manage these tools, e.g. "claude codex"
+  AGMAN_SHARE_STATE   1 (default): share session history across profiles so
+                      'claude --resume' keeps working. 0: keep it per profile.
+  AGMAN_RAW_URL       Where 'agman update' downloads from
+
+  Cloud and stealth variables: see 'agman help cloud' and 'agman help stealth'.
+EOF
+}
+
+cmd_help() {
+  local topic="${1:-}" line
+  case "$topic" in
+    "") help_summary ;;
+    all)
+      help_summary
+      for topic in create use run dir login cloud stealth projects tools environment; do
+        printf '\n'; "help_$topic"
+      done ;;
+    create|use|dir|login|cloud|stealth|projects|tools|environment) "help_$topic" ;;
+    run|exec|env) help_run ;;
+    logout) help_login ;;
+    *)
+      [ "$topic" = "ls" ] && topic="list"
+      [ "$topic" = "rm" ] && topic="remove"
+      line="$(help_summary | grep -E "^  $topic(,| |\$)" || true)"
+      [ -n "$line" ] || usage_die "no help for '$topic'"
+      printf 'agman %s\n\n%s\n' "$topic" "$line" ;;
+  esac
 }
 
 # ---------------------------------------------------------------------------
 # dispatch
 
 main() {
-  local cmd="${1:-help}"
+  local cmd="${1:-help}" arg
   [ $# -gt 0 ] && shift
+  # --help must never run the command. run/exec/stealth forward everything
+  # after their first argument, so only that first argument can ask for help.
+  case "$cmd" in
+    help|-h|--help) ;;
+    run|exec|stealth)
+      case "${1:-}" in -h|--help) cmd_help "$cmd"; return ;; esac ;;
+    *)
+      for arg in ${1+"$@"}; do
+        [ "$arg" = "--" ] && break
+        case "$arg" in -h|--help) cmd_help "$cmd"; return ;; esac
+      done ;;
+  esac
   case "$cmd" in
     create)  cmd_create ${1+"$@"} ;;
-    list|ls) cmd_list ;;
+    list|ls|--list) cmd_list ;;
     use)     cmd_use ${1+"$@"} ;;
     off)     cmd_off ;;
     current) cmd_current ;;
@@ -3081,7 +3608,7 @@ main() {
     update)  cmd_update ;;
     doctor)  cmd_doctor ;;
     init)    cmd_init ${1+"$@"} ;;
-    help|-h|--help) cmd_help ;;
+    help|-h|--help) cmd_help ${1+"$@"} ;;
     version|-v|--version) printf 'agman %s\n' "$AGMAN_VERSION" ;;
     *) usage_die "unknown command '$cmd'" ;;
   esac
