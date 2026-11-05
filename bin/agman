@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.19.0"
+AGMAN_VERSION="0.19.1"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -1511,6 +1511,47 @@ cmd_env() {
   [ "$emitted" = "1" ] || warn "no tool in profile '$name' supports a per-shell override"
 }
 
+# Escape a string for inclusion in a JSON double-quoted string literal.
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "$s"
+}
+
+# --settings flag that keeps the machine-active profile's memory out of a
+# launch of another profile: from the home directory Claude Code reads
+# <cwd>/.claude/CLAUDE.md and <cwd>/.claude/rules/** as project memory, and
+# ~/.claude is the active profile's tree. Names both the path Claude computes
+# and the directory it points at. Prints nothing when the launch targets the
+# active profile itself.
+memory_exclude_args() {
+  local dir="$1" active p out=""
+  dir="$(cd "$dir" 2>/dev/null && pwd -P)" || return 0
+  active="$(target_path .claude)"
+  if [ -L "$active" ]; then active="$(readlink_once "$active")"; fi
+  active="$(cd "$active" 2>/dev/null && pwd -P)" || return 0
+  [ "$active" != "$dir" ] || return 0
+  for p in "$TARGET_HOME/.claude/CLAUDE.md" "$TARGET_HOME/.claude/rules/**" "$active/CLAUDE.md" "$active/rules/**"; do
+    # Git Bash: Claude Code matches native C:/… paths, not /c/… ones.
+    command -v cygpath >/dev/null 2>&1 && p="$(cygpath -m "$p")"
+    out="${out:+$out,}\"$(json_escape "$p")\""
+  done
+  printf '%s' "--settings={\"claudeMdExcludes\":[$out]}"
+}
+
+# The user's own --settings wins: agman never overrides it, and merging two
+# flag settings is not worth the surprise. Prints nothing when clean.
+memory_exclude_guard() {
+  local a
+  for a in ${1+"$@"}; do
+    case "$a" in
+      --settings|--settings=*) return 1 ;;
+    esac
+  done
+  return 0
+}
+
 cmd_run() {
   local name="${1:-}"
   if [ -z "$name" ] || [ "$name" = "--" ]; then
@@ -1527,8 +1568,12 @@ cmd_run() {
     return
   fi
   command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
-  local dir; dir="$(profile_dir "$name")"
-  exec env CLAUDE_CONFIG_DIR="$(profile_claude_dir "$dir")" claude ${1+"$@"}
+  local dir memargs=""
+  dir="$(profile_dir "$name")"
+  if memory_exclude_guard ${1+"$@"}; then
+    memargs="$(memory_exclude_args "$(profile_claude_dir "$dir")")"
+  fi
+  exec env CLAUDE_CONFIG_DIR="$(profile_claude_dir "$dir")" claude ${memargs:+"$memargs"} ${1+"$@"}
 }
 
 cmd_exec() {
@@ -3057,7 +3102,7 @@ EOF
 }
 
 stealth_claude() {
-  local otel="" profile="" arg hosts claude_config="" save=0 pname="" given saved detected h src
+  local otel="" profile="" arg hosts claude_config="" save=0 pname="" given saved detected h src memargs=""
   local claude_args n=0
   claude_args=()
   # --otel/--profile belong to stealth; every other argument (positionals and
@@ -3145,6 +3190,15 @@ stealth_claude() {
   export NODE_EXTRA_CA_CERTS="$STEALTH_CA"
   if [ -n "$claude_config" ]; then
     export CLAUDE_CONFIG_DIR="$claude_config"
+  fi
+  # Whether the other profile came from --profile or the shell's
+  # CLAUDE_CONFIG_DIR, keep the machine-active profile's memory out of it.
+  if memory_exclude_guard ${claude_args[@]+"${claude_args[@]}"}; then
+    memargs="$(memory_exclude_args "${CLAUDE_CONFIG_DIR:-$TARGET_HOME/.claude}")"
+    if [ -n "$memargs" ]; then
+      claude_args[$n]="$memargs"
+      n=$((n + 1))
+    fi
   fi
   printf 'Launching claude with OTEL hosts %s blocked.\n' "$(stealth_hosts_commas "$hosts")"
   exec claude ${claude_args[@]+"${claude_args[@]}"}
@@ -3386,6 +3440,9 @@ agman env <name>
   env    Print export lines for this shell:  eval "$(agman env work)"
 
   A CLAUDE_CONFIG_DIR set in a shell always wins over 'agman use' there.
+  Launched from the home directory, the machine-active profile's CLAUDE.md
+  and rules are excluded from the child (claudeMdExcludes), so only the
+  asked-for profile's memory loads — unless you pass --settings yourself.
 EOF
 }
 
