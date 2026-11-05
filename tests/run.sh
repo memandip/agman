@@ -1525,8 +1525,8 @@ for a in "$@"; do
   prev="$a"
 done
 case " $* " in
-  *[/]v1/traces*|*[/]v1/metrics*|*[/]v1/logs*)
-    # an OTLP path: answered by the generated addon
+  *[/]v1/traces*|*[/]v1/metrics*|*[/]v1/logs*|*[/]custom/ingest*)
+    # an OTLP path, or an exact-path target's probe: answered by the addon
     printf '%s' "${STEALTH_CURL_BODY-blocked by agman stealth}" > "$out"
     printf '%s' "${STEALTH_CURL_CODE-403}" ;;
   *)
@@ -1781,6 +1781,9 @@ for p in '"/v1/traces"' '"/v1/metrics"' '"/v1/logs"' \
          '"/opentelemetry.proto.collector.trace.v1.TraceService/"'; do
   assert_contains "bare-host block names the exporter path $p" "$addon" "$p"
 done
+assert_contains "addon logs passed-through requests" "$addon" '"[agman stealth] passed %s"'
+assert_contains "addon blocks protobuf bodies on any path" "$addon" 'application/x-protobuf'
+assert_contains "addon blocks grpc bodies on any path" "$addon" 'application/grpc'
 assert_ok "stealth stop after path scoping" stealth_run stealth stop
 
 # a URL with its own base path scopes the block under it
@@ -1799,6 +1802,20 @@ assert_contains "explicit endpoint blocks the exporter's paths on the host" \
   "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" \
   '"otel.acme-corp.example": ["/v1/traces", "/v1/metrics", "/v1/logs",'
 assert_ok "stealth stop after explicit endpoint" stealth_run stealth stop
+
+# a signal-specific endpoint env variable carries the full URL the exporter
+# posts to: a path that is not itself an OTLP path is blocked exactly, not
+# treated as a base to extend
+: > "$TMP/stealthlog/claude"
+out="$(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://exact.corp.example/custom/ingest \
+  stealth_run stealth claude 2>&1)" \
+  && ok "exact-path endpoint launches with the block on" \
+  || bad "exact-path endpoint launches with the block on ($(printf '%s' "$out" | tail -1))"
+assert_contains "exact-path target is blocked as-is" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"exact.corp.example": ["/custom/ingest"]'
+assert_lacks "exact target does not gain appended paths" \
+  "$(cat "$AGMAN_HOME/.stealth/block_otel.py")" '"/custom/ingest/v1/traces"'
+assert_ok "stealth stop after exact-path launch" stealth_run stealth stop
 
 # fail closed when the OTLP path is not answered by the addon (block gone)
 out="$(STEALTH_CURL_BODY="" stealth_run stealth claude --otel "https://otel.acme-corp.example" 2>&1 || true)"
@@ -1885,11 +1902,14 @@ cat > "$sp_settings" <<'EOF'
 EOF
 printf '{"env":{"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT":"https://managed.corp.example/v1/metrics"}}\n' \
   > "$TMP/stealthlog/managed-settings.json"
-out="$(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://envvar.corp.example stealth_run stealth detect --profile stealthprof)"
+out="$(OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://envvar.corp.example \
+  OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=https://exact.corp.example/custom/ingest \
+  stealth_run stealth detect --profile stealthprof)"
 assert_contains "detect finds the settings.json endpoint" "$out" "collector.corp.example"
 assert_contains "detect names the source file" "$out" "$sp_settings"
 assert_contains "detect finds the managed-settings endpoint" "$out" "managed.corp.example"
 assert_contains "detect finds the environment endpoint" "$out" "envvar.corp.example"
+assert_contains "detect marks a non-OTLP endpoint path as exact" "$out" "exact.corp.example!custom/ingest"
 assert_lacks "detect skips loopback collectors" "$out" "localhost"
 
 : > "$TMP/stealthlog/claude"
