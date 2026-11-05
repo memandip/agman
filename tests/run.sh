@@ -1841,7 +1841,9 @@ assert_contains "version --help shows help" "$("$AGM" version --help)" "Print th
 # interactive picker: 'agman use' with no name on a terminal. script(1) gives the
 # command a pseudo-terminal; BSD/macOS and util-linux spell it differently.
 pty_run() {
-  if script -qec true /dev/null >/dev/null 2>&1; then
+  # Probe on a closed stdin: util-linux script forwards stdin to its pty, so a
+  # probe sharing the pipe would swallow the keys meant for the real run.
+  if script -qec true /dev/null </dev/null >/dev/null 2>&1; then
     script -qec "$*" /dev/null
   else
     script -q /dev/null "$@"
