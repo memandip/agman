@@ -74,6 +74,17 @@ The passthrough is not free: on a blocked host, agman's local proxy terminates T
 trusts it via `NODE_EXTRA_CA_CERTS`) and forwards the request unmodified to the real
 server. Nothing is stored, but the proxy is on the path for that host's traffic.
 
+Three guards keep the scoped block honest when the org changes things:
+
+- The signal-specific endpoint variables (`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and
+  friends) carry the full URL the exporter posts to, so a path that is not itself an
+  OTLP path is blocked exactly, not treated as a base to extend.
+- Requests carrying an OTLP/protobuf or gRPC body are blocked on a blocked host even
+  when the path is unknown — no Claude Code API traffic uses those content types.
+- Everything that passes through on a blocked host is logged in the daemon log
+  (`[agman stealth] passed …`), so telemetry taking an unexpected route is visible
+  instead of escaping silently.
+
 ### Auto-detect
 
 You usually don't need `--otel` at all. Before launching, agman looks for every

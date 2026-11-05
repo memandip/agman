@@ -2761,19 +2761,33 @@ stealth_host_of_url() {
   printf '%s' "$host" | tr '[:upper:]' '[:lower:]'
 }
 
-# "host" or "host/base-path" out of one endpoint URL. The path is kept so the
-# block can stay scoped to the exporter's own paths: a telemetry host may
-# share its name with traffic claude needs (a company gateway serves login,
-# managed settings and OTEL on one hostname). A URL that already ends in an
-# OTLP path (.../v1/traces) names one signal's route, and a collector serves
-# the other signals beside it — so the parent path is kept and all of the
-# exporter's paths under it are blocked. Query strings and fragments are
-# dropped; the path is not percent-decoded (exporter endpoints do not use
-# escapes).
+# Host part of a stored target: "host", "host/base-path" or "host!exact-path".
+stealth_target_host() {
+  local t="$1"
+  t="${t%%!*}"
+  printf '%s' "${t%%/*}"
+}
+
+# "host", "host/base-path" or "host!exact-path" out of one endpoint URL. The
+# path is kept so the block can stay scoped to the exporter's own paths: a
+# telemetry host may share its name with traffic claude needs (a company
+# gateway serves login, managed settings and OTEL on one hostname). A URL
+# that already ends in an OTLP path (.../v1/traces) names one signal's route,
+# and a collector serves the other signals beside it — so the parent path is
+# kept and all of the exporter's paths under it are blocked. The second
+# argument, when set, is the settings key the value came from: the
+# signal-specific _TRACES_/_METRICS_/_LOGS_ENDPOINT variables carry the full
+# URL the exporter posts to (nothing is appended), so a path that is not
+# itself an OTLP path is stored as an exact-path target and blocked as-is.
+# Query strings and fragments are dropped; the path is not percent-decoded
+# (exporter endpoints do not use escapes).
 stealth_target_of_url() {
-  local item="$1" host rest path="" s suf
+  local item="$1" key="${2:-}" host rest path="" s suf exact=""
   host="$(stealth_host_of_url "$item")"
   [ -n "$host" ] || return 0
+  case "$key" in
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT|OTEL_EXPORTER_OTLP_METRICS_ENDPOINT|OTEL_EXPORTER_OTLP_LOGS_ENDPOINT) exact=1 ;;
+  esac
   rest="$item"
   case "$rest" in *://*) rest="${rest#*://}" ;; esac
   case "$rest" in
@@ -2794,21 +2808,23 @@ stealth_target_of_url() {
     done
     path="${path#/}"
   fi
-  if [ -n "$path" ]; then printf '%s/%s\n' "$host" "$path"
+  if [ -n "$path" ] && [ -n "$exact" ]; then printf '%s!%s\n' "$host" "$path"
+  elif [ -n "$path" ]; then printf '%s/%s\n' "$host" "$path"
   else printf '%s\n' "$host"; fi
 }
 
 # Comma-separated OTLP endpoints -> newline-separated, sorted, de-duplicated
-# targets ("host" or "host/base-path").
+# targets ("host", "host/base-path" or "host!exact-path"). The optional second
+# argument is the settings key the values came from; see stealth_target_of_url.
 stealth_targets_of_urls() {
-  local list="${1:-}" item
+  local list="${1:-}" key="${2:-}" item
   list="${list},"
   while [ -n "$list" ]; do
     item="${list%%,*}"
     list="${list#*,}"
     item="$(printf '%s' "$item" | tr -d '[:space:]')"
     [ -n "$item" ] || continue
-    stealth_target_of_url "$item"
+    stealth_target_of_url "$item" "$key"
   done | sort -u
 }
 
@@ -2816,11 +2832,20 @@ stealth_targets_of_urls() {
 stealth_hosts_commas() { printf '%s' "$1" | tr '\n' ',' | sed 's/,$//; s/,/, /g'; }
 
 # newline-separated targets -> a Python dict literal mapping each host to the
-# exporter's request paths blocked on it: the OTLP paths under its base path.
+# request paths blocked on it: the OTLP paths under its base path, or exactly
+# the stored path for an exact-path target.
 stealth_targets_pydict() {
   local t host base s p paths out="{"
   while IFS= read -r t; do
     [ -n "$t" ] || continue
+    case "$t" in
+      *"!"*)
+        host="${t%%!*}"
+        p="${t#*!}"
+        out="$out\"$host\": [\"/$p\"], "
+        continue
+        ;;
+    esac
     host="${t%%/*}"
     case "$t" in */*) base="${t#*/}" ;; *) base="" ;; esac
     paths=""
@@ -2923,25 +2948,26 @@ stealth_is_loopback() {
   return 1
 }
 
-# "host-or-target<TAB>source" lines for one endpoint value.
+# "target<TAB>source" lines for one endpoint value. The optional third
+# argument is the settings key the value came from; see stealth_target_of_url.
 stealth_detect_emit() {
-  local val="$1" src="$2" t h
-  stealth_targets_of_urls "$val" | while IFS= read -r t; do
+  local val="$1" src="$2" key="${3:-}" t h
+  stealth_targets_of_urls "$val" "$key" | while IFS= read -r t; do
     [ -n "$t" ] || continue
-    h="${t%%/*}"
+    h="$(stealth_target_host "$t")"
     stealth_is_loopback "$h" && continue
     printf '%s\t%s\n' "$t" "$src"
   done
 }
 
 # All OTEL endpoints Claude would see with the given config dir, as
-# "host<TAB>source" lines.
+# "target<TAB>source" lines.
 stealth_detect() {
   local claude_dir="${1:-}" var val f list
   [ -n "$claude_dir" ] || claude_dir="${CLAUDE_CONFIG_DIR:-$TARGET_HOME/.claude}"
   for var in $STEALTH_OTEL_VARS; do
     eval "val=\${$var:-}"
-    [ -n "$val" ] && stealth_detect_emit "$val" "\$$var"
+    [ -n "$val" ] && stealth_detect_emit "$val" "\$$var" "$var"
   done
   # Colon-separated so paths with spaces (macOS's managed dir) survive.
   list="$claude_dir/settings.json:$claude_dir/settings.local.json:$PWD/.claude/settings.json:$PWD/.claude/settings.local.json:$STEALTH_MANAGED_FILES:"
@@ -2949,8 +2975,10 @@ stealth_detect() {
     f="${list%%:*}"; list="${list#*:}"
     [ -n "$f" ] && [ -f "$f" ] || continue
     grep -o '"OTEL_EXPORTER_OTLP_[A-Z_]*ENDPOINT"[[:space:]]*:[[:space:]]*"[^"]*"' "$f" 2>/dev/null \
-      | sed 's/^"[A-Z_]*"[[:space:]]*:[[:space:]]*"//; s/"$//' \
-      | while IFS= read -r val; do stealth_detect_emit "$val" "$f"; done
+      | sed 's/^"//; s/"[[:space:]]*:[[:space:]]*"/\t/; s/"$//' \
+      | while IFS="$(printf '\t')" read -r key val; do
+          stealth_detect_emit "$val" "$f" "$key"
+        done
   done
   return 0
 }
@@ -3015,7 +3043,7 @@ stealth_stop_daemon() {
 }
 
 stealth_start_daemon() {
-  local hosts="$1" pid i lp pylist allowre
+  local hosts="$1" pid i lp pydict allowre
   mkdir -p "$STEALTH_DIR"
   # Wait out a just-stopped daemon so we don't fail to bind its port.
   for i in {1..30}; do
@@ -3038,6 +3066,12 @@ from mitmproxy import http
 
 BLOCKED = ${pydict}
 
+# OTLP/protobuf and gRPC bodies are unambiguous: no Claude Code API traffic
+# uses them. A request carrying one on a blocked host is telemetry taking a
+# path the block rules do not name (a changed or custom exporter route).
+def _is_proto(ctype: str) -> bool:
+    return ctype == "application/x-protobuf" or ctype.startswith("application/grpc")
+
 def request(flow: http.HTTPFlow) -> None:
     prefixes = None
     for host in BLOCKED:
@@ -3046,18 +3080,29 @@ def request(flow: http.HTTPFlow) -> None:
             break
     if prefixes is None:
         return
-    path = flow.request.path.split("?", 1)[0]
-    if path.endswith("/") and len(path) > 1:
-        path = path[:-1]
-    for p in prefixes:
-        if path == p or path.startswith(p + "/"):
-            flow.response = http.Response.make(
-                403,
-                b"blocked by agman stealth",
-                {"Content-Type": "text/plain"},
-            )
-            print("[agman stealth] blocked %s %s" % (flow.request.method, flow.request.pretty_url), flush=True)
-            return
+    url = "%s %s" % (flow.request.method, flow.request.pretty_url)
+    ctype = (flow.request.headers.get("content-type") or "").split(";")[0].strip().lower()
+    blocked = _is_proto(ctype)
+    if not blocked:
+        path = flow.request.path.split("?", 1)[0]
+        if path.endswith("/") and len(path) > 1:
+            path = path[:-1]
+        for p in prefixes:
+            if path == p or path.startswith(p + "/"):
+                blocked = True
+                break
+    if blocked:
+        flow.response = http.Response.make(
+            403,
+            b"blocked by agman stealth",
+            {"Content-Type": "text/plain"},
+        )
+        print("[agman stealth] blocked %s" % url, flush=True)
+    else:
+        # Passed through to the real server. Logged so telemetry taking an
+        # unexpected path on a blocked host shows up in the daemon log
+        # instead of escaping silently.
+        print("[agman stealth] passed %s" % url, flush=True)
 PYEOF
 
   # Intercept only the blocked hosts; pass everything else through un-decrypted so
@@ -3172,13 +3217,16 @@ stealth_ensure_ca() {
 # An unreachable host (000) is only a warning — nothing can leak when the
 # host is down.
 stealth_verify_block() {
-  local targets="$1" t host base probe url code body tmpf
+  local targets="$1" t host probe url code body tmpf
   tmpf="$(mktemp "${TMPDIR:-/tmp}/agman-block-check.XXXXXX")" || return 1
   while IFS= read -r t; do
     [ -n "$t" ] || continue
-    host="${t%%/*}"
-    case "$t" in */*) base="/${t#*/}" ;; *) base="" ;; esac
-    probe="${base}/v1/traces"
+    host="$(stealth_target_host "$t")"
+    case "$t" in
+      *"!"*) probe="/${t#*!}" ;;          # exact path: probe it as-is
+      */*) probe="/${t#*/}/v1/traces" ;;
+      *) probe="/v1/traces" ;;
+    esac
 
     url="https://${host}${probe}"
     code="$(curl -s -o "$tmpf" -w '%{http_code}' --max-time 6 -k \
@@ -3648,7 +3696,9 @@ How it works:
   claude runs through a small local proxy. The exporter's own request paths
   (/v1/traces, /v1/metrics, /v1/logs) get a 403; everything else, including
   api.anthropic.com and any non-telemetry traffic to the blocked host itself,
-  works normally. Needs mitmproxy, lsof and curl (macOS: brew install mitmproxy).
+  works normally and is logged. Protobuf and gRPC bodies are blocked on a
+  blocked host regardless of path. Needs mitmproxy, lsof and curl
+  (macOS: brew install mitmproxy).
 
 Which hosts are blocked:
   - hosts you pass with --otel (add --save to remember them); when the URL
