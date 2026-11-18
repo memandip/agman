@@ -279,7 +279,7 @@ assert_contains "env var pointing into a profile is recognized" "$out" "personal
 
 out="$("$AGM" run work -- --help)"
 assert_contains "run sets CLAUDE_CONFIG_DIR for claude" "$out" "CONFIG_DIR=$AGMAN_HOME/work/claude"
-assert_contains "run forwards args" "$out" "ARGS=--help"
+assert_contains "run forwards args" "$out" " --help"
 
 out="$("$AGM" exec personal -- claude hello)"
 assert_contains "exec sets CLAUDE_CONFIG_DIR" "$out" "CONFIG_DIR=$AGMAN_HOME/personal/claude"
@@ -1707,6 +1707,48 @@ assert_ok "stealth restarts a daemon missing the passthrough marker" \
 wait_for_mitm 1
 assert_eq "stale daemon is re-launched" "1" "$(wc -l < "$TMP/stealthlog/mitm.args" | tr -d ' ')"
 assert_ok "stealth stop after stale-daemon restart" stealth_run stealth stop
+
+# --- memory: launching another profile must not inherit the active one ---------
+
+# From the home directory, <cwd>/.claude is the machine-active profile's tree,
+# and Claude Code reads <cwd>/.claude/CLAUDE.md and <cwd>/.claude/rules/** as
+# project memory on top of the launched profile's user memory.
+assert_ok "activate work as the machine profile" "$AGM" use work
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude with a non-active profile" \
+  stealth_run stealth claude --profile stealthprof --otel "https://mem.example"
+assert_contains "active profile's memory is excluded" \
+  "$(cat "$TMP/stealthlog/claude")" "claudeMdExcludes"
+assert_contains "exclusion names the active profile's CLAUDE.md" \
+  "$(cat "$TMP/stealthlog/claude")" "$AGMAN_HOME/work/claude/CLAUDE.md"
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude with the active profile" \
+  stealth_run stealth claude --profile work --otel "https://mem.example"
+assert_lacks "no exclusion when launching the active profile" \
+  "$(cat "$TMP/stealthlog/claude")" "claudeMdExcludes"
+: > "$TMP/stealthlog/claude"
+assert_ok "stealth claude with user --settings" \
+  stealth_run stealth claude --profile stealthprof --otel "https://mem.example" --settings '{"a":1}'
+assert_lacks "user --settings is never overridden" \
+  "$(cat "$TMP/stealthlog/claude")" "claudeMdExcludes"
+: > "$TMP/stealthlog/claude"
+out="$("$AGM" run stealthprof -- --resume rM)"
+assert_contains "run excludes the active profile's memory" "$out" "claudeMdExcludes"
+assert_contains "run still forwards its args" "$out" " --resume rM"
+# a shell carrying another profile's CLAUDE_CONFIG_DIR (agman env) is the same leak
+: > "$TMP/stealthlog/claude"
+CLAUDE_CONFIG_DIR="$AGMAN_HOME/stealthprof/claude" stealth_run stealth claude --otel "https://mem.example" >/dev/null 2>&1 \
+  && ok "stealth claude under another profile's CLAUDE_CONFIG_DIR" \
+  || bad "stealth claude under another profile's CLAUDE_CONFIG_DIR"
+assert_contains "exclusion also follows the shell's CLAUDE_CONFIG_DIR" \
+  "$(cat "$TMP/stealthlog/claude")" "claudeMdExcludes"
+: > "$TMP/stealthlog/claude"
+stealth_run stealth claude --otel "https://mem.example" >/dev/null 2>&1 \
+  && ok "stealth claude with no profile at all" \
+  || bad "stealth claude with no profile at all"
+assert_lacks "no exclusion when nothing points at another profile" \
+  "$(cat "$TMP/stealthlog/claude")" "claudeMdExcludes"
+assert_ok "stealth stop after memory checks" stealth_run stealth stop
 
 # --- stealth: two profiles at once ---------------------------------------------------------------
 

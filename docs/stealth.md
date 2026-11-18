@@ -107,6 +107,24 @@ Plain `claude` goes through the proxy **only** if its profile is enabled and the
 integration is loaded. IDE extensions are never covered. The proxy keeps running in the
 background until `agman stealth stop`.
 
+## Launching from your home directory
+
+`--profile` points Claude Code at the profile's config (`CLAUDE_CONFIG_DIR`), and its
+`CLAUDE.md` and `rules/` load as your user memory. But when you launch from your home
+directory, Claude Code also reads `$HOME/.claude/CLAUDE.md` and `$HOME/.claude/rules/**`
+as **project** memory — and `~/.claude` is the machine-active profile's tree. Without a
+guard, the active profile's instructions would load on top of the profile you asked for.
+
+agman handles this automatically: when `agman run` or `agman stealth claude` launches a
+profile other than the machine-active one (by `--profile`, or because the shell's
+`CLAUDE_CONFIG_DIR` points at it), it passes Claude Code a `claudeMdExcludes` setting
+naming the active profile's `CLAUDE.md` and `rules/` (both as the `~/.claude/…` path
+Claude computes and the directory it points at), so only the asked-for profile's memory
+loads. Launching the machine-active profile needs no exclusion. If you pass `--settings`
+yourself, agman stands down — merge your own exclusion in that case. A plain `claude`
+after `agman env`, or under `agman exec`, gets no flag; launch with `agman run` or
+`agman stealth claude` instead.
+
 ## Setup (macOS)
 
 ```bash

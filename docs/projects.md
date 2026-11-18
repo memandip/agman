@@ -56,6 +56,10 @@ agman run work               # start claude once with 'work'
 agman exec work -- <command> # run anything with 'work'
 ```
 
+Started from your home directory, `agman run` also keeps the machine-active profile's
+`CLAUDE.md` and `rules/` out of the session, where `~/.claude` would otherwise load as
+project memory (see [launching from your home directory](stealth.md#launching-from-your-home-directory)).
+
 ## Which profile wins
 
 1. `CLAUDE_CONFIG_DIR` set in the shell (from `env`, `run`, `exec` or the hook).
