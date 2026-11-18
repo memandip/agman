@@ -72,7 +72,7 @@ v0.1 activated profiles purely via `CLAUDE_CONFIG_DIR`, which required shell int
 ## Platform notes
 
 - bash 3.2 compatible: no associative arrays, no `${var,,}`, `${1+"$@"}` forwarding idiom for old-bash `set -u` safety.
-- `find -print0 | while read -d ''` for filename safety; `cp -R` preserves symlinks per POSIX.
+- `find -print0 | while read -d ''` for filename safety; `cp -R` preserves symlinks per POSIX. A preserved *relative* link that points outside the tree (`skills/x -> ../../.agents/skills/x`) would resolve somewhere else once the tree sits deeper under `~/.agman`, so seeding and the move into `global` rewrite those to absolute targets; links within the tree stay relative.
 - shellcheck (`-S warning`) enforced in CI; not assumed locally.
 
 ## Risks
