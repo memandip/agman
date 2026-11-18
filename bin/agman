@@ -2734,7 +2734,7 @@ STEALTH_ADDON_FILE="$STEALTH_DIR/block_otel.py"
 # traffic claude needs), so a daemon still running an older addon is restarted
 # even when its host list matches.
 STEALTH_ADDONVER_FILE="$STEALTH_DIR/addon_version"
-STEALTH_ADDONVER="2"
+STEALTH_ADDONVER="3"
 STEALTH_LOG_FILE="$STEALTH_DIR/mitmdump.log"
 STEALTH_PORT="${AGMAN_STEALTH_PORT:-8080}"
 STEALTH_PROFILES_DIR="$STEALTH_DIR/profiles"
