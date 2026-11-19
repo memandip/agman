@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-AGMAN_VERSION="0.20.0"
+AGMAN_VERSION="0.20.1"
 
 AGMAN_HOME="${AGMAN_HOME:-$HOME/.agman}"
 # Where tool config paths live. Overridable so tests never touch a real home.
@@ -378,6 +378,29 @@ seed_from_dir() {
     fi
     cp -R "$entry" "$dst/$base"
   done < <(find "$src" -mindepth 1 -maxdepth 1 -print0)
+  pin_relative_links "$dst" "$src"
+}
+
+# Rewrite relative symlinks under $1 that resolve outside $2 (the tree's
+# original location) to absolute targets: moving or copying a config tree to a
+# new depth otherwise breaks them (skills/x -> ../../.agents/skills/x). Links
+# within the tree stay relative; dangling links are left as they are.
+pin_relative_links() {
+  local tree="$1" orig="$2" root link rel t abs
+  root="$(cd -P "$orig" 2>/dev/null && pwd -P)" || return 0
+  while IFS= read -r -d '' link; do
+    t="$(readlink_once "$link")"
+    case "$t" in ''|/*) continue ;; esac
+    rel="${link#"$tree"/}"
+    [ -e "$orig/$rel" ] || continue
+    if [ -d "$orig/$rel" ]; then
+      abs="$(cd -P "$orig/$rel" && pwd -P)" || continue
+    else
+      abs="$(cd -P "$(dirname "$orig/$rel")" && cd -P "$(dirname "$t")" && pwd -P)/${t##*/}" || continue
+    fi
+    case "$abs" in "$root"|"$root"/*) continue ;; esac
+    ln -sfn "$abs" "$link" || warn "could not repoint $link at $abs"
+  done < <(find "$tree" -type l -print0 2>/dev/null)
 }
 
 write_starter_claude_md() {
@@ -1091,6 +1114,7 @@ link_one() {
         fi
       else
         mkdir -p "$GLOBAL_BACKUP"
+        if [ "$type" = "d" ]; then pin_relative_links "$tgt" "$tgt"; fi
         mv "$tgt" "$gdest" || { warn "$tool: could not back up $tgt"; return 1; }
         printf '%s\n' "$LAYOUT_VERSION" > "$GLOBAL_BACKUP/$LAYOUT_FILE"
       fi

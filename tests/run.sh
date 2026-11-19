@@ -468,6 +468,31 @@ assert_ok "migrate is idempotent" grun migrate
 assert_eq "content still intact after re-migrate" "OLD WORK RULES" "$(cat "$GA/oldwork/claude/CLAUDE.md")"
 grun off >/dev/null
 
+# --- relative symlinks survive the move into agman's trees ---------------------------
+
+RL="$TMP/rlhome"
+mkdir -p "$RL/.claude/skills/real" "$RL/.agents/skills/ext"
+printf 'external skill\n' > "$RL/.agents/skills/ext/SKILL.md"
+printf 'internal skill\n' > "$RL/.claude/skills/real/SKILL.md"
+ln -s ../../.agents/skills/ext "$RL/.claude/skills/ext"
+ln -s real "$RL/.claude/skills/alias"
+ln -s ../../nowhere "$RL/.claude/skills/dangling"
+rlrun() { env HOME="$RL" AGMAN_HOME="$RL/.agman" AGMAN_TOOLS="claude" "$AGM" "$@"; }
+
+rlrun create rlwork --copy-current >/dev/null
+assert_eq "copied profile keeps an external relative skill link working" "external skill" \
+  "$(cat "$RL/.agman/rlwork/claude/skills/ext/SKILL.md" 2>/dev/null)"
+assert_eq "copied external link is pinned to the absolute target" "$(cd -P "$RL" && pwd -P)/.agents/skills/ext" \
+  "$(readlink "$RL/.agman/rlwork/claude/skills/ext")"
+assert_eq "internal relative link stays relative" "real" "$(readlink "$RL/.agman/rlwork/claude/skills/alias")"
+assert_eq "dangling link is left as it was" "../../nowhere" "$(readlink "$RL/.agman/rlwork/claude/skills/dangling")"
+rlrun use rlwork >/dev/null
+assert_eq "active profile resolves the external skill" "external skill" "$(cat "$RL/.claude/skills/ext/SKILL.md" 2>/dev/null)"
+assert_eq "global backup keeps the external skill link working" "external skill" \
+  "$(cat "$RL/.agman/global/claude/skills/ext/SKILL.md" 2>/dev/null)"
+rlrun off >/dev/null
+assert_eq "off restores a working external skill link" "external skill" "$(cat "$RL/.claude/skills/ext/SKILL.md" 2>/dev/null)"
+
 # --- identity seeding (the login-prompt fix) -----------------------------------------
 
 ID_HOME="$TMP/idhome"
